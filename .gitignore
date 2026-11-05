@@ -1,0 +1,14 @@
+**/__pycache__/
+*.egg-info/
+.env
+.env.*
+!.env.example
+
+# 运行日志（可能包含敏感信息）
+*.log
+
+# IDE 配置
+.idea/
+.vscode/
+# 源码备份（逐行注释前的原版，不需要纳入版本管理）
+src_备份_无注释/
