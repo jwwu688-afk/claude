@@ -131,20 +131,42 @@ def test_no_self_recursion_in_source():
 
 
 def test_approval_rules():
-    """测试：只读工具免确认、其他默认要问、模型显式写的优先"""
+    """测试：只读免确认、危险命令必须确认、模型不能自己给自己放行
+
+    【2026-11-06 第 9 轮改过这条断言】
+      改前最后一条是：
+          assert _needs_user_approval("cmd_runner", {"need_user_approve": False}) is False
+      也就是说，测试把"模型说不用问就不用问"当成了正确行为。
+      但那正是第 9 轮修掉的漏洞：被判断的人自己当裁判，
+      模型给 `del /s /q` 标一个 false，命令就静默执行了。
+      现在规则变了——模型的意见只能"加严"，不能"放松"；
+      真正决定要不要问的是 core/permissions.py 里的规则表。
+    """
     print("\n测试: 授权默认值集中判定")
 
     for name in READ_ONLY_TOOLS:  # 只读清单里的工具，没写参数时不该弹确认
         assert Conversation._needs_user_approval(name, {}) is False, f"{name} 不该弹确认"
 
-    for name in ("cmd_runner", "file_write", "file_edit", "task", "smart_context_cropper"):
+    for name in ("file_write", "file_edit", "task", "smart_context_cropper"):
         assert Conversation._needs_user_approval(name, {}) is True, f"{name} 默认应该要确认"
 
-    # 模型显式写了就按它写的来（兼容 cmd_runner 一直以来的用法）
-    assert Conversation._needs_user_approval("cmd_runner", {"need_user_approve": False}) is False
+    # 模型显式要求"问一下"，对只读工具也照样问（只能加严）
     assert Conversation._needs_user_approval("file_read", {"need_user_approve": True}) is True
+
+    # 【第 9 轮】模型的 false 不能给危险操作放行
+    assert Conversation._needs_user_approval(
+        "cmd_runner", {"command": "rm -rf /tmp/x", "need_user_approve": False}) is True
+    assert Conversation._needs_user_approval(
+        "cmd_runner", {"command": "del /s /q D:\\data", "need_user_approve": False}) is True
+    assert Conversation._needs_user_approval(
+        "cmd_runner", {"need_user_approve": False}) is True  # 没给命令，按"未知"处理，照问
+
+    # 【第 9 轮】只读命令不再打断人（连模型的 true 也不理）
+    assert Conversation._needs_user_approval(
+        "cmd_runner", {"command": "git status", "need_user_approve": True}) is False
+
     print(f"  · 只读清单 {sorted(READ_ONLY_TOOLS)} 免确认，其余默认要问")
-    print("✓ 通过: 三条授权规则都正确")
+    print("✓ 通过: 规则优先，模型的意见只能收紧不能放松")
 
 
 def test_tool_call_chain_approval():

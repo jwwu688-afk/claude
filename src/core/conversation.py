@@ -21,10 +21,11 @@ Conversation management with refactored UI components and history manager integr
 """
 
 import asyncio  # 【2026-11-06 第 2 轮新增】摘要生成要把同步的接口调用丢到线程池，需要用到它
-import os  # 【第 6 轮】用来读"单条工具输出最多保留多少字符"这个配置
 import json  # json 库：把模型给的"参数字符串"解析成真正的 Python 字典
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
 from core.api_client import APIClient  # 导入 API 客户端：真正发请求给大模型的家伙
+from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各处各写一个数
+from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
 from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器：负责生成"系统提示词"
 from core.prompt.reminder import get_reminder  # 导入函数：生成一段"提醒模型去看 todo"的文字
 from tools.tool_manager import ToolManager  # 导入工具管理器：负责注册工具、执行工具
@@ -39,14 +40,22 @@ from .history.history_manager import HistoryManager, message_text  # 导入历�
 #   为什么要在这里截，而不是只在界面上截？
 #     界面截断只是"不刷屏"，模型拿到的仍然是全文（可能几万字），
 #     照样会把上下文吃满、把预算烧掉。真正省钱的截断必须发生在"写进历史之前"。
-MAX_TOOL_OUTPUT_CHARS = int(os.getenv("MAX_TOOL_OUTPUT_CHARS", "12000"))
+# 【2026-11-06 第 9 轮】这个数字移到 core/limits.py，和 cmd_runner 共用同一个。
+#   原来这里有 12000、cmd_runner 里有 30000，两刀砍在同一个输出上，
+#   30000 那一刀等于白写；file_read 读满 2000 行也会被这里腰斩。
+#   导入的那一行在上面（from core.limits import MAX_TOOL_OUTPUT_CHARS）。
 
 # 【2026-11-06 第 8 轮】只读工具清单：这些工具不改磁盘文件、不启动外部进程，
 # 没必要每次都弹窗打断用户。第 8 轮新加的三个文件检索工具都在这里。
 # 注意 smart_context_cropper 不在此列——它会真的删掉聊天记录，属于有风险的操作。
-READ_ONLY_TOOLS = {
-    "file_read", "file_glob", "file_grep", "todo_write",
-}
+# 【2026-11-06 第 9 轮】清单本体搬到 core/permissions.py（上面的 import 已引入），
+#   这里保留名字是为了兼容：测试和其他模块仍在 from core.conversation import READ_ONLY_TOOLS。
+__all__ = ["Conversation", "READ_ONLY_TOOLS"]
+# ↑ 为什么需要这行？
+#   READ_ONLY_TOOLS 在本文件里已经不再被直接用到（判定全交给 classify 了），
+#   但它是"对外导出的名字"——test/test_conversation_loop.py 就是从这个模块 import 它的。
+#   不声明 __all__ 的话，PyCharm / flake8 会把它标成"导入后未使用"（黄色波浪线）。
+#   写进 __all__ 等于告诉静态检查：这是我故意留着给外面用的，别报。
 
 SUMMARY_SYSTEM_PROMPT = """你是一个对话压缩器。
 
@@ -543,22 +552,20 @@ class Conversation:
 
     @staticmethod
     def _needs_user_approval(tool_name: str, args: dict) -> bool:
-        """判断这次工具调用要不要弹确认（2026-11-06 第 8 轮新增）
+        """判断这次工具调用要不要弹确认（2026-11-06 第 8 轮新增，第 9 轮改成规则判定）
 
-        原来这里写死 args.get('need_user_approve', True)：模型没写就一律要问。
-        第 8 轮新增 file_read / file_glob / file_grep 之后，如果读个文件
-        也要打断用户一次，几乎没法用。所以按三条规则判定：
+        第 8 轮的写法是"模型显式写了就听它的"。这个设计有个致命问题：
+        被判断的人自己当裁判——模型给 `del /s /q` 标个 false，命令就静默执行了。
 
-          1. 模型显式写了 need_user_approve → 听它的（兼容 cmd_runner 等老工具的写法）
-          2. 没写、且在只读工具清单里 → 不打断用户
-          3. 其余一律要问（安全优先）
+        第 9 轮把判定搬到 core/permissions.py，三条规则：
+          1. 命中危险模式 → 必须问（模型的 false 也不放行，回车默认拒绝）
+          2. 只读工具 / 只读命令 → 不问
+          3. 其余一切 → 必须问
 
-        这只是过渡：模型仍然可以自己把危险操作标成 false，
-        真正的白名单 / 黑名单 / 路径边界规则放到第 9 轮做。
+        这个方法只是薄薄一层转手，保留它是因为测试和别处还在调它。
+        想看完整规则请读 core/permissions.py 的 classify()。
         """
-        if "need_user_approve" in args:  # 显式写了就按显式的值来
-            return bool(args["need_user_approve"])
-        return tool_name not in READ_ONLY_TOOLS  # 没写：只读工具免确认，其他都要问
+        return classify(tool_name, args).need_approval
 
     async def _handle_tool_calls(self, tool_calls):
         """Handle tool calls with user approval when needed.（逐个处理模型的工具申请）"""
@@ -581,12 +588,13 @@ class Conversation:
                 continue  # 跳过这一个，处理下一个
 
             # Check if user approval is needed
-            # 【2026-11-06 第 8 轮】改成集中判定（见 _needs_user_approval）：
-            #   第 1 轮把默认值从 False 改成 True，是"失败时更安全"的兜底；
-            #   但新增三个只读工具后，读个文件也弹确认会非常打扰。
-            #   现在按"只读 / 其他"分流，模型显式写的值仍然优先。
-            #   注意这只是过渡，完整的白名单/黑名单/路径边界规则在第 9 轮做。
-            need_user_approve = self._needs_user_approval(tool_call.function.name, args)
+            # 【2026-11-06 第 9 轮】判定交给 core/permissions.py 的 classify()：
+            #   它不只回答"要不要问"，还告诉我们是"低危 / 普通 / 高危"。
+            #   高危（rm -rf、格式化、强制推送……）会额外做两件事：
+            #     1. 在屏幕上标出来，让用户知道自己面对的是什么
+            #     2. 把"回车即同意"翻转成"回车即拒绝"，必须明确打 y 才放行
+            decision = classify(tool_call.function.name, args)
+            need_user_approve = decision.need_approval
             should_execute = True  # 默认"要执行"（下面如果要问用户，会根据用户的回答改写它）
             content = ""  # 用户拒绝时说的话（没有就是空串）
 
@@ -596,10 +604,17 @@ class Conversation:
             #   第一次还是一坨没排版的字典。现在头部只画一次，顺序也符合人的阅读习惯。
             self._ui_manager.show_preparing_tool(tool_call.function.name, args)
 
-            if need_user_approve:  # 如果模型说这个操作有风险、需要用户点头
+            if decision.is_high_risk:  # 【第 9 轮】高危操作先亮红牌再问
+                self._ui_manager.print_warning(f"高危操作（{decision.reason}）：回车将默认拒绝，确认执行请输入 y。")
+
+            if need_user_approve:  # 如果规则判定这个操作需要用户点头
                 # 【第 8.2 轮】问题只问"是否执行"，参数已经在上面那行里了。
                 #   回车即同意；输入别的内容 = 拒绝 + 那句内容作为说明（见 interpret_approval）。
-                should_execute, content = await self._ui_manager.wait_for_user_approval()
+                # 【第 9 轮】高危操作传 default_yes=False：不填就打回，必须显式确认。
+                #   这个参数第 8.2 轮就在接口里留好了，本轮终于用上。
+                should_execute, content = await self._ui_manager.wait_for_user_approval(
+                    default_yes=not decision.is_high_risk
+                )
 
             if should_execute:  # 用户同意（或本来就不需要问）
                 # show_header=False：头部上面已经画过了，别再画一遍
@@ -670,7 +685,7 @@ class Conversation:
         self.add_message(tool_message)  # 存进历史
 
     def _truncate_tool_output(self, content) -> str:
-        """把过长的工具输出掐头去尾（2026-11-06 第 6 轮新增）
+        """把过长的工具输出掐头去尾（2026-11-06 第 6 轮新增，第 9 轮改了提示语）
 
         策略：保留开头 70% + 结尾 30%，中间替换成一句说明。
         为什么留头尾？
@@ -678,7 +693,10 @@ class Conversation:
           中间的大段重复日志恰恰是最没用的部分。
         为什么要在说明里教它怎么取全文？
           否则模型以为数据只有这么多，会基于残缺信息做判断。
-          告诉它"可以用 sed -n 或 grep 分段取"，它就会自己去补。
+
+        【第 9 轮】提示语原来教模型用 `sed -n` / `grep` 分段取——那是 Linux 命令，
+        这个项目跑在 Windows 的 cmd.exe 上，照着执行只会失败。现在改成教它用
+        file_read 的 offset / limit，或者给 cmd_runner 换一条更窄的命令。
         """
         text = content if isinstance(content, str) else str(content)  # 统一成字符串
         if len(text) <= MAX_TOOL_OUTPUT_CHARS:  # 没超限，原样返回
@@ -688,9 +706,9 @@ class Conversation:
         omitted = len(text) - MAX_TOOL_OUTPUT_CHARS  # 中间省略了多少
         return (
             text[:head_length]
-            + f"\n\n... [工具输出过长，中间省略了 {omitted} 个字符。"
-            + "如需完整内容，请分段读取：例如 `sed -n '开始行,结束行 p' 文件`，"
-            + "或用 `grep` 只取你需要的部分。] ...\n\n"
+            + f"\n\n... [输出过长，中间省略了 {omitted} 个字符。"
+            + "如需完整内容：读文件请用 file_read 的 offset / limit 分段；"
+            + "查命令输出请把命令写得更窄（例如加 include 过滤、或用 file_grep 精确定位）。] ...\n\n"
             + text[-tail_length:]
         )
 

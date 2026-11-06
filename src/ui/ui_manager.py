@@ -112,6 +112,14 @@ class UIManager:
         """Print info message.（打印提示）"""
         self.display_manager.print_info(info_message, emoji)
 
+    def print_warning(self, warning_message: str) -> None:
+        """打印警告（2026-11-06 第 9 轮新增）
+
+        用在"高危工具调用"确认之前：告诉用户这次操作危险在哪、
+        以及"回车等于拒绝"。和 print_error 分开，是因为此时还没出事。
+        """
+        self.display_manager.print_warning(warning_message)
+
     def print_status(self, text: str, level: str = "info") -> None:
         """打印状态行（2026-11-06 第 4 轮新增，第 5 轮加了颜色分级）
 

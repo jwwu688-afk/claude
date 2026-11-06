@@ -18,13 +18,17 @@
 import asyncio  # asyncio 库：用来"异步"执行命令（不阻塞界面）
 import locale  # locale 库：用来猜当前系统的默认文字编码（中文 Windows 是 GBK）
 import sys  # sys 库：这里只用来判断"当前是不是 Windows"（决定用哪种方式杀进程）
+from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各写一个数
 from tools.base_tool import BaseTool  # 导入父类
 
 
 # 【2026-11-06 优化】下面三个常量是这轮新增的，把"魔法数字"集中到一处，改的时候只改这里
 DEFAULT_TIMEOUT = 30  # 默认最多等 30 秒
 MAX_TIMEOUT = 600  # 上限 10 分钟（防止模型传个几小时把程序挂住）
-MAX_OUTPUT_CHARS = 30000  # 输出超过约 3 万字符就截断（不截断会把上下文撑爆）
+# 【2026-11-06 第 9 轮】原来这里自己写死 30000，而 conversation.py 里另有一个 12000。
+#   同一段输出被砍两刀，12000 那一刀最终生效，所以 30000 等于白写。
+#   现在两处共用 core/limits.py 里的同一个数字（默认 30000，可用环境变量覆盖）。
+MAX_OUTPUT_CHARS = MAX_TOOL_OUTPUT_CHARS
 
 
 class CmdRunner(BaseTool):

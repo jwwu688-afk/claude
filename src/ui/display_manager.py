@@ -113,6 +113,18 @@ class DisplayManager:
         text.append(str(info_message), style="qs.dim")
         self._console.print(text)
 
+    def print_warning(self, warning_message: str) -> None:
+        """打印警告（2026-11-06 第 9 轮新增）
+
+        样式：  ! 高危操作（递归强制删除文件）：回车将默认拒绝，确认执行请输入 y。
+        和 print_error 的区别：错误是"已经出事了"，警告是"还没出事，你要不要继续"。
+        颜色用黄而不是红——红留给真正的报错，否则一屏里两处红，用户分不清轻重。
+        """
+        text = Text()
+        text.append(f"{theme.WARN_SIGN} ", style="bold qs.warn")
+        text.append(str(warning_message), style="qs.warn")
+        self._console.print(text)
+
     def print_status(self, text_content: str, level: str = "info") -> None:
         """打印状态行（2026-11-06 第 4 轮新增，第 5 轮加了按水位变色）
 

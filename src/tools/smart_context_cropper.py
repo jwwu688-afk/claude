@@ -14,7 +14,7 @@
 # 【2026-11-06 第 3 轮】说明书和所有返回给模型的文字已改成中文。
 # =============================================================================
 
-import subprocess  # 导入了但没用到（残留代码，可以删）
+from typing import Optional  # 类型标注：表示"可能是这个值，也可能是 None"
 from core.history.history_manager import Crop_Direction, HistoryManager  # 导入"裁剪方向"枚举和历史管理器
 from tools.base_tool import BaseTool  # 导入父类
 
@@ -28,18 +28,52 @@ class SmartContextCropper(BaseTool):
     def get_tool_name():
         return "smart_context_cropper"  # 在模型眼里的名字
 
-    async def act(self, crop_direction: Crop_Direction, crop_amount: int, deleted_messages_summary: str):
+    @staticmethod
+    def _normalize_direction(raw) -> Optional[Crop_Direction]:
+        """把模型给的裁剪方向统一成枚举（2026-11-06 第 9 轮新增）
+
+        为什么需要这一步？
+          这个工具的说明书示例里写的是 "TOP" / "BOTTOM"（大写），
+          而枚举值是 "top" / "bottom"。原来的代码直接拿它去和 Crop_Direction.TOP 比，
+          大写的 "TOP" 比不上小写的 "top"，于是一路落到 else 分支——
+          模型想从顶部删，实际却从底部删了。这种"静默走错分支"最难查。
+          现在先归一化（去空格、转小写），再转成枚举；转不了就明确报错。
+        """
+        if isinstance(raw, Crop_Direction):  # 已经是枚举（测试里会这么传）
+            return raw
+        text = str(raw or "").strip().lower()  # 去空格 + 转小写
+        try:
+            return Crop_Direction(text)
+        except ValueError:  # 既不是 top 也不是 bottom
+            return None
+
+    async def act(self, crop_direction: Crop_Direction, crop_amount: int, deleted_messages_summary: str = ""):
         # crop_direction：从头删还是从尾删
         # crop_amount：删几条
-        # deleted_messages_summary：被删内容的摘要（这个参数其实没被使用，见下面）
+        # deleted_messages_summary：被删内容的摘要
+        #
+        # 【2026-11-06 第 9 轮修复】这个参数原来是"必填但没人用"：
+        #   模型认真写了摘要，工具拿到手直接扔掉，于是删掉的信息真的消失了。
+        #   现在把它作为一条消息插回被删位置（见 HistoryManager.crop_message 的 note 参数）。
         try:  # 试
-            if (crop_amount <= 0):  # 删除数量必须是正数
+            try:
+                amount = int(crop_amount)  # 模型有时会把数字写成字符串
+            except (TypeError, ValueError):
+                return "裁剪数量无效：crop_amount 必须是整数。"
+            if amount <= 0:  # 删除数量必须是正数
                 return "裁剪数量无效：crop_amount 必须大于 0。"
-            result = self._history_manager.crop_message(crop_direction, crop_amount)  # 让历史管理器去删
+
+            direction = self._normalize_direction(crop_direction)  # 归一化方向
+            if direction is None:
+                return "裁剪方向无效：只能是 top（从开头删）或 bottom（从结尾删）。"
+
+            note = deleted_messages_summary.strip() if isinstance(deleted_messages_summary, str) else ""
+            result = self._history_manager.crop_message(direction, amount, note=note)  # 让历史管理器去删
+
+            if result.startswith("裁剪成功") and note:
+                # 明确告诉模型"你写的摘要没白发"，它下次才会继续认真写
+                return result + " 已把 deleted_messages_summary 作为一条消息保留在对话里。"
             return result  # 把"删成功"或"删不了"的结果返回给模型
-            # ⚠️ 这里没有处理 deleted_messages_summary。
-            #    也就是说：模型辛苦写的摘要，其实根本没被存进对话里，
-            #    删掉的内容是真的消失了。这是个明显可以改进的点。
         except Exception as e:  # 出错就捕获
             return f"smart_context_cropper 执行出错：{e}"  # 返回错误信息
 
@@ -114,7 +148,7 @@ class SmartContextCropper(BaseTool):
 <smart_context_cropper>
 smart_context_cropper(
     need_user_approve = true,
-    crop_direction = "TOP",
+    crop_direction = "top",
     crop_amount = 2,
 )
 </smart_context_cropper>
@@ -131,7 +165,7 @@ smart_context_cropper(
 <smart_context_cropper>
 smart_context_cropper(
     need_user_approve = false,
-    crop_direction = "BOTTOM",
+    crop_direction = "bottom",
     crop_amount = 3,
     deleted_messages_summary = "失败总结：(1) 调整 GC 参数无效，虽然确实观察到了长停顿；(2) 数据库写锁的假设不成立——加索引并没有降低延迟；(3) 批处理任务的相关性无法确认——关掉相关实验后没有变化。结论：尖峰很可能是因为定时任务和数据库维护时段重叠。下一步：检查 00:00 的定时任务和数据库清理/备份窗口，在那段时间加临时限流或排队。"
 )

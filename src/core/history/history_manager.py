@@ -21,6 +21,7 @@ import os  # os 库：读环境变量
 from pyexpat.errors import messages
 # ↑ 这行是原作者手滑多导入的（pyexpat 是解析 XML 用的库），代码里根本没用它。
 #   不影响运行，但属于可以删掉的垃圾行。保留在这里是为了跟原版保持一致。
+from typing import Any  # 【第 9 轮】类型标注：原来自定义函数写成 -> any（内置函数 any），是错的
 from dotenv import load_dotenv  # 导入用于读取 .env 文件的函数
 from ui.ui_manager import UIManager  # 导入界面管理器：压缩时要给用户提示一句
 from enum import Enum  # Enum 用来做"枚举"：一组固定的选项，防止写错
@@ -78,12 +79,103 @@ def message_text(message) -> str:
     return "" if content is None else str(content)  # 其他情况：能转文字就转，什么都没有就返回空串
 
 
+# -----------------------------------------------------------------------------
+# 【2026-11-06 第 9 轮新增】裁剪的安全边界
+#
+# 为什么需要这一组函数？
+#   OpenAI 格式要求 assistant(tool_calls) 和紧随其后的 tool 消息必须成对出现：
+#     - 留下 assistant(tool_calls) 却删掉它的 tool 结果 → 400：
+#       "An assistant message with 'tool_calls' must be followed by tool messages"
+#     - 留下 tool 结果却删掉它的 assistant → 400：
+#       "messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
+#   而原来的裁剪是"按下标硬切"：crop_message 直接 messages[crop_amount:]，
+#   _compress_single_session 直接 user_index+1+3，都可能正好切在一对中间。
+#   结果是：上下文一到阈值、一裁剪，下一次请求就 400，整个对话直接结束。
+#
+# 解法：切之前把刀口"挪"到安全位置。挪的方向永远是多保留一点，
+# 宁可少删几条，也不能把对话切坏。
+# -----------------------------------------------------------------------------
+
+def _role(message) -> Any:
+    """读 role，字典和对象两种形态都支持（模块级版本，给下面的工具函数用）"""
+    if isinstance(message, dict):
+        return message.get("role")
+    return getattr(message, "role", None)
+
+
+def _tool_calls(message) -> list:
+    """取出这条消息带 tool_calls（没有就返回空列表）
+
+    为什么要做类型兜底？
+      历史里的 assistant 消息是字典，但测试里可能用对象；
+      两种情况都要能读，否则一个 AttributeError 就把裁剪打断了。
+    """
+    value = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+    return list(value) if value else []
+
+
+def _owner_index(messages: list, index: int) -> int:
+    """找出 index 这条 tool 消息"属于"哪个 assistant（往前找最近一条带 tool_calls 的）
+
+    返回 -1 表示找不到主人——说明这条消息本身就是残缺的（测试用的假数据常见），
+    这种情况下我们不去猜，交给调用方决定（一律不改刀口）。
+    """
+    for i in range(index - 1, -1, -1):
+        if _role(messages[i]) == Role.ASSISTANT and _tool_calls(messages[i]):
+            return i
+    return -1
+
+
+def align_top_cut(messages: list, index: int) -> int:
+    """把"从 index 往后保留"的刀口往前挪到安全位置（第 9 轮新增）
+
+    不安全的样子：messages[index] 是 tool，但它的 assistant 已经被切掉了。
+    这时把刀口挪到那条 assistant 上，保住整对。
+    """
+    index = max(0, min(index, len(messages)))
+    while 0 < index < len(messages) and _role(messages[index]) == Role.TOOL:
+        owner = _owner_index(messages, index)
+        if owner < 0 or owner >= index:  # 没主人（残缺数据）→ 不去猜
+            break
+        index = owner  # 刀口退到主人那一行
+    return index
+
+
+def align_bottom_cut(messages: list, index: int) -> int:
+    """把"保留 [0:index]"的刀口往前挪到安全位置（第 9 轮新增）
+
+    不安全的样子：messages[index-1] 是带 tool_calls 的 assistant，
+    但它的 tool 结果在 index 之后被切掉了。这时连这条 assistant 一起切掉。
+    """
+    index = max(0, min(index, len(messages)))
+    while 0 < index <= len(messages) and _tool_calls(messages[index - 1]):
+        index -= 1
+    return index
+
+
+def make_note_message(text: str) -> dict:
+    """把一段摘要包成一条"用户消息"（第 9 轮新增，给 crop_message 用）
+
+    为什么用 user 身份？
+      和自动压缩时的公告一致（见 _create_compression_notice）：
+      模型对"用户说的"接受度最高，而且不需要额外解释这是什么结构。
+    """
+    return {
+        "role": Role.USER,
+        "content": [{"type": "text", "text": text}],
+    }
+
+
 class BaseHistoryManager(ABC):
     # 定义一个"抽象基类"，相当于"合同模板"：
     # 谁继承我，就必须把下面带 @abstractmethod 的方法全部实现，少一个都不能创建对象
     def __init__(self):
         self.messages_history = [[]]  # 一本书，一开始只有一页空纸
         self.history_token_usage = []  # 每页对应的 token 用量记录
+        # 【2026-11-06 第 9 轮新增】"当前这份用量是否已经压缩过"。
+        #   False = 刚拿到新用量，还没压；True = 这份用量已经处理过，别再压第二遍。
+        #   配合 auto_messages_compression() 使用，防止压缩连环触发。
+        self._compressed_for_current_usage = False
 
     @abstractmethod
     def add_message(self, message) -> None:
@@ -96,7 +188,7 @@ class BaseHistoryManager(ABC):
         pass
 
     @abstractmethod
-    def get_current_messages(self) -> any:
+    def get_current_messages(self) -> Any:
         pass
 
     async def auto_messages_compression(self) -> None:
@@ -105,8 +197,23 @@ class BaseHistoryManager(ABC):
         # 【2026-11-06 第 2 轮优化】从同步改成异步（async）：
         #   因为现在压缩时会调用大模型生成摘要，而调模型是异步操作。
         #   调用方也要相应加上 await（conversation.py 的两处已同步修改）。
-        if self._requires_compression():  # 调用下面的判断方法
-            await self._compress_current_message()  # 需要就执行压缩
+        #
+        # 【2026-11-06 第 9 轮修复】压缩后会挂一个"已处理"标记（见下面几行）。
+        #   为什么必须挂？
+        #     压缩不会改变 history_token_usage[-1] 里那个"上一轮请求用了多少"，
+        #     所以 _requires_compression() 压完还是 True。
+        #     而 Conversation._run_one_iteration 在一轮里会调这个方法两次
+        #     （请求前一次、收到回复后又一次），下一次迭代还要再调。
+        #     结果就是：一旦过线，就会连续压好几次，每次都真调一次摘要模型——
+        #     钱花了、消息也被多删了。
+        #   现在压完就标记"这份用量已经处理过"，直到下一次真正的请求
+        #     更新用量（update_token_usage 会把标记清掉）才允许再压。
+        if self._compressed_for_current_usage:  # 这份用量已经压过了
+            return
+        if not self._requires_compression():  # 调用下面的判断方法
+            return
+        await self._compress_current_message()  # 需要就执行压缩
+        self._compressed_for_current_usage = True  # 本轮用量已处理，不再重复压
 
     @abstractmethod
     def _requires_compression(self) -> bool:
@@ -168,7 +275,12 @@ class HistoryManager(BaseHistoryManager):
     # mustn't crop the latest user input message
     # mustn't crop_amount < current_messages - 1
     # ↑ 原作者的两句提醒：不能把"用户最新说的那句"删掉，删除数量也不能超范围
-    def crop_message(self, crop_direction: Crop_Direction, crop_amount: int) -> str:
+    #
+    # 【2026-11-06 第 9 轮】新增 note 参数，并把刀口对齐到"工具调用配对"的安全位置。
+    #   note：被删内容的摘要，会插在"被删掉的那一段原来的位置"上。
+    #         原来这个参数在 smart_context_cropper 里是必填的，但工具层拿到手就扔了，
+    #         等于删掉的信息真的消失了——现在补上。
+    def crop_message(self, crop_direction: Crop_Direction, crop_amount: int, note: str = "") -> str:
         current_messages = self.messages_history[-1]  # 拿到当前这一页
 
         if len(current_messages) <= 1:  # 只有 1 条或更少，删了就没内容了
@@ -181,7 +293,8 @@ class HistoryManager(BaseHistoryManager):
         latest_user_index = -1  # 先假设"没找到用户消息"，用 -1 表示
         for i in range(len(current_messages) - 1, -1, -1):
             # range(开始, 结束, 步长)：从最后一条往前走，也就是"从后往前找"
-            if current_messages[i]['role'] == Role.USER:  # 找到一条"用户说的话"
+            # 【第 9 轮】改用 _role()，字典和对象两种形态都能读（原来只支持字典）
+            if _role(current_messages[i]) == Role.USER:  # 找到一条"用户说的话"
                 latest_user_index = i  # 记下它的位置
                 break  # 找到就停（从后往前找，找到的就是最新的那条）
 
@@ -197,18 +310,29 @@ class HistoryManager(BaseHistoryManager):
         if crop_amount > max_crop_amount:  # 想删的比允许的还多
             return "无法裁剪：不能删掉用户最新说的那条消息。"  # 拒绝，保护用户最新输入
 
+        note_messages = [make_note_message(note)] if note and note.strip() else []
+        # 【第 9 轮】把摘要包成消息，插到"被删掉的那一段"原来的位置
+
         if crop_direction == Crop_Direction.TOP:
             # crop from the top, keeping system messages and content after the latest user message
-            system_messages = [msg for msg in current_messages if msg['role'] == Role.SYSTEM]
+            intended_cut = crop_amount  # 原本想从这里开始保留
+            cut = align_top_cut(current_messages, intended_cut)  # 【第 9 轮】挪到安全位置
+            system_messages = [msg for msg in current_messages if _role(msg) == Role.SYSTEM]
             # 上面这行是列表推导式：把"所有系统消息"单独挑出来，因为系统提示词永远不能删
-            cropped_messages = system_messages + current_messages[crop_amount:]
-            # 结果是：系统消息 + 从第 crop_amount 条开始往后的内容
+            cropped_messages = system_messages + note_messages + current_messages[cut:]
+            # 结果是：系统消息 + 摘要 + 从第 cut 条开始往后的内容
         else:  # BOTTOM
             # crop from the bottom, ensuring not to crop the latest user message
-            cropped_messages = current_messages[:-crop_amount]
-            # [:-n] 的意思是"从头取到倒数第 n 条之前"，也就是把最后 n 条砍掉
+            intended_cut = len(current_messages) - crop_amount
+            cut = align_bottom_cut(current_messages, intended_cut)  # 【第 9 轮】挪到安全位置
+            cropped_messages = current_messages[:cut] + note_messages
+            # [:] 的意思是"从头取到第 cut 条之前"，也就是把后面那些砍掉
 
         self.messages_history[-1] = cropped_messages  # 用新列表替换掉当前这一页
+
+        skipped = intended_cut - cut  # 为了保住完整性，实际少删了几条
+        if skipped > 0:
+            return (f"裁剪成功，但为保证工具调用与其结果不被拆开，实际少删了 {skipped} 条。")
         return "裁剪成功。"  # 告诉调用方"删成功了"
 
     @property
@@ -236,7 +360,11 @@ class HistoryManager(BaseHistoryManager):
         # 注意这里用的是"覆盖"而不是"累加"：因为每次请求返回的 total_tokens
         # 已经是"这一整轮对话的总量"，不是"本次新增量"，所以覆盖才是对的
 
-    def get_current_messages(self) -> any:
+        # 【2026-11-06 第 9 轮】来了新的用量数字，说明上下文已经变了，
+        #   之前那次压缩的"已处理"标记要清掉，允许按新数字重新判断要不要压。
+        self._compressed_for_current_usage = False
+
+    def get_current_messages(self) -> Any:
         return copy.deepcopy(self.messages_history[-1])  # 深拷贝一份返回
         # 为什么要复制？因为调用方（比如加缓存标记）会修改返回的列表，
         # 不复制的话会把原始记录也改掉
@@ -283,7 +411,7 @@ class HistoryManager(BaseHistoryManager):
             await self._compress_single_session(current_messages, user_indices[0], 3)  # 就删掉紧跟在它后面的 3 条
 
     @staticmethod
-    def _role_of(message) -> any:
+    def _role_of(message) -> Any:
         """读取一条消息的 role，字典和对象两种写法都支持（2026-11-06 新增）
 
         为什么需要这个函数？
@@ -334,6 +462,13 @@ class HistoryManager(BaseHistoryManager):
         start_index = min(user_index + 1 + delete_message_num, len(messages))
         # 计算"从第几条开始保留"：用户消息后面跳过 delete_message_num 条
         # min(..., len(messages)) 是防止算出来的位置超出列表长度
+
+        # 【2026-11-06 第 9 轮修复】如果刀口正好落在一条 tool 消息上，
+        #   说明它上面那条 assistant(tool_calls) 会被删掉，而结果却被留下——
+        #   下一次请求就会 400（role=tool 找不到对应的 tool_calls）。
+        #   这里把刀口往后推到这一组工具结果之后，整组一起删。
+        while start_index < len(messages) and _role(messages[start_index]) == Role.TOOL:
+            start_index += 1
 
         removed_messages = messages[user_index + 1:start_index]  # 【2026-11-06 第 2 轮新增】要删掉的那几条
         summary = await self._summarize_if_possible(removed_messages)  # 先总结
