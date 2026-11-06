@@ -120,20 +120,32 @@ class CmdRunner(BaseTool):
 
     @staticmethod
     def _decode(raw: bytes) -> str:
-        """把命令输出的原始字节转成文字（2026-11-06 新增）
+        """把命令输出的原始字节转成文字（2026-11-06 新增，第 4 轮修正编码顺序）
 
         为什么要猜编码？
           Linux/Mac 上命令输出基本都是 UTF-8，但中文 Windows 的 cmd 输出是 GBK。
           如果一律按 UTF-8 解码，遇到中文就会抛 UnicodeDecodeError。
-          所以先试 UTF-8，不行再试系统默认编码，最后才用"忽略错误"的兜底方式。
+
+        第 4 轮踩到的坑：
+          原来只试 [utf-8, 系统默认编码]。但在这个环境里系统默认也是 UTF-8，
+          于是两个都失败，最后走到 errors="replace"，中文就全变成了 �����。
+          现在把 GBK 显式加进候选列表（GBK 是中文 Windows 命令行的实际编码）。
         """
         if not raw:  # 没有任何输出
             return ""  # 直接返回空字符串
-        for encoding in ("utf-8", locale.getpreferredencoding(False)):  # 依次尝试两种编码
+
+        candidates = ["utf-8", "gbk", locale.getpreferredencoding(False)]
+        # 注意顺序：UTF-8 优先（现代工具的输出），其次 GBK（中文 Windows 命令行），最后系统默认
+        tried = set()  # 记录试过的编码，避免重复
+        for encoding in candidates:
+            if not encoding or encoding.lower() in tried:  # 重复或为空
+                continue
+            tried.add(encoding.lower())
             try:
-                return raw.decode(encoding)  # 解码成功就直接返回
-            except UnicodeDecodeError:  # 这个编码解不了
+                return raw.decode(encoding)  # 严格解码，失败会抛异常
+            except (UnicodeDecodeError, LookupError):  # 这个编码解不了
                 continue  # 换下一个
+
         return raw.decode("utf-8", errors="replace")  # 都失败：强行解码，把不能认的字符替换成 �
 
     @staticmethod

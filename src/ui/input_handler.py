@@ -19,6 +19,8 @@ Input handling functionality for user interactions.（处理用户交互中的�
 import asyncio  # 用来做异步操作
 from typing import Optional  # 类型标注工具（表示"可能是这个值，也可能没有"）
 
+from . import theme  # 【2026-11-06 第 4 轮】输入提示符的样式从这里取
+
 
 class InputHandler:
     """Handles all user input operations.（处理所有用户输入操作）"""
@@ -27,7 +29,7 @@ class InputHandler:
         """Initialize the input handler.（初始化，这里没什么要做的）"""
         pass  # 什么都不做
 
-    async def get_user_input(self, prompt: str = "Enter: ") -> str:
+    async def get_user_input(self, prompt: str = None) -> str:
         """
         Get user input asynchronously.（异步获取用户输入）
 
@@ -37,7 +39,10 @@ class InputHandler:
         Returns:
             User input as string（用户输入的字符串）
         """
-        print("👤")  # 先打印一个人头图标，表示"该你说了"
+        # 【2026-11-06 第 4 轮】改成一个青色的 ❯ 提示符，并去掉原来单独一行的 👤
+        #   原来每次输入前都打一个 emoji，屏幕上会堆一排人头，很乱。
+        if prompt is None:  # 调用方没指定提示符
+            prompt = theme.prompt_text()  # 用统一的 ❯
         loop = asyncio.get_event_loop()  # 拿到当前的"事件循环"（异步任务的总调度台）
         return await loop.run_in_executor(None, input, prompt)
         # 上一行是关键：把 input 函数丢到"执行器"里去跑

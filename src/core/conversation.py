@@ -25,6 +25,7 @@ from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器
 from core.prompt.reminder import get_reminder  # 导入函数：生成一段"提醒模型去看 todo"的文字
 from tools.tool_manager import ToolManager  # 导入工具管理器：负责注册工具、执行工具
 from ui.ui_manager import UIManager  # 导入界面管理器：负责显示和要输入
+from ui.theme import DOT  # 【第 4 轮】状态行里的分隔点 ·
 from .history.history_manager import HistoryManager, message_text  # 导入历史管理器；message_text 用来把消息转成纯文本
 
 
@@ -217,7 +218,8 @@ class Conversation:
         }
 
         # Start assistant response
-        self._ui_manager.print_simple_message("", "🤖")  # 先打印一个机器人头像，表示"模型开始说话了"
+        # 【第 4 轮】圆点不再单独打印：它现在画在流式区域内部，
+        # 这样模型"只调工具不说话"时，屏幕上不会多出一个空圆点。
 
         # Use streaming API for response
         try:  # 开始试：这一段是"收流式回复"
@@ -327,7 +329,7 @@ class Conversation:
 
     def _print_context_window_and_total_cost(self):
         # 打印一行状态："上下文窗口用了 12.3%，一共花了 0.45 美元"
-        self._ui_manager.print_simple_message(f"（上下文已用 {self._history_manager.current_context_window}%，累计花费 {self._api_client.total_cost} 美元）")
+        self._ui_manager.print_status(f"上下文 {self._history_manager.current_context_window}% {DOT} 花费 ${self._api_client.total_cost}")
 
     # -------------------------------------------------------------------------
     # 【2026-11-06 第 2 轮新增】摘要式压缩相关

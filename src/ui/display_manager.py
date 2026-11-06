@@ -1,17 +1,19 @@
 # =============================================================================
 # 文件：src/ui/display_manager.py
-# 作用：管"往屏幕上打东西"。所有你看到的文字、表格、清单，都是这里画出来的。
+# 作用：管"往屏幕上打东西"。所有你看到的文字、清单、状态行，都是这里画出来的。
 #
-# 用到的库叫 rich，它能让终端显示得更漂亮：
-#   - Markdown：把 **粗体**、`代码`、列表这些东西渲染成好看的样子
+# 用到的库叫 rich：
+#   - Markdown：把 **粗体**、`代码`、列表渲染成好看的样子
 #   - Live：可以"原地不断刷新"一块区域，这就是流式输出的效果
-#     （模型吐一个字，就把整段重画一遍，看起来像在实时打字）
+#   - Padding：给内容加左缩进，让回答看起来是从符号下面"展开"的
 #
-# 这个文件里的方法分四类：
-#   1. 打印消息（assistant / simple / error / success / info）
-#   2. 流式显示（start / stop / print）
-#   3. 画待办清单（display_todos）
-#   4. 内部小工具（_get_status_icon）
+# 【2026-11-06 第 4 轮】整体换了视觉风格，参考 Claude Code：
+#   模型说话   ⏺  后面跟缩进两格的正文
+#   工具调用   ⏺ 工具名(参数)
+#   工具结果     ⎿  一行预览
+#   状态栏       ⎿  上下文 x% · 花费 $y
+#   错误       ✗ （红色）
+#   提示       · （暗灰）
 # =============================================================================
 
 """
@@ -21,7 +23,12 @@ Display management functionality for outputting content to users.（负责往屏
 from rich.console import Console  # rich 库的"控制台"对象，是打印的入口
 from rich.markdown import Markdown  # 把 markdown 文本变成带格式的漂亮输出
 from rich.live import Live  # "实时刷新"组件，流式输出的核心
+from rich.padding import Padding  # 给内容加内边距（这里用来做左缩进）
+from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
+from rich.console import Group  # 把多个可渲染对象竖着叠在一起
 from typing import Optional  # 类型标注：表示"可能是这个，也可能是 None"
+
+from . import theme  # 本项目统一的配色和符号（见 theme.py）
 
 
 class DisplayManager:
@@ -32,52 +39,149 @@ class DisplayManager:
         Initialize the display manager.（初始化）
 
         Args:
-            console: Rich console instance, creates new one if None（控制台对象，不传就新建一个）
+            console: Rich console instance, creates new one if None（控制台对象，不传就用全局那一个）
         """
-        self._console = console or Console()  # 如果传了就用传的，没传就新建（a or b 是"a 为空就用 b"）
+        self._console = console or theme.console  # 默认共用 theme 里的全局控制台，保证风格一致
         self._live: Optional[Live] = None  # 存放流式显示对象，一开始没有
         self._stream_buffer: str = ""  # 存放已经收到但还没显示完的文字
 
-    def print_assistant_message(self, content: str, emoji: str = "🤖") -> None:
-        """
-        Print assistant message with markdown formatting.（打印模型回复，带 markdown 格式）
+    # -------------------------------------------------------------------------
+    # 一、消息类
+    # -------------------------------------------------------------------------
+    def assistant_header(self) -> None:
+        """只打印模型发言的起始标记 ⏺（2026-11-06 第 4 轮新增）
 
-        Args:
-            content: Content to display（要显示的内容）
-            emoji: Emoji to display before content（前面的图标）
+        为什么要单独一个方法？
+          流式输出时，我们得先把 ⏺ 打出来，再让文字一点点往外冒。
+          否则用户会先看到一串文字，末尾才出现圆点，看起来很怪。
         """
-        content = content.strip() if content else ""
-        # 这行的意思：如果 content 有值，就去掉首尾空白；如果是空的，就保持空字符串
-        if content:  # 如果内容不是空的（空的话就别浪费屏幕了）
-            if emoji:  # 如果要图标
-                print(emoji)  # 先打图标
-            self._console.print(Markdown(content))  # 把内容当 markdown 渲染后打印
+        self._console.print(Text(f"{theme.BULLET} ", style="qs.accent"), end="\n")
+
+    def print_assistant_message(self, content: str, emoji: str = "", header: bool = True) -> None:
+        """打印模型回复（带 markdown 渲染）
+
+        样式说明：
+          先打一个青色圆点 ⏺，再把正文缩进两格渲染。
+          这样长回复在视觉上是"挂在圆点下面"的，和 Claude Code 一致。
+          header=False 用于"流式已经打过圆点、这里只补正文"的场景。
+        """
+        content = content.strip() if content else ""  # 去掉首尾空白；空内容保持空串
+        if not content:  # 没内容就直接返回，别浪费屏幕
+            return
+        if header:  # 需要的话先打圆点
+            self.assistant_header()
+        self._console.print(Padding(Markdown(content), (0, 0, 0, 2)))  # 正文左缩进 2 格
 
     def print_simple_message(self, message: str, emoji: str = "") -> None:
-        """
-        Print a simple message without markdown formatting.（打印纯文本，不做 markdown 渲染）
-        """
-        if emoji:  # 有图标就带图标一起打
-            print(f"{emoji} {message}")
-        else:  # 没图标就只打内容
-            print(message)
+        """打印纯文本（不做 markdown 渲染）"""
+        if not message:  # 空消息不打，避免留下空行
+            return
+        self._console.print(Padding(Text(message, style="qs.dim"), (0, 0, 0, 2)))
+        # 一律用暗灰色 + 左缩进，避免和模型正文抢注意力
 
+    def print_error(self, error_message: str, emoji: str = "") -> None:
+        """打印错误信息：红色叉号 + 红色文字"""
+        text = Text()
+        text.append(f"{theme.CROSS} ", style="bold qs.err")  # 叉号加粗红色
+        text.append(str(error_message), style="qs.err")  # 正文红色
+        self._console.print(text)
+
+    def print_success(self, success_message: str, emoji: str = "") -> None:
+        """打印成功信息：绿色对勾"""
+        text = Text()
+        text.append(f"{theme.CHECK_ON} ", style="qs.ok")
+        text.append(str(success_message), style="qs.dim")  # 正文仍然是暗色，只有符号点缀
+        self._console.print(text)
+
+    def print_info(self, info_message: str, emoji: str = "") -> None:
+        """打印提示信息：暗色小圆点，最不抢眼"""
+        text = Text()
+        text.append(f"{theme.DOT} ", style="qs.dim")
+        text.append(str(info_message), style="qs.dim")
+        self._console.print(text)
+
+    def print_status(self, text_content: str) -> None:
+        """打印状态行（2026-11-06 第 4 轮新增）
+
+        样式：  ⎿  上下文 12.3% · 花费 $0.01
+        用 ⎿ 表示"这是上面那轮对话的补充信息"，比单独一行括号更清晰。
+        """
+        text = Text()
+        text.append(f"  {theme.RESULT} ", style="qs.dim")  # 两个空格缩进 + 转折符号
+        text.append(text_content, style="qs.dim")  # 内容暗灰
+        self._console.print(text)
+
+    # -------------------------------------------------------------------------
+    # 二、工具调用（Claude Code 风格）
+    # -------------------------------------------------------------------------
+    def tool_header(self, tool_name: str, args_preview: str = "") -> None:
+        """打印一行"工具调用"（2026-11-06 第 4 轮新增）
+
+        样式：  ⏺ cmd_runner(dir)
+        参数太长时由调用方先截断，这里只负责排版。
+        """
+        text = Text()
+        text.append(f"{theme.BULLET} ", style="qs.accent")  # 圆点
+        text.append(tool_name, style="bold")  # 工具名加粗
+        if args_preview:  # 有参数就用暗色括起来
+            text.append(f"({args_preview})", style="qs.dim")
+        self._console.print(text)
+
+    def tool_result(self, result: str, success: bool = True) -> None:
+        """打印工具执行结果（2026-11-06 第 4 轮新增）
+
+        样式：    ⎿  hello
+        失败时整行变红，成功时暗灰——这样一眼就能从满屏输出里找到出问题的那次调用。
+        """
+        text = Text()
+        text.append(f"  {theme.RESULT}  ", style="qs.dim")  # 缩进两格 + 转折符号 + 空格
+        style = "qs.dim" if success else "qs.err"  # 成功用暗灰，失败用红
+        text.append(str(result), style=style)
+        self._console.print(text)
+
+    # -------------------------------------------------------------------------
+    # 三、流式显示
+    # -------------------------------------------------------------------------
     def start_stream_display(self, refresh_rate: int = 10) -> None:
         """
         Start streaming display mode.（开启流式显示模式）
 
-        Args:
-            refresh_rate: Refresh rate per second for live display（每秒刷新几次）
+        【2026-11-06 第 4 轮】圆点 ⏺ 现在画在"流式区域"内部，
+        而不是事先单独打一行。好处是：模型只调工具、不说话时，
+        屏幕上不会多出一个空圆点。
         """
         self._stream_buffer = ""  # 清空缓冲区，准备接收新内容
-        self._live = Live(console=self._console, refresh_per_second=refresh_rate)  # 创建一个"实时刷新区域"
-        self._live.start()  # 开始刷新（此时屏幕上会出现一块会被不断重画的地方）
+        self._live = Live(
+            console=self._console,
+            refresh_per_second=refresh_rate,
+            vertical_overflow="visible",  # 内容超过一屏时保留滚动，不要裁掉
+            get_renderable=self._stream_renderable,  # 每次刷新都调用这个函数拿最新画面
+        )
+        self._live.start()  # 开始刷新
+
+    def _stream_renderable(self):
+        """根据当前缓冲区生成"这一帧"要显示的内容（2026-11-06 第 4 轮新增）"""
+        if not self._stream_buffer:  # 还没有任何文字
+            return Text("")  # 显示空内容（屏幕上就是一片空白，不会留圆点）
+        return Group(
+            Text(f"{theme.BULLET} ", style="qs.accent"),  # 圆点
+            Padding(Markdown(self._stream_buffer), (0, 0, 0, 2)),  # 缩进两格的正文
+        )
 
     def stop_stream_display(self) -> None:
-        """Stop streaming display mode.（结束流式显示模式）"""
+        """Stop streaming display mode.（结束流式显示模式）
+
+        【2026-11-06 第 4 轮】补一个换行。
+        原因：Live 结束后，光标会停在最后一行末尾（没有换行符），
+        紧跟着打印的状态行就会粘在正文屁股后面，看起来像
+        "……助手的话  ⎿ 上下文 3.5%"。这里补一行就分开了。
+        """
         if self._live:  # 如果当前确实在刷新
+            had_content = bool(self._stream_buffer.strip())  # 之前有没有真的输出过文字
             self._live.stop()  # 停掉它（不然它会一直占着屏幕）
             self._live = None  # 清空引用
+            if had_content:  # 有文字才补换行（纯工具调用的轮次不需要）
+                self._console.print()
 
     def print_streaming_content(self, chunk: str) -> None:
         """
@@ -90,75 +194,70 @@ class DisplayManager:
             self._stream_buffer = ""  # 就建一个空的
 
         self._stream_buffer += chunk  # 把新来的这一小段接到后面
-        if self._live:  # 如果正在流式显示
-            self._live.update(Markdown(self._stream_buffer))  # 用"到目前为止的全部文字"重画一遍
-            # 注意：每次都重画全部，而不是只追加。
-            # 这么做开销大一点，但能保证 markdown 渲染正确（比如代码块跨了多行）
+        # 不用手动 update：Live 会按 refresh_per_second 自己去取 _stream_renderable()
 
     def get_stream_buffer(self) -> str:
         """Get the current stream buffer content.（把缓冲区里的内容取出来）"""
         return getattr(self, "_stream_buffer", "")
-        # getattr 的第三个参数是"取不到时的默认值"，这样就算属性不存在也不会报错
 
     def clear_stream_buffer(self) -> None:
         """Clear the stream buffer.（清空缓冲区）"""
         self._stream_buffer = ""
 
-    def print_error(self, error_message: str, emoji: str = "❌") -> None:
-        """
-        Print error message with special formatting.（打印错误信息）
-        """
-        if emoji:
-            print(f"{emoji} {error_message}")
-        else:
-            print(error_message)
+    # -------------------------------------------------------------------------
+    # 四、待办清单
+    # -------------------------------------------------------------------------
+    def display_todos(self, todos: list, emoji: str = "") -> None:
+        """把待办清单画出来（2026-11-06 第 4 轮改成勾选样式）
 
-    def print_success(self, success_message: str, emoji: str = "✅") -> None:
-        """
-        Print success message with special formatting.（打印成功信息）
-        """
-        if emoji:
-            print(f"{emoji} {success_message}")
-        else:
-            print(success_message)
-
-    def print_info(self, info_message: str, emoji: str = "ℹ️") -> None:
-        """
-        Print info message.（打印提示信息）
-        """
-        if emoji:
-            print(f"{emoji} {info_message}")
-        else:
-            print(info_message)
-
-    def display_todos(self, todos: list, emoji: str = "📋") -> None:
-        """
-        Display todo list with formatting.（把待办清单画出来）
-
-        Args:
-            todos: List of todo items（待办列表）
-            emoji: Emoji to display before todo list（前面的图标）
+        样式：
+          ◻ 1  写解析器            ← 未开始（暗色）
+          ◼ 2  跑测试              ← 进行中（青色加粗）
+          ✔ 3  提交代码            ← 已完成（绿色，文字变暗）
         """
         if not todos:  # 如果清单是空的
-            self.print_info("当前没有待办事项", emoji)  # 提示一句，然后返回
-            return  # 直接结束，不往下画
+            self.print_info("当前没有待办事项")  # 提示一句，然后返回
+            return
 
-        output = []  # 准备一个列表，一行一行往里加
-        output.append("📋 待办清单：")  # 标题
-        output.append("=" * 50)  # 一条分隔线（= 重复 50 次）
+        self._console.print()  # 前面空一行，把清单和正文分开
+        for i, todo in enumerate(todos, 1):  # 遍历清单，i 从 1 开始
+            status = todo.get('status', 'pending')  # 取状态，取不到就当未开始
+            line = Text()
+            if status == 'completed':  # 已完成
+                line.append(f"{theme.CHECK_ON} ", style="qs.ok")  # 绿色对勾
+                line.append(f"{i}  {todo['content']}", style="qs.dim")  # 文字变暗（做完了就不抢眼）
+            elif status == 'in_progress':  # 进行中
+                line.append(f"{theme.CHECK_RUN} ", style="qs.accent")  # 青色实心方块
+                line.append(f"{i}  {todo['content']}", style="bold")  # 加粗，最显眼
+            else:  # 未开始
+                line.append(f"{theme.CHECK_OFF} ", style="qs.dim")  # 暗色空心方块
+                line.append(f"{i}  {todo['content']}", style="")
+            self._console.print(Padding(line, (0, 0, 0, 2)))  # 整体缩进两格
 
-        for i, todo in enumerate(todos, 1):  # 遍历清单，i 从 1 开始（所以要传第二个参数 1）
-            status_icon = self._get_status_icon(todo['status'])  # 根据状态取图标
-            content = todo['content']  # 任务内容
-            todo_id = todo['id']  # 任务编号
+    # -------------------------------------------------------------------------
+    # 五、小工具
+    # -------------------------------------------------------------------------
+    @staticmethod
+    def preview_lines(text, max_lines: int = 3, max_width: int = 70) -> str:
+        """取结果的前几行做预览（2026-11-06 第 4 轮新增）
 
-            output.append(f"{i:2d}. {status_icon} [{todo_id}] {content}")
-            # {i:2d} 的意思是"把 i 显示成至少占 2 个字符宽度，不够补空格"，这样能对齐
-
-        output.append("=" * 50)  # 底部线
-        output.append(f"共 {len(todos)} 项")  # 统计总数
-
-        self.print_simple_message("\n".join(output))  # 用换行把列表连成一整段，然后打印
+        为什么不用 shorten 那种"整段折成一行"？
+          像 dir、git status 这类输出，整段折行会变成一坨没法读的长句。
+          取前 3 行、每行截断到 70 字，既能看出"跑成功了没、大概是什么"，又不会刷屏。
+        """
+        text = str(text)  # 保险：可能是字典或数字
+        lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n") if line.strip()]
+        # 先统一换行，再滤掉空行
+        if not lines:  # 没有任何内容
+            return "（无输出）"
+        picked = []  # 装挑出来的几行
+        for line in lines[:max_lines]:  # 只看前几行
+            if len(line) > max_width:  # 单行太长就截断
+                line = line[:max_width] + "…"
+            picked.append(line)
+        if len(lines) > max_lines:  # 后面还有，就补一句提示
+            picked.append(f"…（共 {len(lines)} 行）")
+        return " ⏎ ".join(picked)  # 用 ⏎ 把几行连起来，表示"这里换过行"
 
     @staticmethod
     def shorten(text, limit: int = 600) -> str:
@@ -177,21 +276,3 @@ class DisplayManager:
         head_length = max(0, limit - 40)  # 留 40 个字符的位置给后面的省略说明
         preview = one_line[:head_length].rstrip()  # 截取前面一段
         return f"{preview} …（共 {len(text)} 字符，已省略 {len(text) - head_length}）"
-
-    def _get_status_icon(self, status: str) -> str:
-        """
-        Get icon for todo status.（根据状态返回对应图标）
-
-        Args:
-            status: Todo status（状态字符串）
-
-        Returns:
-            Icon string for the status（图标）
-        """
-        icons = {
-            # 一个字典，把状态映射到图标
-            'pending': '⏳',  # 待办：沙漏
-            'in_progress': '🔄',  # 进行中：循环箭头
-            'completed': '✅'  # 已完成：对勾
-        }
-        return icons.get(status, '❓')  # 取对应的图标，取不到就用问号（表示状态不认识）

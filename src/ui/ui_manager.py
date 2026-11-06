@@ -19,6 +19,7 @@ from typing import Optional  # 类型标注
 from rich.console import Console  # rich 的控制台对象
 from .input_handler import InputHandler  # 导入输入处理器
 from .display_manager import DisplayManager  # 导入显示管理器
+from . import theme  # 【2026-11-06 第 4 轮】统一配色与符号
 
 
 class UIManager:
@@ -46,15 +47,15 @@ class UIManager:
             console: Rich console instance, creates new one if None（控制台对象）
         """
         if not self._initialized:  # 只初始化一次
-            self._console = console or Console()  # 没有就新建一个控制台
+            self._console = console or theme.console  # 没传就用全局那一个（保证配色统一）
             self.input_handler = InputHandler()  # 建输入处理器
             self.display_manager = DisplayManager(self._console)  # 建显示管理器，并把控制台传给它（共用同一个）
             self._initialized = True  # 打标记
 
     # Input delegation methods
     # ↓ 下面这三个方法：全是在转手，把活交给 input_handler
-    async def get_user_input(self, prompt: str = "Enter: ") -> str:
-        """Get user input with specified prompt.（等用户输入）"""
+    async def get_user_input(self, prompt: str = None) -> str:
+        """Get user input with specified prompt.（等用户输入；prompt 为 None 时用统一的 ❯）"""
         return await self.input_handler.get_user_input(prompt)
 
     async def wait_for_user_approval(self, content: str, emoji: str = "🤖") -> tuple[bool, str]:
@@ -67,9 +68,13 @@ class UIManager:
 
     # Display delegation methods
     # ↓ 下面这一批：全是在转手，把活交给 display_manager
-    def print_assistant_message(self, content: str, emoji: str = "🤖") -> None:
+    def print_assistant_message(self, content: str, emoji: str = "", header: bool = True) -> None:
         """Print assistant message with markdown formatting.（打印模型回复）"""
-        self.display_manager.print_assistant_message(content, emoji)
+        self.display_manager.print_assistant_message(content, emoji, header)
+
+    def print_assistant_header(self) -> None:
+        """只打印模型发言的起始圆点 ⏺（2026-11-06 第 4 轮新增）"""
+        self.display_manager.assistant_header()
 
     def print_simple_message(self, message: str, emoji: str = "") -> None:
         """Print simple message without markdown formatting.（打印纯文本）"""
@@ -86,6 +91,13 @@ class UIManager:
     def print_info(self, info_message: str, emoji: str = "") -> None:
         """Print info message.（打印提示）"""
         self.display_manager.print_info(info_message, emoji)
+
+    def print_status(self, text: str) -> None:
+        """打印状态行（2026-11-06 第 4 轮新增）
+
+        用在每轮对话结束时显示"上下文用了多少、花了多少钱"。
+        """
+        self.display_manager.print_status(text)
 
     # Streaming methods
     # ↓ 流式显示相关，同样是转手
@@ -127,34 +139,45 @@ class UIManager:
         """
         Display tool execution information.（显示工具执行的结果）
 
-        Args:
-            tool_name: Name of the tool being executed（工具名）
-            tool_args: Arguments passed to the tool（参数）
-            success: Whether the execution was successful（是否成功）
-            result: Result of the execution（执行结果）
+        【2026-11-06 第 4 轮】改成 Claude Code 那种两行式：
+            ⏺ cmd_runner(dir)      ← 由 show_preparing_tool 打印
+              ⎿  a.py b.py         ← 这里只打印结果
+        参数不再重复显示（上面那行已经带过了）。
         """
-        if success:  # 如果成功
-            # 【2026-11-06 第 2 轮优化】原来是 f"...args: {tool_args}, result: {result}" 全量打印，
-            #   命令输出一长（比如几百行日志）就会刷满整个屏幕，用户什么都看不到。
-            #   现在参数最多显示 200 字符、结果最多 400 字符，超长会折叠成一行并标注省略了多少。
-            args_preview = self.display_manager.shorten(tool_args, 200)
-            result_preview = self.display_manager.shorten(result, 400)
-            self.print_success(f"工具 {tool_name} 执行成功 · 参数：{args_preview} · 结果：{result_preview}")
-        else:  # 如果失败
-            error_preview = self.display_manager.shorten(result, 400)  # 错误信息同样截断
-            self.print_error(f"工具 {tool_name} 执行失败 · 错误：{error_preview}")
+        result_preview = self.display_manager.preview_lines(result, 3, 70)  # 只取前 3 行做预览
+        self.display_manager.tool_result(result_preview, success=success)
 
     def show_preparing_tool(self, tool_name: str, tool_args: dict) -> None:
         """
         Show that a tool is being prepared for execution.（显示"准备调用工具"）
 
-        Args:
-            tool_name: Name of the tool（工具名）
-            tool_args: Arguments for the tool（参数）
+        样式：  ⏺ cmd_runner(dir)
         """
-        # 【2026-11-06 第 2 轮优化】参数同样截断，避免一次写文件的参数把屏幕刷爆
-        args_preview = self.display_manager.shorten(tool_args, 200)
-        self.print_info(f"准备调用工具：{tool_name} · 参数：{args_preview}")
+        args_preview = self._args_preview(tool_args)  # 把参数字典压成一小段可读文字
+        self.display_manager.tool_header(tool_name, args_preview)
+
+    def _args_preview(self, tool_args) -> str:
+        """把工具参数压成一行可读的摘要（2026-11-06 第 4 轮新增）
+
+        为什么要做这件事？
+          直接把字典打印出来是 cmd_runner({'command': 'dir', 'timeout': 30})，
+          又长又难看，还带一堆引号和花括号。
+          这里针对常见工具挑出"最能说明意图"的那个字段：
+            cmd_runner  → 直接显示命令本身：dir
+            task        → 显示任务描述：修复登录问题
+            todo_write  → 显示条数：4 项
+            其他        → 截断后的原样
+        """
+        if not tool_args:  # 没有参数
+            return ""
+        if isinstance(tool_args, dict):  # 最常见的情况：参数字典
+            if tool_args.get("command"):  # 命令类工具
+                return self.display_manager.shorten(tool_args["command"], 60)
+            if tool_args.get("description"):  # 派活类工具
+                return self.display_manager.shorten(tool_args["description"], 60)
+            if isinstance(tool_args.get("todos"), list):  # 待办类工具
+                return f"{len(tool_args['todos'])} 项"
+        return self.display_manager.shorten(tool_args, 80)  # 兜底：整体截断
 
     # Todo display delegation method
     def display_todos(self, todos: list, emoji: str = "📋") -> None:

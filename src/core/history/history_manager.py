@@ -271,7 +271,7 @@ class HistoryManager(BaseHistoryManager):
     # tell the model we have compressed the messages
     async def _compress_current_message(self) -> None:
         """Compress current message history to save context window space（真正执行压缩）"""
-        self._ui_manager.print_assistant_message("上下文太长了，正在压缩…")  # 提示用户
+        self._ui_manager.print_info("上下文太长了，正在自动压缩…")  # 【第 4 轮】改成暗色提示，不再占据"模型发言"的位置
 
         current_messages = self.messages_history[-1]  # 拿到当前这一页
         user_indices = self._get_user_message_indices(current_messages)  # 找出所有"用户消息"的位置
