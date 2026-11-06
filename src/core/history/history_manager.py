@@ -56,6 +56,28 @@ class Crop_Direction(str, Enum):
     BOTTOM = "bottom"  # 从最后面删（删最新的）
 
 
+def message_text(message) -> str:
+    """把一条消息的 content 转换成纯文本（2026-11-06 第 2 轮新增，提到模块级方便复用）
+
+    为什么需要：content 在消息里是"内容块列表"，长这样：
+        [{"type": "text", "text": "任务做完了，结论是……"}]
+    直接打印或返回出去，会带着 {'type': 'text', ...} 这些噪音。
+    这个函数把里面的文字抽出来拼成干净的一段话。
+    """
+    content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+    # 上面这行：字典就按字典取，对象就按属性取
+
+    if isinstance(content, str):  # 情况一：本来就是一段文字
+        return content
+    if isinstance(content, list):  # 情况二：是内容块列表（最常见）
+        texts = []  # 准备装每一块的文字
+        for block in content:  # 逐块检查
+            if isinstance(block, dict) and block.get("type") == "text":  # 只挑"文字"类型的块
+                texts.append(block.get("text", ""))  # 把文字取出来
+        return "\n".join(texts)  # 用换行拼成一段
+    return "" if content is None else str(content)  # 其他情况：能转文字就转，什么都没有就返回空串
+
+
 class BaseHistoryManager(ABC):
     # 定义一个"抽象基类"，相当于"合同模板"：
     # 谁继承我，就必须把下面带 @abstractmethod 的方法全部实现，少一个都不能创建对象
@@ -77,18 +99,22 @@ class BaseHistoryManager(ABC):
     def get_current_messages(self) -> any:
         pass
 
-    def auto_messages_compression(self) -> None:
+    async def auto_messages_compression(self) -> None:
         # 这是个"已经写好"的普通方法，子类可以直接用
         # 逻辑很简单：先问"要不要压缩"，要就压
+        # 【2026-11-06 第 2 轮优化】从同步改成异步（async）：
+        #   因为现在压缩时会调用大模型生成摘要，而调模型是异步操作。
+        #   调用方也要相应加上 await（conversation.py 的两处已同步修改）。
         if self._requires_compression():  # 调用下面的判断方法
-            self._compress_current_message()  # 需要就执行压缩
+            await self._compress_current_message()  # 需要就执行压缩
 
     @abstractmethod
     def _requires_compression(self) -> bool:
         pass
 
     @abstractmethod
-    def _compress_current_message(self) -> None:
+    async def _compress_current_message(self) -> None:
+        # 【2026-11-06 第 2 轮优化】抽象方法也改成异步，子类实现必须用它
         pass
 
     @abstractmethod
@@ -120,7 +146,20 @@ class HistoryManager(BaseHistoryManager):
             # 比如配置里写 200，算出来就是 204800，表示模型一次最多能读约 20 万字
             self._compress_threshold = float(os.getenv("COMPRESS_THRESHOLD", compress_threshold))
             # 压缩阈值：用到 80%（0.8）就开始压缩，留点余量免得撞上限
+            self._summarizer = None
+            # 【2026-11-06 第 2 轮新增】"摘要生成器"，是一个异步函数：传入一批消息，返回一段摘要文字。
+            #   为什么要留成"外部注入"而不是在这里直接调模型？
+            #     1. 历史管理器不该知道 API 密钥、模型名这些事（分层清晰）
+            #     2. 单元测试里不注入它，压缩就自动退回"直接删除"的老做法，不会真的去花钱调模型
             self._initialized = True  # 打标记
+
+    def set_summarizer(self, summarizer):
+        """注入摘要生成器（2026-11-06 第 2 轮新增）
+
+        summarizer 的签名要求：async def fn(messages: list) -> str
+        由 Conversation 在启动时注入；不注入则压缩时直接丢弃旧消息。
+        """
+        self._summarizer = summarizer
 
     def add_message(self, message) -> None:
         self.messages_history[-1].append(message)  # 往"当前这一页"的末尾追加一条
@@ -217,27 +256,8 @@ class HistoryManager(BaseHistoryManager):
         return response  # 返回给主 agent
 
     def _content_to_text(self, message) -> str:
-        """把一条消息的 content 转换成纯文本（2026-11-06 新增）
-
-        为什么要这一步？
-          content 在消息里是"内容块列表"，长这样：
-              [{"type": "text", "text": "任务做完了，结论是……"}]
-          直接把它 return 出去，主 agent 收到的会是这段 Python 代码的字符串形式，
-          里面带着 {'type': 'text', ...} 这些噪音，既浪费 token 又干扰理解。
-          所以这里把里面的文字抽出来拼成一段干净的话。
-        """
-        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
-        # 上面这行：字典就按字典取，对象就按属性取（和 _role_of 一个道理）
-
-        if isinstance(content, str):  # 情况一：本来就是一段文字
-            return content
-        if isinstance(content, list):  # 情况二：是内容块列表（最常见）
-            texts = []  # 准备装每一块的文字
-            for block in content:  # 逐块检查
-                if isinstance(block, dict) and block.get("type") == "text":  # 只挑"文字"类型的块
-                    texts.append(block.get("text", ""))  # 把文字取出来
-            return "\n".join(texts)  # 用换行拼成一段
-        return "" if content is None else str(content)  # 其他情况：能转文字就转，什么都没有就返回空串
+        """把一条消息的 content 转换成纯文本（2026-11-06 新增，第 2 轮改为复用模块级函数）"""
+        return message_text(message)  # 具体实现在文件上方的 message_text() 里，这里只是保留方法入口
 
     def _requires_compression(self) -> bool:
         if self._compress_threshold and self.history_token_usage:  # 有阈值配置，也有用量记录
@@ -249,7 +269,7 @@ class HistoryManager(BaseHistoryManager):
     # if there is more than one  session, compress the oldest chat session
     # else compress the current roll assistant output
     # tell the model we have compressed the messages
-    def _compress_current_message(self) -> None:
+    async def _compress_current_message(self) -> None:
         """Compress current message history to save context window space（真正执行压缩）"""
         self._ui_manager.print_assistant_message("History context too long, compressing...")  # 提示用户
 
@@ -257,10 +277,10 @@ class HistoryManager(BaseHistoryManager):
         user_indices = self._get_user_message_indices(current_messages)  # 找出所有"用户消息"的位置
 
         if len(user_indices) > 1:  # 如果用户已经说过好几轮了
-            self._compress_multiple_sessions(current_messages, user_indices)  # 就把最老的那一轮整体删掉
+            await self._compress_multiple_sessions(current_messages, user_indices)  # 就把最老的那一轮整体删掉
         elif len(user_indices) == 1:  # 如果只有一轮（用户只说过一句，后面全是来回调工具）
             # delete_message_num is hardcode to 3 right now
-            self._compress_single_session(current_messages, user_indices[0], 3)  # 就删掉紧跟在它后面的 3 条
+            await self._compress_single_session(current_messages, user_indices[0], 3)  # 就删掉紧跟在它后面的 3 条
 
     @staticmethod
     def _role_of(message) -> any:
@@ -282,19 +302,31 @@ class HistoryManager(BaseHistoryManager):
         # 【2026-11-06 优化】原来写的是 msg.role，但真实消息是字典，会抛 AttributeError。
         #    现在统一走 _role_of()，字典和对象两种形态都能读（细节见该方法）。
 
-    def _compress_multiple_sessions(self, messages: list, user_indices: list[int]) -> None:
-        """delete the oldest chat session（删掉最老的那一轮对话）"""
+    async def _compress_multiple_sessions(self, messages: list, user_indices: list[int]) -> None:
+        """delete the oldest chat session（删掉最老的那一轮对话）
+
+        【2026-11-06 第 2 轮优化】从"直接删"改成"先摘要、再删"：
+          被删掉的那段内容会先交给大模型总结成一段话，
+          再把这段话放进对话里。这样模型不会真的"忘事"。
+        """
         second_oldest_user_index = user_indices[1]  # 找出"第二老"的那句用户消息的位置
 
         system_messages = [msg for msg in messages[:second_oldest_user_index] if self._role_of(msg) == Role.SYSTEM]
         # 从开头到"第二老"之前，把里面的系统消息挑出来（保住规则设定）
         # 【2026-11-06 优化】同样把 msg.role 改成 _role_of(msg)
+
+        removed_messages = [msg for msg in messages[:second_oldest_user_index]
+                            if self._role_of(msg) != Role.SYSTEM]
+        # 【2026-11-06 第 2 轮新增】算清楚"到底要删掉哪些"（不含系统消息），
+        #   这一段就是要送去生成摘要的原料
+
         recent_messages = messages[second_oldest_user_index:]  # 从"第二老"开始往后的全部内容（保住近期对话）
 
-        self.messages_history[-1] = system_messages + self._create_compression_notice(messages) + recent_messages
-        # 新的这一页 = 系统消息 + 一句"历史被压缩了"的公告 + 近期对话
+        summary = await self._summarize_if_possible(removed_messages)  # 让模型总结这段被删的内容
+        self.messages_history[-1] = system_messages + self._create_compression_notice(messages, summary) + recent_messages
+        # 新的这一页 = 系统消息 + 摘要公告 + 近期对话
 
-    def _compress_single_session(self, messages: list, user_index: int, delete_message_num: int) -> None:
+    async def _compress_single_session(self, messages: list, user_index: int, delete_message_num: int) -> None:
         """delete assistant messages and tool message close to user input（删掉紧跟用户发言后的若干条）"""
         system_messages = [msg for msg in messages[:user_index] if self._role_of(msg) == Role.SYSTEM]  # 保住系统消息
         # 【2026-11-06 优化】同样把 msg.role 改成 _role_of(msg)
@@ -302,13 +334,41 @@ class HistoryManager(BaseHistoryManager):
         start_index = min(user_index + 1 + delete_message_num, len(messages))
         # 计算"从第几条开始保留"：用户消息后面跳过 delete_message_num 条
         # min(..., len(messages)) 是防止算出来的位置超出列表长度
-        user_message = [messages[user_index]] + self._create_compression_notice(messages) + messages[start_index:]
-        # 新的内容 = 用户那句话 + 压缩公告 + 剩下的内容
+
+        removed_messages = messages[user_index + 1:start_index]  # 【2026-11-06 第 2 轮新增】要删掉的那几条
+        summary = await self._summarize_if_possible(removed_messages)  # 先总结
+
+        user_message = [messages[user_index]] + self._create_compression_notice(messages, summary) + messages[start_index:]
+        # 新的内容 = 用户那句话 + 摘要公告 + 剩下的内容
 
         self.messages_history[-1] = system_messages + user_message  # 拼成新的这一页
 
-    def _create_compression_notice(self, messages: list) -> list:
-        """create compression notice（造一条"历史已压缩"的公告）"""
+    async def _summarize_if_possible(self, messages: list):
+        """尝试把一段消息总结成摘要；做不到就返回 None（2026-11-06 第 2 轮新增）
+
+        三种情况会返回 None（也就是退回"直接删除"的老做法）：
+          1. 没有注入摘要器（比如单元测试环境）
+          2. 要删的消息是空的
+          3. 调模型失败（没网、没额度、超时……）——这种情况不能卡死对话，必须降级
+        """
+        if not messages or self._summarizer is None:  # 情况 1、2
+            return None
+        try:
+            summary = await self._summarizer(messages)  # 调用外部注入的摘要函数
+        except Exception as e:  # 情况 3
+            print(f"[压缩] 生成摘要失败（{e}），本次退回为直接删除旧消息")
+            return None
+        if not summary or not summary.strip():  # 模型返回了空内容
+            return None
+        return summary.strip()
+
+    def _create_compression_notice(self, messages: list, summary: str = None) -> list:
+        """create compression notice（造一条"历史已压缩"的公告）
+
+        【2026-11-06 第 2 轮优化】多了一个 summary 参数：
+          有摘要 → 公告里带上摘要内容，模型能知道之前发生了什么
+          没摘要 → 退回原来那句话
+        """
         if not messages:  # 如果消息列表是空的
             return []  # 就返回空列表，不用公告
 
@@ -316,7 +376,13 @@ class HistoryManager(BaseHistoryManager):
         #   而其他消息的 content 都是 [{"type": "text", "text": ...}] 这种"内容块列表"。
         #   两种结构混在一起，任何按统一格式读 content 的代码（比如 _content_to_text）
         #   都会出错。现在统一成内容块列表。
-        notice_text = "[Previous conversation history has been compressed to save context window space]"
+        if summary:  # 有摘要
+            notice_text = (
+                "[Earlier conversation was compressed to save context space. "
+                "Summary of the removed part:]\n" + summary
+            )
+        else:  # 没摘要，用原来那句
+            notice_text = "[Previous conversation history has been compressed to save context window space]"
 
         first = messages[0]  # 看一眼现有消息是什么形态
         if isinstance(first, dict):  # 真实运行时都是字典
@@ -338,8 +404,9 @@ class HistoryManager(BaseHistoryManager):
 #    所以 token 一超过 80% 触发压缩就会抛 AttributeError 崩掉。
 #    现在统一改用 _role_of() 读取，字典和对象两种形态都能用。
 #
-# 2. 压缩的策略仍然很"暴力"：直接把旧消息删掉，只留一句"压缩过了"的公告。
-#    模型因此会真的忘记之前聊了什么。更温柔的做法是：
-#    让一个小模型把旧对话总结成一段摘要，再用摘要替换原文。
-#    （这条留到第 2 轮优化，涉及"摘要式压缩"）
+# 2. 【2026-11-06 第 2 轮已修复】压缩的策略原来是"硬删消息"，只留一句"压缩过了"的公告，
+#    模型会真的忘记之前聊了什么。
+#    现在改成"摘要式压缩"：删之前先让模型把这段内容总结成一段摘要，
+#    再把摘要放进对话里。摘要器由 Conversation 注入（set_summarizer），
+#    没有注入或者调模型失败时，会自动退回"直接删除"的老做法。
 # =============================================================================

@@ -160,6 +160,24 @@ class DisplayManager:
 
         self.print_simple_message("\n".join(output))  # 用换行把列表连成一整段，然后打印
 
+    @staticmethod
+    def shorten(text, limit: int = 600) -> str:
+        """把过长的内容压成一行预览，避免刷屏（2026-11-06 第 2 轮新增）
+
+        为什么需要？
+          工具执行结果可能是一整份 npm install 日志（几千行）。
+          原样打印会把屏幕刷满，用户根本看不到自己关心的那几行。
+          这里把换行折叠成 ⏎ 符号，超长再截断，一眼就能看出"这行在讲什么"。
+        """
+        text = str(text)  # 保险：传进来的可能是字典或数字
+        if len(text) <= limit:  # 没超长，原样返回（短内容保留换行更好读）
+            return text
+        one_line = text.replace("\r\n", " ").replace("\n", " ⏎ ").replace("\r", " ")
+        # 把换行折叠掉，整段压成一行
+        head_length = max(0, limit - 40)  # 留 40 个字符的位置给后面的省略说明
+        preview = one_line[:head_length].rstrip()  # 截取前面一段
+        return f"{preview} …（共 {len(text)} 字符，已省略 {len(text) - head_length}）"
+
     def _get_status_icon(self, status: str) -> str:
         """
         Get icon for todo status.（根据状态返回对应图标）

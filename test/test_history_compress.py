@@ -20,6 +20,7 @@
 #      现在每个用例都通过 fresh_manager() 拿全新实例，可以独立运行了。
 # =============================================================================
 
+import asyncio  # 【2026-11-06 第 2 轮新增】压缩方法已改成异步，这里要用 asyncio.run 来驱动
 import sys  # 改模块搜索路径
 import os  # 拼路径
 from dataclasses import dataclass  # 用来自动生成简单数据类
@@ -81,7 +82,8 @@ def test_auto_compression_not_triggered():
     original_length = len(manager.get_current_messages())  # 记下现在的消息条数
 
     # 执行自动压缩
-    manager.auto_messages_compression()  # 调用自动压缩（内部会先判断要不要压）
+    asyncio.run(manager.auto_messages_compression())  # 调用自动压缩（内部会先判断要不要压）
+    # 【2026-11-06 第 2 轮】压缩现在是异步方法（因为可能要调模型生成摘要），所以用 asyncio.run 驱动
 
     # 验证消息数量没有变化
     assert len(manager.get_current_messages()) == original_length  # 条数应该一模一样
@@ -123,7 +125,7 @@ def test_auto_compression_multiple_sessions():
     # 这三行是调试输出，帮你确认"判断条件到底对不对"
 
     # 执行自动压缩
-    manager.auto_messages_compression()
+    asyncio.run(manager.auto_messages_compression())
 
     messages = manager.get_current_messages()  # 看压缩后的结果
 
@@ -176,7 +178,7 @@ def test_auto_compression_single_session():
     original_length = len(manager.get_current_messages())  # 记下原条数
 
     # 执行自动压缩
-    manager.auto_messages_compression()
+    asyncio.run(manager.auto_messages_compression())
 
     messages = manager.get_current_messages()
 

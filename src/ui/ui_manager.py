@@ -134,12 +134,15 @@ class UIManager:
             result: Result of the execution（执行结果）
         """
         if success:  # 如果成功
-            self.print_success(f"Successfully called tool: {tool_name}, args: {tool_args}, result: {result}")
-            # 打一行"成功调用 xx 工具，参数是…，结果是…"
-            # ⚠️ 这里有个体验问题：如果命令输出很长（比如打印了 500 行日志），
-            #    这行会刷满整个屏幕。应该截断，只显示前几百个字符。
+            # 【2026-11-06 第 2 轮优化】原来是 f"...args: {tool_args}, result: {result}" 全量打印，
+            #   命令输出一长（比如几百行日志）就会刷满整个屏幕，用户什么都看不到。
+            #   现在参数最多显示 200 字符、结果最多 400 字符，超长会折叠成一行并标注省略了多少。
+            args_preview = self.display_manager.shorten(tool_args, 200)
+            result_preview = self.display_manager.shorten(result, 400)
+            self.print_success(f"Tool {tool_name} ok · args: {args_preview} · result: {result_preview}")
         else:  # 如果失败
-            self.print_error(f"Tool call failed: {tool_name}, error: {result}")  # 打错误信息
+            error_preview = self.display_manager.shorten(result, 400)  # 错误信息同样截断
+            self.print_error(f"Tool {tool_name} failed · error: {error_preview}")
 
     def show_preparing_tool(self, tool_name: str, tool_args: dict) -> None:
         """
@@ -149,8 +152,9 @@ class UIManager:
             tool_name: Name of the tool（工具名）
             tool_args: Arguments for the tool（参数）
         """
-        self.print_info(f"Preparing to call tool: {tool_name}, args: {tool_args}")
-        # 同样是全量打印参数，参数很长时会刷屏
+        # 【2026-11-06 第 2 轮优化】参数同样截断，避免一次写文件的参数把屏幕刷爆
+        args_preview = self.display_manager.shorten(tool_args, 200)
+        self.print_info(f"Preparing to call tool: {tool_name} · args: {args_preview}")
 
     # Todo display delegation method
     def display_todos(self, todos: list, emoji: str = "📋") -> None:

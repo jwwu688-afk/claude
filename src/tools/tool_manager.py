@@ -37,14 +37,26 @@ class ToolManager:
             # Important tools should be placed lower, as this affects their position in the prompt.
             # 翻译：越重要的工具越晚登记（因为字典保持插入顺序，
             # 后面登记的工具在给模型的清单里排得越靠后，位置越显眼）
-            self.register_mcp_task = asyncio.create_task(self._register_mcp_tool())
-            # 上一行：在后台开一个"注册 MCP 工具"的任务，不阻塞主流程
-            # asyncio.create_task 的意思是"派个后台工人去干这件事，我先往下走"
+            self.register_mcp_task = None
+            # 【2026-11-06 第 2 轮优化】先留空，等真正需要工具清单时再启动后台注册任务。
+            #   原因同 MCPClient：asyncio.create_task 必须在"正在运行的事件循环"里调用，
+            #   在循环外创建 ToolManager 会抛 RuntimeError: no running event loop。
+            self._ensure_mcp_registration()  # 有循环就顺手启动
             self._register_tool(SmartContextCropper.get_tool_name(), SmartContextCropper())  # 登记裁剪工具
             self._register_tool(TodoWrite.get_tool_name(), TodoWrite())  # 登记待办工具
             self._register_tool(Task.get_tool_name(), Task())  # 登记子任务工具
             self._register_tool(CmdRunner.get_tool_name(), CmdRunner())  # 登记命令行工具（最重要，放最后）
             ToolManager._initialized = True  # 打标记
+
+    def _ensure_mcp_registration(self):
+        """确保"后台注册 MCP 工具"的任务已经启动（2026-11-06 第 2 轮新增，可重复调用）"""
+        if self.register_mcp_task is not None:  # 已经启动过
+            return
+        try:
+            asyncio.get_running_loop()  # 看看现在有没有事件循环
+        except RuntimeError:  # 没有，就先不启动
+            return
+        self.register_mcp_task = asyncio.create_task(self._register_mcp_tool())
 
     async def _register_mcp_tool(self):
         # 这个方法是后台跑的：连上所有 MCP 服务器，把它们提供的工具都登记进来
@@ -72,7 +84,9 @@ class ToolManager:
                      {"task"} for sub-agents so they cannot delegate further.
             参数 exclude：不想让模型看到的工具名集合。子 agent 会把 task 排除掉。
         """
-        await self.register_mcp_task  # 先等后台那个"注册 MCP 工具"的任务干完
+        self._ensure_mcp_registration()  # 【2026-11-06 第 2 轮新增】确保后台注册任务已启动
+        if self.register_mcp_task is not None:  # 启动了才需要等
+            await self.register_mcp_task  # 先等后台那个"注册 MCP 工具"的任务干完
         exclude = exclude or set()  # 如果传了 None，就换成空集合（方便后面判断"在不在里面"）
         descriptions = []  # 准备结果列表
         for tool_name, tool_instance in self.tools.items():  # 遍历字典的每一对"键和值"
@@ -101,3 +115,14 @@ class ToolManager:
         if tool:  # 找到了
             return tool.get_status()  # 让它自己汇报
         return "Tool not found"  # 没找到
+
+    async def shutdown(self):
+        """关闭所有外部资源（2026-11-06 第 2 轮新增）
+
+        目前主要就是关掉 MCP 的那些外部服务器进程。
+        程序退出前调用它，可以避免留下孤儿进程、避免退出时报 cancel scope 错误。
+        """
+        try:
+            await self._mcp_client.aclose()  # 交给 MCP 客户端自己收尾
+        except Exception as e:  # 收尾失败不该阻止程序退出
+            print(f"[MCP] 关闭外部工具时出现异常（可忽略）：{e}")

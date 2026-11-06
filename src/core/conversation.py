@@ -17,6 +17,7 @@ Conversation management with refactored UI components and history manager integr
 （上面这段是原作者的英文说明，意思是：对话管理，UI 拆成了独立组件，历史记录交给 HistoryManager 管）
 """
 
+import asyncio  # 【2026-11-06 第 2 轮新增】摘要生成要把同步的接口调用丢到线程池，需要用到它
 import json  # json 库：把模型给的"参数字符串"解析成真正的 Python 字典
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
 from core.api_client import APIClient  # 导入 API 客户端：真正发请求给大模型的家伙
@@ -24,7 +25,28 @@ from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器
 from core.prompt.reminder import get_reminder  # 导入函数：生成一段"提醒模型去看 todo"的文字
 from tools.tool_manager import ToolManager  # 导入工具管理器：负责注册工具、执行工具
 from ui.ui_manager import UIManager  # 导入界面管理器：负责显示和要输入
-from .history.history_manager import HistoryManager  # 导入历史管理器：负责存消息、算 token、压缩上下文
+from .history.history_manager import HistoryManager, message_text  # 导入历史管理器；message_text 用来把消息转成纯文本
+
+
+# 【2026-11-06 第 2 轮新增】压缩旧对话时用的提示词。
+# 核心思路：明确告诉模型"哪些必须留、哪些可以丢"，否则它会写一堆没用的客套话。
+SUMMARY_SYSTEM_PROMPT = """你是一个对话压缩器。
+
+用户会给你一段命令行编程助手的工作记录。请把它压缩成一段中文摘要（不超过 400 字），
+供后续继续工作时参考。
+
+必须保留的内容：
+1. 用户的目标、明确要求和约束条件
+2. 已经做过的关键决定，以及为什么这么决定
+3. 改动过的文件路径，以及每个文件做了什么改动（新建/修改/删除）
+4. 遇到过的错误和对应的解决办法
+5. 还没做完的事、下一步计划、当前的待办清单
+6. 用户明确表达过的偏好（比如"不要加注释""用中文回复"）
+
+可以丢弃的内容：
+寒暄、重复的试探、工具输出的具体内容（除非结论重要）、已被否决的方案细节。
+
+只输出摘要正文，不要写"以下是摘要"之类的话。"""
 # 注意上面这行开头的 "." 表示"同一个文件夹下的"，是相对导入
 
 
@@ -61,6 +83,10 @@ class Conversation:
             self._api_client = APIClient()  # 建 API 客户端（它会读 .env 里的配置）
             self._ui_manager = UIManager()  # 建界面管理器
             self._history_manager = HistoryManager()  # 建历史管理器
+            # 【2026-11-06 第 2 轮优化】把"摘要生成器"交给历史管理器：
+            #   以后上下文太长需要压缩时，它会先调这个方法把旧对话总结成摘要，
+            #   而不是直接把旧消息删掉（那样模型会真的忘事）。
+            self._history_manager.set_summarizer(self._summarize_messages)
             self._prompt_manager = PromptManager()  # 建提示词管理器
             self._initialized = True  # 打上标记，下次不再重复创建
 
@@ -181,7 +207,7 @@ class Conversation:
         """
 
         # Check for auto compression
-        self._history_manager.auto_messages_compression()  # 问一句："是不是该压缩了？"需要就压
+        await self._history_manager.auto_messages_compression()  # 问一句："是不是该压缩了？"需要就压
 
         request = {
             "messages": self._get_messages_with_cache_mark(),  # 全部对话消息（带缓存标记）
@@ -274,7 +300,7 @@ class Conversation:
         self.add_message(assistant_message)  # 存进历史
 
         # Check for auto compression
-        self._history_manager.auto_messages_compression()  # 又变长了，再检查一次要不要压缩
+        await self._history_manager.auto_messages_compression()  # 又变长了，再检查一次要不要压缩
 
         # Handle tool calls
         if hasattr(response_message, 'tool_calls') and response_message.tool_calls is not None and len(response_message.tool_calls) > 0:
@@ -302,6 +328,88 @@ class Conversation:
     def _print_context_window_and_total_cost(self):
         # 打印一行状态："上下文窗口用了 12.3%，一共花了 0.45 美元"
         self._ui_manager.print_simple_message(f"(context window: {self._history_manager.current_context_window}%, total cost: {self._api_client.total_cost}$)")
+
+    # -------------------------------------------------------------------------
+    # 【2026-11-06 第 2 轮新增】摘要式压缩相关
+    # -------------------------------------------------------------------------
+    async def _summarize_messages(self, messages) -> str:
+        """把一批旧消息压缩成一段摘要（交给大模型做）
+
+        这个方法是"摘要生成器"，在 __init__ 里交给 HistoryManager。
+        上下文快满时，HistoryManager 会调用它，用返回的摘要替换掉被删掉的旧消息。
+        调模型失败时异常会往上抛，由 HistoryManager 捕获并退回"直接删除"。
+        """
+        transcript = self._messages_to_transcript(messages)  # 先把消息拼成一段可读的文字
+        if not transcript.strip():  # 什么都没有就不浪费一次请求了
+            return ""
+
+        request = {
+            "messages": [
+                {"role": "system", "content": [{"type": "text", "text": SUMMARY_SYSTEM_PROMPT}]},
+                # 系统提示词：告诉模型"你的任务是把下面这段对话压缩成摘要"
+                {"role": "user", "content": [{"type": "text", "text": transcript}]},
+                # 用户消息：真正要压缩的对话内容
+            ]
+        }
+
+        loop = asyncio.get_running_loop()  # 拿到当前的事件循环
+        message, token_usage = await loop.run_in_executor(
+            None, self._api_client.get_completion, request
+        )
+        # 为什么要用 run_in_executor？
+        #   get_completion 是"同步"的（会一直等到接口返回）。
+        #   直接在异步函数里调用，会把整个事件循环卡住，界面就不动了。
+        #   丢到线程池里跑，界面上还能继续转圈。
+
+        if token_usage:  # 这次调用也花了钱，记一笔
+            self._history_manager.update_token_usage(token_usage)
+        return message.content or ""  # 返回摘要正文
+
+    def _messages_to_transcript(self, messages, max_chars: int = 24000) -> str:
+        """把消息列表拼成一段"人能看懂"的文字，用来喂给摘要模型（第 2 轮新增）
+
+        格式大概是：
+            user: 帮我把 xxx 改成 yyy
+            assistant: 好的，我先看一下文件
+            assistant -> tool cmd_runner({"command": "ls"})
+            tool: a.py b.py
+        """
+        lines = []  # 存每一行
+        for message in messages:  # 逐条消息
+            role = message.get("role") if isinstance(message, dict) else getattr(message, "role", "")
+            # 取角色（字典 / 对象两种形态都兼容）
+
+            text = message_text(message).strip()  # 取出这条消息的文字内容
+            if text:  # 有文字才记
+                lines.append(f"{role}: {text}")
+
+            tool_calls = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
+            # 取出这条消息里的"工具调用"（可能没有）
+            if tool_calls:  # 有就逐条记下来——这些"改了什么文件"的信息对摘要很关键
+                for call in tool_calls:
+                    function = getattr(call, "function", None)  # 正常是对象形态
+                    name = getattr(function, "name", None)  # 工具名
+                    arguments = getattr(function, "arguments", None)  # 参数（JSON 字符串）
+                    if name is None and isinstance(call, dict):  # 万一是字典形态
+                        name = call.get("function", {}).get("name", "")
+                        arguments = call.get("function", {}).get("arguments", "")
+                    lines.append(f"assistant -> tool {name}({arguments})")
+
+        transcript = "\n".join(lines)  # 拼成整段
+
+        if len(transcript) > max_chars:  # 太长的话摘要模型自己也读不完
+            head = transcript[: int(max_chars * 0.7)]  # 留开头 70%（通常是目标和背景）
+            tail = transcript[-int(max_chars * 0.3):]  # 留结尾 30%（通常是最新的进展）
+            transcript = head + "\n... [middle omitted] ...\n" + tail
+        return transcript
+
+    async def shutdown(self):
+        """程序退出前收尾（2026-11-06 第 2 轮新增）
+
+        主要是关掉 MCP 那些外部服务器进程。不关的话它们会变成孤儿进程留在后台，
+        而且退出时还会打一段 cancel scope 的报错。
+        """
+        await self._tool_manager.shutdown()
 
     def _get_messages_with_cache_mark(self):
         """Get messages with cache mark.（给最后一条消息打上"可缓存"标记）"""

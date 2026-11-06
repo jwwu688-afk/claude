@@ -67,15 +67,25 @@ def welcome():
 async def main():
     # 定义主函数。前面带 async 表示它是"异步函数"，里面有等网络的操作也不会卡住界面
     welcome()  # 先画欢迎框
-    await Conversation().start_conversation()
-    # Conversation() 会创建一个"对话总管"（整个程序只有一个，后面会讲单例）
-    # start_conversation() 是启动聊天，await 的意思是"在这儿等着，但等着的时候不占着 CPU"
+    conversation = Conversation()  # 先创建对话总管，后面收尾时还要用到它
+    try:
+        await conversation.start_conversation()
+        # start_conversation() 是启动聊天，await 的意思是"在这儿等着，但等着的时候不占着 CPU"
+    finally:
+        # 【2026-11-06 第 2 轮新增】不管正常结束还是被 Ctrl+C 打断，都要收尾
+        #   不收尾的话：MCP 那些外部服务器进程会留在后台变成孤儿进程，
+        #   退出时还会打一段 "cancel scope" 的报错。
+        await conversation.shutdown()
 
 
 def cli():
     # 定义命令行入口函数。pyproject.toml 里配置的 quickstar 命令，指向的就是这个函数
-    asyncio.run(main())
-    # asyncio.run 是异步世界的"启动器"：它负责建立一个事件循环，把 main() 跑起来，跑完再收尾
+    try:
+        asyncio.run(main())
+        # asyncio.run 是异步世界的"启动器"：它负责建立一个事件循环，把 main() 跑起来，跑完再收尾
+    except KeyboardInterrupt:
+        # 【2026-11-06 第 2 轮新增】用户按 Ctrl+C 时，别再打一大段红色堆栈吓人，说句话就好
+        print("\n已退出 QuickStar。")
 
 
 if __name__ == "__main__":

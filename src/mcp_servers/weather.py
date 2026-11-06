@@ -48,12 +48,12 @@ def format_alert(feature: dict) -> str:
     """Format an alert feature into a readable string.（把一条预警格式化成人能读的文字）"""
     props = feature["properties"]  # 取出"属性"这一层（气象局的返回结构就是这样套的）
     return f"""
-Event: {props.get('event', 'Unknown')}
-Area: {props.get('areaDesc', 'Unknown')}
-Severity: {props.get('severity', 'Unknown')}
-Description: {props.get('description', 'No description available')}
-Instructions: {props.get('instruction', 'No specific instructions provided')}
-"""
+        Event: {props.get('event', 'Unknown')}
+        Area: {props.get('areaDesc', 'Unknown')}
+        Severity: {props.get('severity', 'Unknown')}
+        Description: {props.get('description', 'No description available')}
+        Instructions: {props.get('instruction', 'No specific instructions provided')}
+    """
     # .get('字段名', '默认值') 的意思是：有这个字段就取，没有就用后面的默认值。
     # 这样就算气象局漏了某个字段，也不会报错。
     # 中文含义依次是：事件类型、影响区域、严重程度、详细描述、应对指引
@@ -110,11 +110,11 @@ async def get_forecast(latitude: float, longitude: float) -> str:
     for period in periods[:5]:  # Only show next 5 periods（只取前 5 个时段，太多了刷屏）
         # periods[:5] 的意思是"从头取到第 5 个之前"，也就是前 5 个
         forecast = f"""
-{period['name']}:
-Temperature: {period['temperature']}°{period['temperatureUnit']}
-Wind: {period['windSpeed']} {period['windDirection']}
-Forecast: {period['detailedForecast']}
-"""
+            {period['name']}:
+            Temperature: {period['temperature']}°{period['temperatureUnit']}
+            Wind: {period['windSpeed']} {period['windDirection']}
+            Forecast: {period['detailedForecast']}
+        """
         # 中文含义：时段名、温度、风速风向、详细预报
         forecasts.append(forecast)  # 加进列表
 

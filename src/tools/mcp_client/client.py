@@ -39,17 +39,62 @@ class MCPClient:
         # Initialize session and client objects
         self.sessions: list[ClientSession] = []  # 存所有已经连上的会话（每个服务器一条）
         self.exit_stack = AsyncExitStack()
-        # 资源栈：把所有"需要关闭的东西"（服务器进程、会话）都登记在这里，
-        # 方便最后一次性全部关掉。不过目前代码里其实没有地方调用它的关闭方法（见文末备注）
+        # 资源栈：把所有"需要关闭的东西"（服务器进程、会话）都登记在这里，方便最后一次性全部关掉
         self.config = MCPConfig("~/.quickstar/mcp.json")
         # 读配置文件。~ 会被展开成你的用户目录，所以实际路径是 C:/Users/你的名字/.quickstar/mcp.json
-        # ⚠️ 如果这个文件不存在，构造时就会直接抛异常，整个程序起不来
+        # 文件不存在会降级处理（见 server_config.py），不会抛异常
 
-        self.connect_server_task = asyncio.create_task(self.connect_to_server())
-        # 派一个后台任务去连接所有服务器，不等它完成，先把对象造出来
+        # 【2026-11-06 第 2 轮优化】新增两个"信号灯"
+        self._ready = asyncio.Event()  # 连接阶段结束（不管成功失败）就点亮
+        self._shutdown = asyncio.Event()  # 有人要求退出时点亮
+        self._closed = False  # 标记"已经关过了"，防止重复关闭
 
-    async def connect_to_server(self):
-        """Connect to all MCP servers（连接配置文件里列出的所有服务器）"""
+        # 【2026-11-06 第 2 轮优化】改用一个"总任务"来管连接和关闭
+        #   原因：MCP 的 stdio 连接是用 AsyncExitStack 打开的，anyio 规定
+        #   "在哪个任务里打开，就必须在哪个任务里关闭"，否则会报
+        #   RuntimeError: Attempted to exit cancel scope in a different task ...
+        #   所以让 _run() 这个任务负责"打开 → 待命 → 自己关掉"，全程同一个任务。
+        self.connect_server_task = None
+        # 【2026-11-06 第 2 轮优化】先留空，用到时再启动。
+        #   原因：asyncio.create_task 必须在一个"正在运行的事件循环"里调用，
+        #   如果有人在循环外面 new 了一个 MCPClient（比如写个脚本直接 import），
+        #   原来那行会直接抛 RuntimeError: no running event loop。
+        #   现在改成"有循环就现在启动，没有就等第一次用到时再启动"。
+        self._ensure_started()
+
+    def _ensure_started(self):
+        """确保后台任务已经启动（2026-11-06 第 2 轮新增，可重复调用）"""
+        if self.connect_server_task is not None:  # 已经启动过
+            return
+        try:
+            asyncio.get_running_loop()  # 试着拿当前正在运行的循环
+        except RuntimeError:  # 没有循环（说明现在不在 async 环境里）
+            return  # 那就先不启动，等真正要用的时候再说
+        self.connect_server_task = asyncio.create_task(self._run())  # 启动"连接 → 待命 → 关闭"总任务
+
+    async def _run(self):
+        """后台任务的完整生命周期：连接 → 待命 → 关闭（2026-11-06 新增）
+
+        为什么要把三件事放在同一个函数里？
+          因为"打开连接"和"关闭连接"必须在同一个任务中完成（anyio 的硬性要求）。
+          如果像以前那样只在后台连接、却由别的地方关闭，退出时就会报 cancel scope 错误。
+        """
+        try:  # 先连接
+            await self._connect_all()
+        except Exception as e:  # 连接阶段出现意外（每个服务器已经单独 try 过，这里只是兜底）
+            print(f"[MCP] 初始化异常：{e}")
+        finally:
+            self._ready.set()  # 不管连成没连成，都要把"就绪"信号点亮，否则 get_sessions 会一直等
+
+        try:  # 然后待命，直到有人喊停
+            await self._shutdown.wait()
+        except asyncio.CancelledError:  # 被强行取消（比如用户直接关窗口）
+            pass  # 忽略，继续走下面的关闭流程
+        finally:
+            await self._close_stack()  # 关键：在当前任务里关闭，不会触发 cross-task 报错
+
+    async def _connect_all(self):
+        """连接配置文件里列出的所有服务器（原 connect_to_server，2026-11-06 改名）"""
         mcp_servers = self.config.list_servers()  # 拿到所有服务器名字的列表
         if not mcp_servers:  # 【2026-11-06 优化】没有配置任何服务器
             return  # 直接返回，连日志都不用打（配置缺失的情况已经在 server_config 里提示过了）
@@ -86,8 +131,42 @@ class MCPClient:
                 # 打印原因后继续下一个，不中断整体流程
 
     async def get_sessions(self) -> list[ClientSession]:
-        await self.connect_server_task  # 等后台那个连接任务全部完成
+        """拿到所有已连接的会话（2026-11-06 改为等"就绪信号"而不是等任务结束）"""
+        self._ensure_started()  # 【2026-11-06 第 2 轮新增】万一还没启动，这里补一下
+        await self._ready.wait()  # 等连接阶段结束
+        # 注意：不能再写 await self.connect_server_task 了——
+        #   因为那个任务现在会一直挂着待命，等它"结束"就等于死等。
         return self.sessions  # 把所有会话交出去
+
+    async def aclose(self):
+        """主动关闭所有 MCP 连接（2026-11-06 新增）
+
+        调用后会：点亮"停止"信号 → 等后台任务自己把资源栈关掉 → 外部服务器进程被回收。
+        这样程序退出时就不会留下孤儿进程，也不会再报 cancel scope 错误。
+        """
+        if self._closed:  # 已经关过了
+            return
+        self._ensure_started()  # 【2026-11-06 第 2 轮新增】没启动过就没什么可关的，这里补一下以防万一
+        self._shutdown.set()  # 喊停
+        if self.connect_server_task is None:  # 确实从来没启动过
+            self._closed = True  # 直接标记为已关闭
+            return
+        try:
+            await asyncio.wait_for(self.connect_server_task, timeout=5)  # 最多等 5 秒让它收尾
+        except asyncio.TimeoutError:  # 5 秒还没收完
+            self.connect_server_task.cancel()  # 强行取消
+        except Exception:  # 收尾时抛错也不用管，反正要退出了
+            pass
+
+    async def _close_stack(self):
+        """关闭资源栈（2026-11-06 新增，只会在 _run 任务里被调用）"""
+        if self._closed:  # 防止重复关闭
+            return
+        self._closed = True  # 先打标记，避免嵌套调用时重复执行
+        try:
+            await self.exit_stack.aclose()  # 依次关闭会话和服务器进程
+        except Exception as e:  # 关闭失败不该阻止程序退出
+            print(f"[MCP] 关闭连接时出现异常（可忽略）：{e}")
 
 # =============================================================================
 # 备注（这段代码的几个隐患，以及本轮处理情况）
@@ -100,10 +179,11 @@ class MCPClient:
 # 2. 【2026-11-06 已修复】一个服务器出错会连累全部：
 #    现在 for 循环里给每个服务器单独套了 try，坏的跳过、好的继续。
 #
-# 3. 退出时不清理：exit_stack 从头到尾没有被 aclose()，
-#    所以程序结束时那些外部服务器进程可能会变成"孤儿进程"留在后台。
-#    这块留到第 2 轮优化（要在同一个事件循环任务里关闭，否则会报
-#    "Attempted to exit cancel scope in a different task"）。
+# 3. 【2026-11-06 第 2 轮已修复】退出时不清理：
+#    原来 exit_stack 从来没有被 aclose()，外部服务器进程会变成"孤儿进程"，
+#    退出时还会打一段 RuntimeError: Attempted to exit cancel scope in a different task。
+#    现在由 _run() 这个后台任务负责"连接 → 待命 → 关闭"全程（同一个任务内），
+#    并由 aclose() 触发退出。Conversation.shutdown() → ToolManager.shutdown() 会调到它。
 #
 # 4. 只支持 stdio：HTTP / SSE 类型的服务器在 server_config 里被直接跳过了。
 # =============================================================================
