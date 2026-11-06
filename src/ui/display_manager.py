@@ -25,8 +25,9 @@ from rich.markdown import Markdown  # 把 markdown 文本变成带格式的漂�
 from rich.live import Live  # "实时刷新"组件，流式输出的核心
 from rich.padding import Padding  # 给内容加内边距（这里用来做左缩进）
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
-from rich.console import Group  # 把多个可渲染对象竖着叠在一起
+from rich.table import Table  # 【第 7 轮】用来做「圆点 + 正文」的两列布局
 from typing import Optional  # 类型标注：表示"可能是这个，也可能是 None"
+import time  # 【第 7 轮】计算"已经等了多久"给 spinner 用
 
 from . import theme  # 本项目统一的配色和符号（见 theme.py）
 
@@ -44,33 +45,45 @@ class DisplayManager:
         self._console = console or theme.console  # 默认共用 theme 里的全局控制台，保证风格一致
         self._live: Optional[Live] = None  # 存放流式显示对象，一开始没有
         self._stream_buffer: str = ""  # 存放已经收到但还没显示完的文字
+        self._stream_start: float = 0.0  # 【第 7 轮】这一轮开始等待的时间点，用来算 spinner 上的秒数
 
     # -------------------------------------------------------------------------
     # 一、消息类
     # -------------------------------------------------------------------------
-    def assistant_header(self) -> None:
-        """只打印模型发言的起始标记 ⏺（2026-11-06 第 4 轮新增）
+    @staticmethod
+    def _bullet_block(content_renderable):
+        """把 ⏺ 和正文排成 Claude Code 那样（2026-11-06 第 7 轮新增）
 
-        为什么要单独一个方法？
-          流式输出时，我们得先把 ⏺ 打出来，再让文字一点点往外冒。
-          否则用户会先看到一串文字，末尾才出现圆点，看起来很怪。
+        要的效果是：
+            ⏺ 目录里有 a、b、c 三个文件，
+              另外还有两个子目录。
+        也就是「圆点和第一行文字同一行，后续行对齐在文字下面」。
+
+        怎么做到的？
+          用两列网格：第一列只放 1 个字符宽的 ⏺，第二列放正文。
+          网格会把两列顶部对齐，正文折行时自然就落在第二列的起始位置。
         """
-        self._console.print(Text(f"{theme.BULLET} ", style="qs.accent"), end="\n")
+        grid = Table.grid(padding=(0, 0))  # 不留额外间距：⏺ 本身在终端里占两格宽，天然有一个空格
+        grid.add_column(width=2)  # 第一列：圆点占 2 列（符号 1 列 + 1 个空格），正文从第 3 列开始
+        grid.add_column()  # 第二列：正文，占满剩余宽度
+        grid.add_row(Text(theme.BULLET, style=""), content_renderable)
+        return grid
 
     def print_assistant_message(self, content: str, emoji: str = "", header: bool = True) -> None:
         """打印模型回复（带 markdown 渲染）
 
-        样式说明：
-          先打一个青色圆点 ⏺，再把正文缩进两格渲染。
-          这样长回复在视觉上是"挂在圆点下面"的，和 Claude Code 一致。
-          header=False 用于"流式已经打过圆点、这里只补正文"的场景。
+        样式说明（第 7 轮改）：
+          圆点 ⏺ 和正文的第一行在同一行，后续行对齐在文字下方——
+          这是 Claude Code 的实际排版方式。
+          header=False 用于"流式已经输出过、这里只补一段"的场景。
         """
         content = content.strip() if content else ""  # 去掉首尾空白；空内容保持空串
         if not content:  # 没内容就直接返回，别浪费屏幕
             return
-        if header:  # 需要的话先打圆点
-            self.assistant_header()
-        self._console.print(Padding(Markdown(content), (0, 0, 0, 2)))  # 正文左缩进 2 格
+        if header:  # 需要的话把圆点和正文排在一起
+            self._console.print(self._bullet_block(Markdown(content)))
+        else:  # 已经打过圆点了，只补正文
+            self._console.print(Padding(Markdown(content), (0, 0, 0, 2)))  # 正文左缩进 2 格
 
     def print_simple_message(self, message: str, emoji: str = "") -> None:
         """打印纯文本（不做 markdown 渲染）"""
@@ -109,7 +122,7 @@ class DisplayManager:
         """
         color = {"info": "qs.dim", "warn": "qs.warn", "err": "qs.err"}.get(level, "qs.dim")
         text = Text()
-        text.append(f"  {theme.RESULT} ", style=f"bold {theme.ACCENT}")  # 转折符号用强调色，和正文区分
+        text.append(f"  {theme.RESULT} ", style="qs.dim")  # 转折符号用暗灰
         text.append(text_content, style=color)  # 内容按水位变色
         self._console.print(text)
 
@@ -123,7 +136,7 @@ class DisplayManager:
         参数太长时由调用方先截断，这里只负责排版。
         """
         text = Text()
-        text.append(f"{theme.BULLET} ", style="qs.accent")  # 圆点
+        text.append(f"{theme.BULLET} ", style="")  # 圆点：白色，Claude Code 里它不上色
         text.append(tool_name, style="bold")  # 工具名加粗
         if args_preview:  # 有参数就用暗色括起来
             text.append(f"({args_preview})", style="qs.dim")
@@ -136,7 +149,7 @@ class DisplayManager:
         失败时整行变红，成功时暗灰——这样一眼就能从满屏输出里找到出问题的那次调用。
         """
         text = Text()
-        text.append(f"  {theme.RESULT}  ", style=f"bold {theme.ACCENT}")  # 转折符号用强调色，方便定位
+        text.append(f"  {theme.RESULT}  ", style="qs.dim")  # 转折符号用暗灰，和 Claude Code 一致
         style = "qs.dim" if success else "qs.err"  # 成功用暗灰，失败用红
         text.append(str(result), style=style)
         self._console.print(text)
@@ -153,6 +166,7 @@ class DisplayManager:
         屏幕上不会多出一个空圆点。
         """
         self._stream_buffer = ""  # 清空缓冲区，准备接收新内容
+        self._stream_start = time.time()  # 【第 7 轮】记下开始等待的时刻
         self._live = Live(
             console=self._console,
             refresh_per_second=refresh_rate,
@@ -162,13 +176,29 @@ class DisplayManager:
         self._live.start()  # 开始刷新
 
     def _stream_renderable(self):
-        """根据当前缓冲区生成"这一帧"要显示的内容（2026-11-06 第 4 轮新增）"""
-        if not self._stream_buffer:  # 还没有任何文字
-            return Text("")  # 显示空内容（屏幕上就是一片空白，不会留圆点）
-        return Group(
-            Text(f"{theme.BULLET} ", style="qs.accent"),  # 圆点
-            Padding(Markdown(self._stream_buffer), (0, 0, 0, 2)),  # 缩进两格的正文
-        )
+        """根据当前缓冲区生成"这一帧"要显示的内容（2026-11-06 第 4 轮新增）
+
+        【第 7 轮】缓冲区为空时不再显示空白，而是显示 Claude Code 那种等待动画：
+            ✻ 正在思考… (3s)
+        因为 Live 每秒钟会刷新十几次，这个函数会被反复调用，
+        每次都用"当前时间 - 开始时间"算秒数，秒数就会自己往上走。
+        """
+        if not self._stream_buffer:  # 还没收到任何文字，说明模型还在想
+            return self._spinner_renderable()
+        return self._bullet_block(Markdown(self._stream_buffer))  # 圆点与正文同排（Claude Code 样式）
+
+    def _spinner_renderable(self):
+        """生成等待动画的一帧（2026-11-06 第 7 轮新增）
+
+        星号在四个形状之间轮换，看起来像在转；后面跟着已经等了多少秒。
+        """
+        elapsed = time.time() - self._stream_start  # 已经等了多久
+        frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]  # 每秒换 8 次
+        line = Text()
+        line.append(f"{frame} ", style=f"bold {theme.ACCENT}")  # 星号用 Claude 橙
+        line.append("正在思考…", style="qs.dim")
+        line.append(f" ({elapsed:.0f}s)", style="qs.dim")  # 秒数，给自己一个"还在动"的反馈
+        return line
 
     def stop_stream_display(self) -> None:
         """Stop streaming display mode.（结束流式显示模式）
@@ -180,6 +210,11 @@ class DisplayManager:
         """
         if self._live:  # 如果当前确实在刷新
             had_content = bool(self._stream_buffer.strip())  # 之前有没有真的输出过文字
+            if not had_content:  # 【第 7 轮】这一轮只有工具调用、没有文字
+                # 把这块区域标记成"临时的"：rich 在 stop() 时会自动擦掉它，
+                # 而不是把最后一帧 spinner 留在屏幕上。
+                # 不能只 update(Text(""))——那样在非交互环境（输出被重定向）里会残留一行。
+                self._live.transient = True
             self._live.stop()  # 停掉它（不然它会一直占着屏幕）
             self._live = None  # 清空引用
             if had_content:  # 有文字才补换行（纯工具调用的轮次不需要）

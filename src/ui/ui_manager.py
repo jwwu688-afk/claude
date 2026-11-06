@@ -72,10 +72,6 @@ class UIManager:
         """Print assistant message with markdown formatting.（打印模型回复）"""
         self.display_manager.print_assistant_message(content, emoji, header)
 
-    def print_assistant_header(self) -> None:
-        """只打印模型发言的起始圆点 ⏺（2026-11-06 第 4 轮新增）"""
-        self.display_manager.assistant_header()
-
     def print_simple_message(self, message: str, emoji: str = "") -> None:
         """Print simple message without markdown formatting.（打印纯文本）"""
         self.display_manager.print_simple_message(message, emoji)
