@@ -137,7 +137,7 @@ class Conversation:
         try:  # 开始试：后面的整个对话循环都可能出错
             await self._recursive_message_handling()  # 进入主循环（下文详解）
         except Exception as e:  # 如果循环里出现任何没被处理的错误
-            self._ui_manager.print_error(f"System error occurred: {e}")  # 在界面上报个错
+            self._ui_manager.print_error(f"发生系统错误：{e}")  # 在界面上报个错
             traceback.print_exc()  # 再把完整的错误现场打印出来，方便定位问题
 
     async def start_task(self, task_system_prompt: str, user_input: str) -> str:
@@ -170,14 +170,14 @@ class Conversation:
         try:  # 开始试
             await self._recursive_message_handling()  # 子 agent 也走同一套主循环
         except Exception as e:  # 如果子任务出错了
-            self._ui_manager.print_error(f"System error occurred during running task: {e}")  # 报错
+            self._ui_manager.print_error(f"执行子任务时发生系统错误：{e}")  # 报错
             traceback.print_exc()  # 打印现场
             self._task_depth -= 1  # 深度 -1，把计数器还原
             self._discard_current_chat()  # 【2026-11-06 优化】把出错的那一页消息丢掉
             # 【2026-11-06 优化】原来是 sys.exit(1)，直接把整个程序干掉：
             #   子 agent 只要有一个工具抛异常，你的 CLI 就退出、主对话上下文全丢。
             #   现在改成"把错误当成子任务的结果交回去"，主 agent 可以自己决定换个做法。
-            return f"Task failed: {e}"  # 返回失败说明，让主 agent 看到并自行补救
+            return f"子任务执行失败：{e}"  # 返回失败说明，让主 agent 看到并自行补救
         self._task_depth -= 1  # 正常结束时也要把深度还原
         return self._history_manager.finish_chat_get_response()  # 收起这一页，把最后一条回复返回给主 agent
 
@@ -225,7 +225,7 @@ class Conversation:
 
             # Validate stream generator
             if stream_generator is None:  # 如果压根没拿到流（说明前面就出问题了）
-                raise Exception("Stream generator is None - API client returned no response")
+                raise Exception("领取数据流失败：API 客户端没有返回任何内容")
 
             response_message = None  # 准备装"模型这一轮的完整回复"
             full_content = ""  # 准备攒"模型说的所有文字"
@@ -235,7 +235,7 @@ class Conversation:
             try:  # 再试一层：确认拿到的确实能一段段读
                 iterator = iter(stream_generator)  # 把它变成"迭代器"
             except TypeError:  # 如果转换失败，说明类型不对
-                raise Exception(f"Stream generator is not iterable. Type: {type(stream_generator)}")
+                raise Exception(f"返回的数据流无法逐段读取，类型是：{type(stream_generator)}")
 
             # Start streaming display
             self._ui_manager.start_stream_display()  # 开启"实时刷新显示"模式（界面上会动）
@@ -265,13 +265,13 @@ class Conversation:
                 response_message = self._create_simple_message(full_content)  # 就用攒下来的文字自己造一个
 
         except Exception as e:  # 如果流式这一套失败了
-            self._ui_manager.print_error(f"Streaming response processing error: {e}")  # 报错
-            self._ui_manager.print_info(f"Error type: {type(e).__name__}")  # 打印错误类型
+            self._ui_manager.print_error(f"处理流式响应时出错：{e}")  # 报错
+            self._ui_manager.print_info(f"错误类型：{type(e).__name__}")  # 打印错误类型
             traceback.print_exc()  # 打印完整现场
 
             # Fallback to non-streaming mode
             try:  # 再试：退一步，用"非流式"方式重发一次（不要逐字效果了，能拿到结果就行）
-                self._ui_manager.print_info("Trying non-streaming mode...")
+                self._ui_manager.print_info("正在改用非流式模式重试……")
                 response_message, token_usage = self._api_client.get_completion(request)  # 一次性拿完整结果
                 self._ui_manager.print_assistant_message(response_message.content)  # 把内容显示出来
 
@@ -280,7 +280,7 @@ class Conversation:
                     self._history_manager.update_token_usage(token_usage)  # 交给历史管理器记账
 
             except Exception as fallback_error:  # 如果连非流式也失败了
-                self._ui_manager.print_error(f"Non-streaming mode also failed: {fallback_error}")
+                self._ui_manager.print_error(f"非流式模式也失败了：{fallback_error}")
                 # Create error response
                 response_message = self._create_error_message(str(e))  # 造一条"出错提示"当作模型的回复
                 self._ui_manager.print_assistant_message(response_message.content)  # 显示出来
@@ -327,7 +327,7 @@ class Conversation:
 
     def _print_context_window_and_total_cost(self):
         # 打印一行状态："上下文窗口用了 12.3%，一共花了 0.45 美元"
-        self._ui_manager.print_simple_message(f"(context window: {self._history_manager.current_context_window}%, total cost: {self._api_client.total_cost}$)")
+        self._ui_manager.print_simple_message(f"（上下文已用 {self._history_manager.current_context_window}%，累计花费 {self._api_client.total_cost} 美元）")
 
     # -------------------------------------------------------------------------
     # 【2026-11-06 第 2 轮新增】摘要式压缩相关
@@ -448,7 +448,7 @@ class Conversation:
                     "tool_call_id": tool_call.id,  # 对应哪一次申请（必须对上号）
                     "name": tool_call.function.name,  # 是哪个工具
                     "content": [
-                        {"type": "text", "text": "tool call failed due to JSONDecodeError"}
+                        {"type": "text", "text": "工具调用失败：参数不是合法的 JSON，请检查 tool 的 arguments 格式后重试。"}
                         # 告诉模型"你参数写错了"，让它重新写一遍
                     ]
                 }
@@ -472,7 +472,7 @@ class Conversation:
             if should_execute:  # 用户同意（或本来就不需要问）
                 await self._execute_tool(tool_call, args, is_last_tool)  # 真正执行
             else:  # 用户拒绝了
-                self._add_tool_response(tool_call, f"user denied to execute tool, user input: {content}", is_last_tool)
+                self._add_tool_response(tool_call, f"用户拒绝执行这个工具。用户的说明：{content}", is_last_tool)
                 # 把"用户拒绝了，理由是..."当作工具结果告诉模型，让它换个做法
 
     async def _execute_tool(self, tool_call, args, is_last_tool=False):
@@ -500,7 +500,7 @@ class Conversation:
                 success=False,  # 这次是失败
                 result=str(e)  # 错误信息
             )
-            self._add_tool_response(tool_call, f"tool call failed, fail reason: {str(e)}", is_last_tool)
+            self._add_tool_response(tool_call, f"工具调用失败，原因：{str(e)}", is_last_tool)
             # 关键设计：工具失败不是"程序崩了"，而是"给模型一条失败消息"，
             # 让模型自己看到错误、自己想办法补救。这是 agent 能自我纠错的核心。
 
@@ -536,7 +536,7 @@ class Conversation:
         """Create an error message object.（造一个"出错回复对象"）"""
         class ErrorMessage:  # 同样临时定义一个类
             def __init__(self, error_msg):  # 初始化
-                self.content = f"Sorry, I encountered a technical problem: {error_msg}"  # 给用户看的道歉文案
+                self.content = f"抱歉，我遇到一个技术问题：{error_msg}"  # 给用户看的道歉文案
                 self.role = "assistant"  # 角色是助手
                 self.tool_calls = None  # 没有工具申请
 

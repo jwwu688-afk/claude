@@ -49,12 +49,12 @@ def test_crop_insufficient_messages():
 
     # Test with no messages
     result = manager.crop_message(Crop_Direction.TOP, 1)  # 一条消息都没有时，试着删 1 条
-    assert result == "Cannot crop: insufficient messages"  # 要求返回"消息不够"，否则测试失败
+    assert result == "无法裁剪：消息数量太少。"  # 要求返回"消息不够"，否则测试失败
 
     # Test with only one message
     manager.add_message(create_mock_message(Role.SYSTEM, "System message"))  # 现在加 1 条
     result = manager.crop_message(Crop_Direction.TOP, 1)  # 再试着删
-    assert result == "Cannot crop: insufficient messages"  # 还是应该拒绝
+    assert result == "无法裁剪：消息数量太少。"  # 还是应该拒绝
 
     print("✓ 通过: 消息数量不足时正确拒绝裁剪")
 
@@ -73,7 +73,7 @@ def test_crop_invalid_amount():
 
 
     result = manager.crop_message(Crop_Direction.TOP, 2)  # 试着删 2 条
-    assert result == "Cannot crop: invalid crop amount"  # 要求被拒绝
+    assert result == "无法裁剪：裁剪数量无效（要删的比剩下的还多）。"  # 要求被拒绝
 
     print("✓ 通过: 无效裁剪数量时正确拒绝")
 
@@ -93,7 +93,7 @@ def test_crop_no_user_messages():
     manager.add_message(create_mock_message(Role.TOOL, "Another tool message"))
 
     result = manager.crop_message(Crop_Direction.TOP, 1)  # 试着删 1 条
-    assert result == "Cannot crop: no user messages found"  # 要求返回"没找到用户消息"
+    assert result == "无法裁剪：没有找到任何用户消息。"  # 要求返回"没找到用户消息"
 
     print("✓ 通过: 没有用户消息时正确拒绝裁剪")
 
@@ -118,7 +118,7 @@ def test_crop_would_remove_latest_user_message():
     # Try to crop 5 messages from top, which would remove the user message at index 4
     # 翻译：从顶部删 5 条，就会把索引 4 那条用户消息删掉——必须被拦住
     result = manager.crop_message(Crop_Direction.TOP, 5)
-    assert result == "Cannot crop: can't crop the latest user message"  # 要求拒绝
+    assert result == "无法裁剪：不能删掉用户最新说的那条消息。"  # 要求拒绝
 
     print("✓ 通过: 正确保护最新用户消息不被裁剪")
 
@@ -139,7 +139,7 @@ def test_crop_top_success():
 
     # Crop 2 messages from top
     result = manager.crop_message(Crop_Direction.TOP, 2)  # 从顶部删 2 条（会删掉前两条非系统消息）
-    assert result == "Crop message successful"  # 要求成功
+    assert result == "裁剪成功。"  # 要求成功
 
     messages = manager.get_current_messages()  # 看看删完以后剩下什么
 
@@ -177,7 +177,7 @@ def test_crop_bottom_success():
 
     # Crop 2 messages from bottom
     result = manager.crop_message(Crop_Direction.BOTTOM, 2)  # 从尾部删 2 条
-    assert result == "Crop message successful"
+    assert result == "裁剪成功。"
 
     messages = manager.get_current_messages()
 
@@ -214,7 +214,7 @@ def test_crop_multiple_user_messages():
 
     # Crop from top - latest user is at index 5, so we can crop up to 5 messages
     result = manager.crop_message(Crop_Direction.TOP, 2)  # 删最前面的 2 条（系统消息会被保住）
-    assert result == "Crop message successful"
+    assert result == "裁剪成功。"
 
     messages = manager.get_current_messages()
 
@@ -244,7 +244,7 @@ def test_crop_edge_cases():
 
     # Test maximum valid crop amount from top
     result = manager.crop_message(Crop_Direction.TOP, 1)  # 只删 1 条，这是下限
-    assert result == "Crop message successful"
+    assert result == "裁剪成功。"
 
     messages = manager.get_current_messages()
     assert len(messages) == 5  # system + user + 剩下的（系统消息被保住了，所以还是 5 条）

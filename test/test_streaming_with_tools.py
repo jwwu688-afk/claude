@@ -39,8 +39,8 @@ def test_streaming_with_tools():
         # Test request that should trigger a tool call
         request_params = {
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},  # 系统设定
-                {"role": "user", "content": "Please list the files in the current directory"}  # 让它列文件
+                {"role": "system", "content": "你是一个乐于助人的助手。"},  # 系统设定
+                {"role": "user", "content": "请列出当前目录下的文件"}  # 让它列文件
             ],
             "tools": tool_manager.get_tools_description()
             # ⚠️ 这里漏了 await！get_tools_description 是异步方法，

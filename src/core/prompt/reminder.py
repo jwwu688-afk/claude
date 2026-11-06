@@ -9,6 +9,8 @@
 #
 # 这是一种很实用的小技巧：与其在系统提示词里说十遍，
 # 不如在实际使用的地方反复提一句——因为最近的内容模型记得最牢。
+#
+# 【2026-11-06 第 3 轮】整段提醒文字已改成中文。
 # =============================================================================
 
 from tools.todo_write import TodoWrite  # 导入待办工具，为了拿到它当前的状态
@@ -19,16 +21,15 @@ def get_reminder() -> str:
     # 定义函数，返回一段提醒文字
     tool_manager = ToolManager()  # 拿到工具管理器（单例，就是对话在用的那个）
     todo_status = tool_manager.get_tool_status(TodoWrite.get_tool_name())  # 查询待办工具现在装了些什么
-    # 上面这行的效果：如果清单是空的，会返回"No todos in memory..."；
+    # 上面这行的效果：如果清单是空的，会返回"当前没有任何待办事项"；
     # 如果有内容，会返回格式化好的 JSON 文字
 
     return f"""
 <reminder>
-## Current Todo Status
+## 当前待办状态
 {todo_status}
-Remember to check and update your todos using tool todo_write regularly to stay organized and productive.
+记得经常用 todo_write 工具检查并更新待办清单，保持条理和效率。
 </reminder>
 """.strip()
     # 上面把状态嵌进一段固定模板里。
-    # 中文大意：这是你的当前待办状态……记得经常用 todo_write 工具更新它，保持条理。
     # 用 <reminder> 这种标签包起来，是让模型能清楚区分"这是系统提醒"和"这是工具结果"

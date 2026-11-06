@@ -140,11 +140,11 @@ class DisplayManager:
             emoji: Emoji to display before todo list（前面的图标）
         """
         if not todos:  # 如果清单是空的
-            self.print_info("No todos to display", emoji)  # 提示一句，然后返回
+            self.print_info("当前没有待办事项", emoji)  # 提示一句，然后返回
             return  # 直接结束，不往下画
 
         output = []  # 准备一个列表，一行一行往里加
-        output.append("📋 Todo List:")  # 标题
+        output.append("📋 待办清单：")  # 标题
         output.append("=" * 50)  # 一条分隔线（= 重复 50 次）
 
         for i, todo in enumerate(todos, 1):  # 遍历清单，i 从 1 开始（所以要传第二个参数 1）
@@ -156,7 +156,7 @@ class DisplayManager:
             # {i:2d} 的意思是"把 i 显示成至少占 2 个字符宽度，不够补空格"，这样能对齐
 
         output.append("=" * 50)  # 底部线
-        output.append(f"Total: {len(todos)} todos")  # 统计总数
+        output.append(f"共 {len(todos)} 项")  # 统计总数
 
         self.print_simple_message("\n".join(output))  # 用换行把列表连成一整段，然后打印
 

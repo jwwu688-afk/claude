@@ -172,10 +172,10 @@ class HistoryManager(BaseHistoryManager):
         current_messages = self.messages_history[-1]  # 拿到当前这一页
 
         if len(current_messages) <= 1:  # 只有 1 条或更少，删了就没内容了
-            return "Cannot crop: insufficient messages"  # 返回一句"删不了"
+            return "无法裁剪：消息数量太少。"  # 返回一句"删不了"
 
         if len(current_messages) < crop_amount + 2:  # 要删的数量太大，剩下的不够
-            return "Cannot crop: invalid crop amount"
+            return "无法裁剪：裁剪数量无效（要删的比剩下的还多）。"
 
         # find the latest user message index
         latest_user_index = -1  # 先假设"没找到用户消息"，用 -1 表示
@@ -186,7 +186,7 @@ class HistoryManager(BaseHistoryManager):
                 break  # 找到就停（从后往前找，找到的就是最新的那条）
 
         if latest_user_index == -1:  # 一条用户消息都没找到
-            return "Cannot crop: no user messages found"
+            return "无法裁剪：没有找到任何用户消息。"
 
         # ensure not to crop the latest user input message
         if crop_direction == Crop_Direction.TOP:  # 如果是从头删
@@ -195,7 +195,7 @@ class HistoryManager(BaseHistoryManager):
             max_crop_amount = len(current_messages) - latest_user_index - 1  # 最多只能删到"最新用户消息"之后
 
         if crop_amount > max_crop_amount:  # 想删的比允许的还多
-            return "Cannot crop: can't crop the latest user message"  # 拒绝，保护用户最新输入
+            return "无法裁剪：不能删掉用户最新说的那条消息。"  # 拒绝，保护用户最新输入
 
         if crop_direction == Crop_Direction.TOP:
             # crop from the top, keeping system messages and content after the latest user message
@@ -209,7 +209,7 @@ class HistoryManager(BaseHistoryManager):
             # [:-n] 的意思是"从头取到倒数第 n 条之前"，也就是把最后 n 条砍掉
 
         self.messages_history[-1] = cropped_messages  # 用新列表替换掉当前这一页
-        return "Crop message successful"  # 告诉调用方"删成功了"
+        return "裁剪成功。"  # 告诉调用方"删成功了"
 
     @property
     def current_context_window(self):
@@ -271,7 +271,7 @@ class HistoryManager(BaseHistoryManager):
     # tell the model we have compressed the messages
     async def _compress_current_message(self) -> None:
         """Compress current message history to save context window space（真正执行压缩）"""
-        self._ui_manager.print_assistant_message("History context too long, compressing...")  # 提示用户
+        self._ui_manager.print_assistant_message("上下文太长了，正在压缩…")  # 提示用户
 
         current_messages = self.messages_history[-1]  # 拿到当前这一页
         user_indices = self._get_user_message_indices(current_messages)  # 找出所有"用户消息"的位置
@@ -376,13 +376,13 @@ class HistoryManager(BaseHistoryManager):
         #   而其他消息的 content 都是 [{"type": "text", "text": ...}] 这种"内容块列表"。
         #   两种结构混在一起，任何按统一格式读 content 的代码（比如 _content_to_text）
         #   都会出错。现在统一成内容块列表。
+        # 【2026-11-06 第 3 轮】公告文字改成中文（它是作为一条"用户消息"进入对话的，模型会读到）
         if summary:  # 有摘要
             notice_text = (
-                "[Earlier conversation was compressed to save context space. "
-                "Summary of the removed part:]\n" + summary
+                "[为节省上下文空间，之前的对话已被压缩。以下是被压缩部分的摘要：]\n" + summary
             )
         else:  # 没摘要，用原来那句
-            notice_text = "[Previous conversation history has been compressed to save context window space]"
+            notice_text = "[之前的对话历史已被压缩，以节省上下文空间]"
 
         first = messages[0]  # 看一眼现有消息是什么形态
         if isinstance(first, dict):  # 真实运行时都是字典

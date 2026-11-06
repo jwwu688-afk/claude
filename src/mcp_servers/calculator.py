@@ -8,6 +8,8 @@
 #   3. 启动服务器
 #
 # 想看一个 MCP 服务器最少需要多少代码？就这么点。
+#
+# 【2026-11-06 第 3 轮】函数文档字符串会直接变成模型看到的工具说明，已改成中文。
 # =============================================================================
 
 from typing import Any  # 类型标注工具（这里没用到，残留导入）
@@ -22,17 +24,17 @@ mcp = FastMCP("calculator", log_level="WARNING")
 @mcp.tool()
 # ↑ 加上这个装饰器，下面的函数就变成了一个工具：
 #   工具名 = adder
-#   工具说明 = 函数下面那段三引号文字
+#   工具说明 = 函数下面那段三引号文字（现在是中文）
 #   参数 = number1、number2（类型也自动识别成整数）
 async def adder(number1: int, number2: int) -> int:
-    """Add two numbers together and return the sum.（把两个数相加，返回和）
+    """把两个数相加，返回它们的和。
 
     Args:
-        number1: The first number to add（第一个数）
-        number2: The second number to add（第二个数）
+        number1: 第一个加数
+        number2: 第二个加数
 
     Returns:
-        The sum of number1 and number2（两数之和）
+        number1 与 number2 的和
     """
     return number1 + number2  # 就这么简单
 

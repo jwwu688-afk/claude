@@ -5,7 +5,7 @@
 #
 # 它的工作流程：
 #   1. 模型说："我想执行 ls -la，不需要用户同意"
-#   2. 这个工具收到命令，用 subprocess 真的去跑
+#   2. 这个工具收到命令，真的去跑
 #   3. 把命令的输出（或错误信息）当作结果返回给模型
 #
 # 注意：现在所有文件操作都靠 cat / sed / grep 这些命令凑，
@@ -35,7 +35,7 @@ class CmdRunner(BaseTool):
     async def act(self, command="", timeout=DEFAULT_TIMEOUT):
         # 真正的执行入口。command 是要跑的命令，timeout 是最多等几秒
         if not command:  # 如果命令是空的
-            return "No command provided"  # 直接告诉他"你没给命令"
+            return "没有提供任何命令。请把要执行的命令放进 command 参数。"  # 直接告诉他"你没给命令"
 
         # 【2026-11-06 优化】对 timeout 做"清洗"：模型有时候会传字符串、负数或者巨大的数
         try:
@@ -62,7 +62,7 @@ class CmdRunner(BaseTool):
                 )
             except asyncio.TimeoutError:  # 等超时了
                 await self._kill_process_tree(process)  # 【2026-11-06 优化】连子进程一起杀掉
-                return f"Command timed out after {timeout:g} seconds"  # 告诉模型"超时了，等了几秒"
+                return f"命令执行超时：等了 {timeout:g} 秒仍未结束，进程已被强制终止。"  # 告诉模型"超时了"
 
             # 把字节转成文字（Windows 上命令输出常常是 GBK，不是 UTF-8，所以要猜）
             stdout = self._decode(stdout_bytes)
@@ -72,15 +72,15 @@ class CmdRunner(BaseTool):
                 if stdout.strip():  # 如果标准输出（正常结果）去掉空白后还有内容
                     return self._truncate(stdout)  # 就返回结果（太长会被截断）
                 else:  # 命令成功了但什么都没输出
-                    return "Command executed successfully and no return"  # 告诉他"跑成功了，但没输出"
+                    return "命令执行成功，但没有产生任何输出。"  # 告诉他"跑成功了，但没输出"
             else:  # 退出码不是 0，说明命令出错了
                 if stderr.strip():  # 有错误输出
-                    return self._truncate(f"Error: {stderr}")  # 把错误输出返回给模型
+                    return self._truncate(f"命令执行失败。错误输出：\n{stderr}")  # 把错误输出返回给模型
                 # 【2026-11-06 优化】有时候命令失败但错误输出是空的，
                 # 原来会返回 "Error: "（什么信息都没有），模型完全不知道发生了什么。
-                return f"Error: command exited with code {process.returncode}"  # 至少告诉他退出码
+                return f"命令执行失败，退出码 {process.returncode}，没有任何错误输出。"  # 至少告诉他退出码
         except Exception as e:  # 其他任何意外
-            return f"cmd_runner Exception: {str(e)}"  # 返回错误信息
+            return f"cmd_runner 工具执行时发生异常：{str(e)}"  # 返回错误信息
 
     @staticmethod
     async def _kill_process_tree(process):
@@ -152,12 +152,13 @@ class CmdRunner(BaseTool):
         omitted = len(text) - limit  # 中间省略了多少字符
         return (
             text[:head_length]  # 开头部分
-            + f"\n... [output truncated, {omitted} characters omitted] ...\n"  # 一句说明，让模型知道中间被省略了
+            + f"\n... [输出过长，中间省略了 {omitted} 个字符] ...\n"  # 一句说明，让模型知道中间被省略了
             + text[-tail_length:]  # 结尾部分
         )
 
     def json_schema(self):
         # 这份"自我介绍"会原封不动发给大模型，模型就是靠它决定怎么调用这个工具的
+        # 【2026-11-06 第 3 轮】所有给模型看的文字统一改成中文
         return {
             "type": "function",  # 固定写法，表示这是一个"函数"
             "function": {
@@ -169,18 +170,16 @@ class CmdRunner(BaseTool):
                         # properties 里列出每个参数的名字、类型、说明
                         "need_user_approve": {
                             "type": "boolean",  # 布尔值：真或假
-                            "description": "Whether the command requires explicit user approval before execution",
-                            # 说明：这个命令是否需要用户先点头同意
+                            "description": "执行这条命令前是否需要用户先明确同意。危险命令必须设为 true。",
                             "default": True  # 默认值是"需要同意"
                         },
                         "command": {
                             "type": "string",  # 字符串
-                            "description": "The shell command to execute"  # 要执行的命令
+                            "description": "要执行的 shell 命令"  # 要执行的命令
                         },
                         "timeout": {
                             "type": "integer",  # 整数
-                            "description": "Maximum number of seconds to wait for the command to finish",
-                            # 最多等多少秒
+                            "description": "最多等待多少秒（默认 30，最大 600）。超时后进程会被强制终止。",
                             "default": 30  # 默认 30 秒
                         }
                     },
@@ -197,119 +196,102 @@ class CmdRunner(BaseTool):
     # ↑ 原作者的待办：以后要把"读文件"和"改文件"拆成独立的工具（确实该拆）
 
     def _tool_description(self):
-        # 下面是给模型看的使用说明书（英文原文，因为模型对英文指令理解更稳）
-        #
-        # 【这段说明书的中文大意，按顺序分 4 块】
-        #
-        # 第 1 块：安全提示
-        #   遇到 rm、sudo、chmod 777、format、del 这类危险命令，
-        #   必须把 need_user_approve 设成 true，让用户先确认。
-        #
-        # 第 2 块：目录检查
-        #   如果要创建新目录或新文件，先用 ls 确认父目录存在、位置对不对。
-        #
-        # 第 3 块：怎么读文件、怎么改文件（这是最要命的一块）
-        #   - 读文件用 cat -n（带行号，方便后面按行号改）
-        #   - 改文件用 sed：sed -i "起始行,结束行 c 新内容" 文件
-        #   - 插入内容用 sed -i "行号 a 要插入的内容"
-        #   - 搜索用 grep
-        #   - 不确定行号时，先用 sed -n "起,止 p" 预览那几行
-        #   ⚠️ 问题就在这儿：sed 是 Linux/macOS 的命令，Windows 上默认没有。
-        #      虽然下面一句提了"Windows 请用 dir/type"，但模型多数时候还是会照着
-        #      sed 的例子去写，在你机器上就会反复失败。
-        #
-        # 第 4 块：git 提交和 PR 的规范
-        #   - 提交前并行跑 git status / git diff / git log，了解现状和提交风格
-        #   - 提交信息要写清"为什么改"，1-2 句
-        #   - 绝对不要改 git config，不要主动 push
-        #   - 用 gh 命令处理 GitHub 相关的事
+        # 下面是给模型看的使用说明书。
+        # 【2026-11-06 第 3 轮】整段从英文翻译成中文，内容和结构保持一一对应：
+        #   1. 安全提示（危险命令必须请求用户同意）
+        #   2. 目录检查（建文件前先确认父目录存在）
+        #   3. 读文件的写法（cat -n 带行号）
+        #   4. 改文件的写法（sed 替换/插入，grep 搜索，不确定就先预览）
+        #   5. 使用注意（参数、超时、尽量用绝对路径）
+        #   6. git 提交与 PR 的规范
         return """
-Executes a given bash command in a persistent shell session with optional timeout, user approval, and security measures.
+在当前会话中执行一条 shell 命令，支持超时控制、用户授权和安全措施。
 
-Before executing the command, please follow these steps:
-1. Security Check:
-   - Always check if the command is potentially dangerous (e.g., rm, sudo, chmod 777, format, del, etc.)
-   - If the command is dangerous or could cause system damage/data loss, you MUST set need_user_approve=true
+执行命令前，请按以下步骤检查：
 
-2. Directory Verification:
-   - If the command will create new directories or files, first use the ls command to verify the parent directory exists and is the correct location
-   - For example, before running "mkdir foo/bar", first use ls to check that "foo" exists and is the intended parent directory
+1. 安全检查：
+   - 始终判断这条命令是否有危险（例如 rm、sudo、chmod 777、format、del 等）
+   - 如果命令危险，或者可能造成系统损坏、数据丢失，必须把 need_user_approve 设为 true
 
-3. Read File Command:
-   - When you need to read a file for the first time, always use `cat -n <file>` to display the contents with line numbers (default max 2000 lines)
+2. 目录检查：
+   - 如果命令会新建目录或文件，先用 ls 确认父目录存在，并且位置正确
+   - 例如：执行 "mkdir foo/bar" 之前，先用 ls 确认 "foo" 存在且就是想要的父目录
 
-4. Edit File Command:
-   - Before updating any file, you must read the file content in the current conversation first
-   - When updating content in an existing file, always use sed for replacement except when the updated content is very large:
-     Example: `sed -i "start_line,end_line c new_content" <file>`
-   - When inserting content into an existing file, use sed for insertion:
-     Example: `sed -i "insert_line_number a insert_content" <file>`
-   - When searching within files, always use grep:
-     Example: `grep "search_pattern" <file>`
-   - Before editing a file, use sed to preview the specific lines with their line numbers if you are unsure of the exact range. Make sure it’s the code you actually want to update.
-     Example: sed -n "start_line,end_line p" <file>
+3. 读取文件：
+   - 第一次读取某个文件时，始终使用 `cat -n <文件>`，这样能看到带行号的内容（默认最多 2000 行）
 
-Note: The above commands are for Linux/macOS systems. For Windows, use appropriate command-line equivalents (e.g., `dir`, `type`, PowerShell commands).
+4. 修改文件：
+   - 修改任何文件之前，必须先在当前对话里读过它的内容
+   - 修改已有文件的内容时，除内容特别多的情况外，一律用 sed 做替换：
+     示例：`sed -i "起始行,结束行 c 新内容" <文件>`
+   - 向已有文件插入内容时，用 sed 插入：
+     示例：`sed -i "插入位置上一行的行号 a 要插入的内容" <文件>`
+   - 在文件内搜索时，一律用 grep：
+     示例：`grep "要搜索的内容" <文件>`
+   - 不确定要改哪几行时，先用 sed 预览带行号的片段，确认那确实是你想改的代码：
+     示例：`sed -n "起始行,结束行 p" <文件>`
 
-Usage notes:
-  - The command and need_user_approve arguments are required.
-  - You can specify an optional timeout in seconds (default 30, maximum 600). If not specified, commands will timeout after 30 seconds.
-  - Try to maintain your current working directory throughout the session by using absolute paths and avoiding usage of `cd`. You may use `cd` if the User explicitly requests it.
+注意：以上命令适用于 Linux/macOS 系统。在 Windows 上请使用对应的等价命令（例如 `dir`、`type`、PowerShell 命令）。
 
-Committing changes with git
+使用说明：
+  - command 和 need_user_approve 两个参数是必填的。
+  - 可以传一个可选的 timeout（单位：秒，默认 30，最大 600）。不传则 30 秒超时。
+  - 整个会话中尽量保持当前工作目录不变：用绝对路径，避免使用 `cd`。只有用户明确要求时才用 `cd`。
 
-When the user asks you to create a new git commit, follow these steps carefully:
+用 git 提交改动
 
-1. You have the capability to call multiple tools in a single response. When multiple independent pieces of information are requested, batch your tool calls together for optimal performance. ALWAYS run the following bash commands in parallel, each using the Bash tool:
-  - Run a git status command to see all untracked files.
-  - Run a git diff command to see both staged and unstaged changes that will be committed.
-  - Run a git log command to see recent commit messages, so that you can follow this repository's commit message style.
-2. Analyze all staged changes (both previously staged and newly added) and draft a commit message:
-  - Summarize the nature of the changes (eg. new feature, enhancement to an existing feature, bug fix, refactoring, test, docs, etc.). Ensure the message accurately reflects the changes and their purpose (i.e. "add" means a wholly new feature, "update" means an enhancement to an existing feature, "fix" means a bug fix, etc.).
-  - Check for any sensitive information that shouldn't be committed
-  - Draft a concise (1-2 sentences) commit message that focuses on the "why" rather than the "what"
-  - Ensure it accurately reflects the changes and their purpose
-3. You have the capability to call multiple tools in a single response. When multiple independent pieces of information are requested, batch your tool calls together for optimal performance. ALWAYS run the following commands in parallel:
-   - Add relevant untracked files to the staging area.
-   - Run git status to make sure the commit succeeded.
-4. If the commit fails due to pre-commit hook changes, retry the commit ONCE to include these automated changes. If it fails again, it usually means a pre-commit hook is preventing the commit. If the commit succeeds but you notice that files were modified by the pre-commit hook, you MUST amend your commit to include them.
+当用户要求你创建一个 git 提交时，请仔细按以下步骤执行：
 
-Important notes:
-- NEVER update the git config
-- NEVER run additional commands to read or explore code, besides git bash commands
-- NEVER use the TodoWrite or Task tools
-- DO NOT push to the remote repository unless the user explicitly asks you to do so
-- IMPORTANT: Never use git commands with the -i flag (like git rebase -i or git add -i) since they require interactive input which is not supported.
-- If there are no changes to commit (i.e., no untracked files and no modifications), do not create an empty commit
-- In order to ensure good formatting, ALWAYS pass the commit message via a HEREDOC, a la this example:
+1. 你可以在一次回复里调用多个工具。当需要多项互不依赖的信息时，把这些调用放在一起并行执行以提高效率。始终并行运行下面这些命令：
+  - 运行 git status，查看所有未跟踪的文件。
+  - 运行 git diff，查看已暂存和未暂存的改动。
+  - 运行 git log，查看最近的提交信息，以便沿用这个仓库的提交信息风格。
+2. 分析所有已暂存的改动（包括之前暂存的和新加入的），然后起草提交信息：
+  - 概括改动的性质（例如：新功能、功能增强、缺陷修复、重构、测试、文档等）。确保信息准确反映改动的目的（"新增"指全新的功能，"更新"指对已有功能的增强，"修复"指修 bug，等等）。
+  - 检查是否包含不应提交的敏感信息
+  - 起草一句简洁（1-2 句）的提交信息，重点写"为什么改"而不是"改了什么"
+  - 确保它准确反映了改动内容和目的
+3. 你可以在一次回复里调用多个工具。当需要多项互不依赖的信息时，把这些调用放在一起并行执行以提高效率。始终并行运行下面这些命令：
+   - 把相关的未跟踪文件加入暂存区。
+   - 运行 git status，确认提交成功。
+4. 如果提交因为 pre-commit 钩子修改了文件而失败，重试一次提交以包含这些自动改动。如果再次失败，通常是某个钩子阻止了提交。如果提交成功但你发现文件被钩子改过，必须补一次提交把这些改动包含进去。
+
+重要说明：
+- 绝对不要修改 git config
+- 除了 git 相关命令，绝对不要额外运行别的命令去读代码或探索代码
+- 绝对不要使用 todo_write 或 task 工具
+- 除非用户明确要求，不要推送到远程仓库
+- 重要：绝对不要使用带 -i 参数的 git 命令（如 git rebase -i、git add -i），因为它们需要交互式输入，本环境不支持
+- 如果没有改动可提交（既没有未跟踪文件也没有修改），不要创建空提交
+- 为了保证格式正确，提交信息一律用 HEREDOC 传入，示例如下：
 <example>
 git commit -m "$(cat <<'EOF'
-   Commit message here.
+   这里写提交信息。
    EOF
    )"
 </example>
 
-### Creating pull requests
-Use the gh command via the Bash tool for ALL GitHub-related tasks including working with issues, pull requests, checks, and releases. If given a Github URL use the gh command to get the information needed.
+### 创建 Pull Request
+所有 GitHub 相关的事（issue、PR、检查、发布）都用 gh 命令完成。如果用户给了 GitHub 链接，用 gh 命令去取需要的信息。
 
-IMPORTANT: When the user asks you to create a pull request, follow these steps carefully:
+重要：用户要求你创建 Pull Request 时，请仔细按以下步骤执行：
 
-1. You have the capability to call multiple tools in a single response. When multiple independent pieces of information are requested, batch your tool calls together for optimal performance. ALWAYS run the following bash commands in parallel using the Bash tool, in order to understand the current state of the branch since it diverged from the main branch:
-   - Run a git status command to see all untracked files
-   - Run a git diff command to see both staged and unstaged changes that will be committed
-   - Check if the current branch tracks a remote branch and is up to date with the remote, so you know if you need to push to the remote
-   - Run a git log command and `git diff [base-branch]...HEAD` to understand the full commit history for the current branch (from the time it diverged from the base branch)
-2. Analyze all changes that will be included in the pull request, making sure to look at all relevant commits (NOT just the latest commit, but ALL commits that will be included in the pull request!!!), and draft a pull request summary
-3. You have the capability to call multiple tools in a single response. When multiple independent pieces of information are requested, batch your tool calls together for optimal performance. ALWAYS run the following commands in parallel:
-   - Create new branch if needed
-   - Push to remote with -u flag if needed
-   - Create PR using gh pr create with the format below. Use a HEREDOC to pass the body to ensure correct formatting.
+1. 你可以在一次回复里调用多个工具。当需要多项互不依赖的信息时，把这些调用放在一起并行执行。始终并行运行下面这些命令，以了解当前分支从主干分叉以来的状态：
+   - 运行 git status，查看所有未跟踪的文件
+   - 运行 git diff，查看已暂存和未暂存的改动
+   - 检查当前分支是否跟踪了远程分支、是否与远程同步，以判断是否需要推送
+   - 运行 git log 和 `git diff [基础分支]...HEAD`，了解当前分支的完整提交历史
+2. 分析将要包含在 PR 里的所有改动，确保查看了所有相关提交（不只是最新一条，而是**所有**会被包含的提交），然后起草 PR 说明
+3. 你可以在一次回复里调用多个工具。当需要多项互不依赖的信息时，把这些调用放在一起并行执行。始终并行运行下面这些命令：
+   - 如有需要，创建新分支
+   - 如有需要，用 -u 参数推送到远程
+   - 用下面的格式通过 gh pr create 创建 PR。正文用 HEREDOC 传入以保证格式正确。
 <example>
-gh pr create --title "the pr title" --body "$(cat <<'EOF'
-#### Summary
-<1-3 bullet points>
+gh pr create --title "PR 标题" --body "$(cat <<'EOF'
+#### 概述
+<1-3 条要点>
 
-Important:
-- NEVER update the git config
+重要：
+- 绝对不要修改 git config
 """.strip()
         # .strip() 的作用：去掉这段字符串首尾的空行和空格，避免占没用的空间

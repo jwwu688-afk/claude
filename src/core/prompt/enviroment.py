@@ -8,6 +8,7 @@
 #   或者以为自己在 Linux 上，写一堆 Mac 才有的命令。
 #
 # 这里收集 5 样东西：当前目录、是不是 git 仓库、操作系统、系统版本、今天日期。
+# 【2026-11-06 第 3 轮】输出的标签和措辞已全部改成中文。
 # =============================================================================
 
 # adapt from Claude Code
@@ -21,7 +22,7 @@ from datetime import datetime  # datetime 用来取当前时间
 
 def get_working_directory():
     """Get the current working directory（拿到当前工作目录，也就是你从哪个文件夹启动的程序）"""
-    return f"Working directory: {os.getcwd()}"  # os.getcwd() = "current working directory"
+    return f"当前工作目录：{os.getcwd()}"  # os.getcwd() = "current working directory"
 
 
 def check_git_repository():
@@ -34,27 +35,27 @@ def check_git_repository():
         # 拼起来就是：先看自己，再一层层往上看
         git_dir = path / '.git'  # "/" 在 Path 对象里表示"拼路径"，得到 C:/a/b/.git
         if git_dir.exists():  # 如果这个 .git 文件夹真的存在
-            return f"Is directory a git repo: Yes, In {path} git repository"  # 说明在仓库里，并告诉它在哪
+            return f"是否在 git 仓库中：是，仓库根目录为 {path}"  # 说明在仓库里，并告诉它在哪
 
-    return "Is directory a git repo: No"  # 一直找到最顶层都没找到，说明不在 git 仓库里
+    return "是否在 git 仓库中：否"  # 一直找到最顶层都没找到，说明不在 git 仓库里
 
 
 def get_platform():
     """Get the current platform（拿到操作系统名字）"""
-    return f"Platform: {platform.system().lower()}"  # system() 会返回 "Windows" / "Linux" / "Darwin"
+    return f"操作系统：{platform.system().lower()}"  # system() 会返回 "Windows" / "Linux" / "Darwin"
     # .lower() 把它变成小写（windows / linux / darwin）
 
 
 def get_os_version():
     """Get the OS version information（拿到操作系统的详细版本）"""
-    return f"OS Version: {platform.platform()}"  # platform() 会返回更完整的信息，比如 Windows-11-10.0.22631
+    return f"系统版本：{platform.platform()}"  # platform() 会返回更完整的信息，比如 Windows-11-10.0.22631
 
 
 def get_current_date():
     """Get today's date（拿到今天的日期）"""
     today = datetime.now().strftime("%Y-%m-%d")  # strftime 是"把时间格式化成字符串"
-    # %Y 是四位年份，%m 是两位月份，%d 是两位日期，所以结果是 2026-11-05 这种样子
-    return f"Today's date: {today}"
+    # %Y 是四位年份，%m 是两位月份，%d 是两位日期，所以结果是 2026-11-06 这种样子
+    return f"今天日期：{today}"
 
 
 def get_enviroment_info():

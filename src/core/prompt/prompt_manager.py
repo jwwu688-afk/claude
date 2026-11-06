@@ -37,10 +37,9 @@ class PromptManager(BasePromptManager):
 
     def get_system_prompt(self) -> str:
         # 每次调用都会重新拼一遍（所以日期永远是当天的）
-        return f"""
-        {get_system_rule()}
-        {get_enviroment_info()}
-        """.strip()
-        # f"""...""" 是"多行格式化字符串"：花括号里的函数会被执行，结果直接嵌进文字里
-        # 所以最终结果是：规矩 + 换行 + 环境信息
-        # .strip() 去掉首尾空白
+        # 【2026-11-06 第 3 轮】原来是三引号模板里嵌两段内容，会导致第二段（环境信息）
+        #   前面多出 8 个空格缩进，看着很别扭。改成直接拼接，顺便去掉多余空白。
+        rule = get_system_rule()  # 行为规矩
+        environment = get_enviroment_info()  # 当前环境信息
+        return f"{rule}\n\n{environment}".strip()
+        # 中间空一行，让"规则"和"环境"在视觉上分开，模型读起来层次更清楚

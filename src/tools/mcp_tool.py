@@ -36,7 +36,7 @@ class McpTool(BaseTool):
             # call_tool 就是"远程调用"：告诉服务器"请执行你那个叫 xxx 的工具，参数是这些"
             return response.content  # 把服务器的返回内容交回去
         except Exception as e:  # 如果远程调用失败（服务器挂了、参数不对等）
-            return f"Mcp Tool {self.tool.name} run Error: {e}"  # 返回错误信息，让模型知道
+            return f"调用外部 MCP 工具 {self.tool.name} 时出错：{e}"  # 返回错误信息，让模型知道
 
     def json_schema(self):
         # 直接把服务器给的说明转成我们需要的格式

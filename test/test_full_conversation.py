@@ -37,8 +37,8 @@ async def test_conversation_integration():
 
         # Test the streaming message handling directly
         conv.messages = [
-            {"role": "system", "content": "You are a helpful assistant."},  # 系统设定
-            {"role": "user", "content": "Say hello briefly"}  # 用户请求
+            {"role": "system", "content": "你是一个乐于助人的助手。"},  # 系统设定
+            {"role": "user", "content": "简短地跟我打个招呼"}  # 用户请求
         ]
         # ⚠️ 这一行其实会报错：messages 在 Conversation 里是个只读属性（@property），
         #    不能直接赋值。所以这个测试跑起来会直接跳到 except 分支。

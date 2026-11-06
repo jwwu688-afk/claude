@@ -135,14 +135,14 @@ def test_auto_compression_multiple_sessions():
         print(f"  {i}: {msg.role} - {msg.content}")
 
     # 验证第一个会话被删除，保留系统消息和第二个会话
-    user_messages = [msg for msg in messages if msg.role == Role.USER and not "compressed" in msg.content.lower()]
+    user_messages = [msg for msg in messages if msg.role == Role.USER and "压缩" not in msg.content]
     # 挑出"用户消息"，但排除掉那句"历史已压缩"的公告（公告也是以用户身份发的）
     print(f"User messages found: {len(user_messages)}")
     assert len(user_messages) == 1  # 只剩下一句用户消息
     assert user_messages[0].content == "Second question"  # 而且是第二轮那句
 
     # 验证有压缩通知
-    compression_notices = [msg for msg in messages if "compressed" in msg.content.lower()]
+    compression_notices = [msg for msg in messages if "压缩" in msg.content]
     # 挑出那条公告
     assert len(compression_notices) == 1  # 有且只有一条
 
@@ -186,12 +186,12 @@ def test_auto_compression_single_session():
     assert len(messages) < original_length  # 条数应该变少了
 
     # 验证用户消息保留
-    user_messages = [msg for msg in messages if msg.role == Role.USER and not "compressed" in msg.content.lower()]
+    user_messages = [msg for msg in messages if msg.role == Role.USER and "压缩" not in msg.content]
     assert len(user_messages) == 1  # 用户那句还在
     assert user_messages[0].content == "Complex question"  # 内容没变
 
     # 验证有压缩通知
-    compression_notices = [msg for msg in messages if "compressed" in msg.content.lower()]
+    compression_notices = [msg for msg in messages if "压缩" in msg.content]
     assert len(compression_notices) == 1  # 有一条公告
 
     print("✓ 通过: 部分消息被删除，用户消息和系统消息保留")

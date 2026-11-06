@@ -9,6 +9,8 @@
 # 两个关键设计：
 #   1. 只有主 agent 能用这个工具（子 agent 的清单里根本没这个选项）
 #   2. 子 agent 干活的聊天记录会单独存，干完就丢，只把最后一段话带回来
+#
+# 【2026-11-06 第 3 轮】说明书和所有返回给模型的文字已改成中文。
 # =============================================================================
 
 from tools.base_tool import BaseTool  # 导入父类
@@ -33,9 +35,9 @@ class Task(BaseTool):
         # prompt：详细的活儿说明书（子 agent 真正看的是这个）
         # subagent_type：要哪种类型的子 agent（目前只有 general-purpose 一种）
         if len(prompt) == 0:  # 如果说明书是空的
-            return "Prompt is empty"  # 拒绝执行
+            return "任务说明（prompt）为空，请把要交给子 agent 的详细说明写进 prompt 参数。"
         if len(subagent_type) == 0:  # 如果没指定类型
-            return "Subagent type is empty"
+            return "没有指定子 agent 类型（subagent_type），目前可用的类型是 general-purpose。"
 
         from core.conversation import Conversation
         # 注意：这行 import 写在函数内部而不是文件开头，是为了避免"循环导入"。
@@ -47,16 +49,15 @@ class Task(BaseTool):
         # First gate: Conversation._get_available_tools() hides `task` from its schema.
         # 翻译：这是第二道闸门。第一道闸门是"清单里不给它这个选项"，这里是"就算它硬要调也拦住"。
         if conversation.is_subagent:  # 如果我现在本身就是个子 agent
-            return ("Task tool is only available to the main agent. "
-                    "Sub-agents must finish the assigned task themselves and report the result; "
-                    "do not delegate further.")
+            return ("task 工具只对主 agent 开放。"
+                    "子 agent 必须自己完成分配给它的任务并汇报结果，不要再往下派活。")
             # 返回一句拒绝的话，让模型知道"你不能再往下派活了，自己干"
 
         # Set only when we are really going to work: keeps the flag False on the
         # refusal path above.
         # 翻译：只有确实要开工了才把这盏灯点亮，上面被拒绝的那条路上它还保持 False
         self._has_initialized_task = True  # 标记"正在跑子任务"
-        self._ui_manager.print_info(f"Submitting task to {subagent_type} sub-agent: {description}\n Prompt: {prompt}")
+        self._ui_manager.print_info(f"正在把任务交给 {subagent_type} 子 agent：{description}\n 任务说明：{prompt}")
         # 在界面上提示一下"我把活派给谁了、活是什么"
         subagent_system_prompt = self._subagent_manager.get_subagent_prompt(subagent_type)
         # 取出这类子 agent 的"人设设定"（比如：你是专门查代码的，要详尽、要给绝对路径）
@@ -64,9 +65,10 @@ class Task(BaseTool):
         # 让对话总管新开一页，跑完这个任务，把最终答复拿回来
 
         self._has_initialized_task = False  # 灯灭掉，表示子任务结束了
-        return f"Task Finished with response: {response}"  # 把结果包一层，交回给主 agent
+        return f"任务已结束，子 agent 的汇报如下：\n{response}"  # 把结果包一层，交回给主 agent
 
     def json_schema(self):
+        # 【2026-11-06 第 3 轮】参数说明改成中文
         return {
             "type": "function",  # 固定写法
             "function": {
@@ -77,15 +79,15 @@ class Task(BaseTool):
                     "properties": {
                         "description": {
                             "type": "string",
-                            "description": "A short (3-5 word) description of the task"  # 三五个词的简短描述
+                            "description": "用 3-5 个词简要描述这个任务"  # 三五个词的简短描述
                         },
                         "prompt": {
                             "type": "string",
-                            "description": "The task for the agent to perform"  # 详细的任务说明
+                            "description": "要交给子 agent 执行的详细任务说明"  # 详细的任务说明
                         },
                         "subagent_type": {
                             "type": "string",
-                            "description": "The type of specialized agent to use for this task"  # 用哪种子 agent
+                            "description": "要使用的子 agent 类型，目前只有 general-purpose"  # 用哪种子 agent
                         }
                     },
                     "required": ["description", "prompt", "subagent_type"],  # 三个都必须给
@@ -98,50 +100,41 @@ class Task(BaseTool):
 
     def _tool_description(self):
         # 这段是告诉模型"什么时候该派活、什么时候不该派"的说明书。
-        # 【中文大意】
-        #   1. 这个工具能启动一个能自己干活的 agent，用来处理复杂的多步骤任务
-        #   2. 目前只有一种类型：general-purpose（通用型，什么工具都能用）
-        #   3. 什么时候【不该】用：只是读某个文件、只是找某个类定义、只在 2-3 个文件里搜东西
-        #   4. 使用要点：
-        #      - 能并行就并行（一次发多个 task 申请）
-        #      - 子 agent 是"一次性"的，它干完只回一段话，之后就不能再追问了
-        #        所以你的说明书必须写得非常详细，明确要它返回什么
-        #      - 要明确告诉它"是写代码还是只做调研"，因为它不知道你的意图
-        #   5. 后面跟了几个示例，演示"写完代码后叫 code-reviewer 来审查"这种用法
+        # 【2026-11-06 第 3 轮】整段翻译成中文，示例也换成了中文。
         return """
-Launch a new agent to handle complex, multi-step tasks autonomously. 
+启动一个新的 agent 来自主处理复杂的多步骤任务。
 
-Available agent types and the tools they have access to:
-- general-purpose: General-purpose agent for researching complex questions, searching for code, and executing multi-step tasks. When you are searching for a keyword or file and are not confident that you will find the right match in the first few tries use this agent to perform the search for you. (Tools: *)
+可用的 agent 类型及其可用的工具：
+- general-purpose：通用型 agent，用于调研复杂问题、搜索代码、执行多步骤任务。当你搜索某个关键词或文件、前几次尝试没有把握能找到时，用这个 agent 帮你搜。（可用工具：全部）
 
-When using the Task tool, you must specify a subagent_type parameter to select which agent type to use.
+使用 task 工具时，必须指定 subagent_type 参数来选择用哪种 agent。
 
-When NOT to use the Agent tool:
-- When you want to read a specific file path
-- When you are searching for a specific class definition like "class Foo"
-- When you are searching for code within a specific file or set of 2-3 files
-- Other tasks that are not related to the agent descriptions above
+以下情况不要用这个工具：
+- 你只是想读某个具体文件
+- 你只是在找某个类定义，比如 "class Foo"
+- 你只是在某一个文件或 2-3 个文件里搜代码
+- 其他与上面 agent 描述无关的任务
 
-Usage notes:
-1. Launch multiple agents concurrently whenever possible, to maximize performance; to do that, use a single message with multiple tool uses
-2. When the agent is done, it will return a single message back to you. The result returned by the agent is not visible to the user. To show the user the result, you should send a text message back to the user with a concise summary of the result.
-3. Each agent invocation is stateless. You will not be able to send additional messages to the agent, nor will the agent be able to communicate with you outside of its final report. Therefore, your prompt should contain a highly detailed task description for the agent to perform autonomously and you should specify exactly what information the agent should return back to you in its final and only message to you.
-4. The agent's outputs should generally be trusted
-5. Clearly tell the agent whether you expect it to write code or just to do research (search, file reads, etc.), since it is not aware of the user's intent
-6. If the agent description mentions that it should be used proactively, then you should try your best to use it without the user having to ask for it first. Use your judgement.
+使用说明：
+1. 能并行就并行：需要同时做多件事时，在一条消息里发出多个 task 调用，性能最好
+2. agent 干完只会返回一条消息给你。它的结果用户是看不到的。要把结果展示给用户，你得自己再用文字总结一遍
+3. 每次调用都是独立的、无状态的。你没法再追问它，它也没法在汇报之外联系你。所以你的 prompt 里必须写清楚要做什么、要返回什么信息，越详细越好
+4. agent 的输出一般可以信任
+5. 明确告诉它你是要它写代码还是只做调研（搜索、读文件等），因为它不知道用户的意图
+6. 如果某个 agent 的描述里写了"应当主动使用"，那就尽量在用户没要求时也主动用上，这点靠你自己判断
 
-Example usage:
+使用示例：
 
 <example_agent_descriptions>
-"code-reviewer": use this agent after you are done writing a signficant piece of code
-"greeting-responder": use this agent when to respond to user greetings with a friendly joke
+"code-reviewer"：写完一段比较重要的代码后，用它来审查
+"greeting-responder"：用户打招呼时，用它来回一句友好的玩笑
 </example_agent_description>
 
 <example>
-user: "Please write a function that checks if a number is prime"
-assistant: Sure let me write a function that checks if a number is prime
-assistant: First let me use the Write tool to write a function that checks if a number is prime
-assistant: I'm going to use the Write tool to write the following code:
+用户："请写一个判断数字是否为质数的函数"
+助手：好的，我来写一个判断质数的函数
+助手：先用写文件的工具把函数写出来
+助手：我要写入的代码如下：
 <code>
 function isPrime(n) {
   if (n <= 1) return false
@@ -152,17 +145,17 @@ function isPrime(n) {
 }
 </code>
 <commentary>
-Since a signficant piece of code was written and the task was completed, now use the code-reviewer agent to review the code
+因为刚写完了一段比较重要的代码且任务已完成，现在用 code-reviewer agent 来审查
 </commentary>
-assistant: Now let me use the code-reviewer agent to review the code
-assistant: Uses the Task tool to launch the with the code-reviewer agent 
+助手：现在用 code-reviewer agent 审查这段代码
+助手：通过 task 工具启动 code-reviewer agent
 </example>
 
 <example>
-user: "Hello"
+用户："你好"
 <commentary>
-Since the user is greeting, use the greeting-responder agent to respond with a friendly joke
+用户在打招呼，用 greeting-responder agent 回一句友好的玩笑
 </commentary>
-assistant: "I'm going to use the Task tool to launch the with the greeting-responder agent"
+助手："我用 task 工具启动 greeting-responder agent"
 </example>
         """.strip()

@@ -139,10 +139,10 @@ class UIManager:
             #   现在参数最多显示 200 字符、结果最多 400 字符，超长会折叠成一行并标注省略了多少。
             args_preview = self.display_manager.shorten(tool_args, 200)
             result_preview = self.display_manager.shorten(result, 400)
-            self.print_success(f"Tool {tool_name} ok · args: {args_preview} · result: {result_preview}")
+            self.print_success(f"工具 {tool_name} 执行成功 · 参数：{args_preview} · 结果：{result_preview}")
         else:  # 如果失败
             error_preview = self.display_manager.shorten(result, 400)  # 错误信息同样截断
-            self.print_error(f"Tool {tool_name} failed · error: {error_preview}")
+            self.print_error(f"工具 {tool_name} 执行失败 · 错误：{error_preview}")
 
     def show_preparing_tool(self, tool_name: str, tool_args: dict) -> None:
         """
@@ -154,7 +154,7 @@ class UIManager:
         """
         # 【2026-11-06 第 2 轮优化】参数同样截断，避免一次写文件的参数把屏幕刷爆
         args_preview = self.display_manager.shorten(tool_args, 200)
-        self.print_info(f"Preparing to call tool: {tool_name} · args: {args_preview}")
+        self.print_info(f"准备调用工具：{tool_name} · 参数：{args_preview}")
 
     # Todo display delegation method
     def display_todos(self, todos: list, emoji: str = "📋") -> None:

@@ -45,8 +45,8 @@ def test_streaming():
         request_params = {
             # 准备请求参数
             "messages": [
-                {"role": "system", "content": "You are a helpful assistant."},  # 系统设定
-                {"role": "user", "content": "Say hello in exactly 3 words"}  # 要求"用三个词打招呼"
+                {"role": "system", "content": "你是一个乐于助人的助手。"},  # 系统设定
+                {"role": "user", "content": "用三个词跟我打个招呼"}  # 要求"用三个词打招呼"
             ]
             # 注意这里没有传 tools（工具清单），所以模型不会调工具，只会说话
         }

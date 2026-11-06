@@ -9,6 +9,8 @@
 #
 # 这个文件里真正的代码只有几十行，剩下 200 多行全是写给模型看的使用说明
 # （那些 <example> 就是在教模型"什么情况该用、什么情况不该用"）。
+#
+# 【2026-11-06 第 3 轮】说明书和所有返回给模型的文字已改成中文。
 # =============================================================================
 
 import json  # json 库：把待办清单转成格式化的文字，方便模型读
@@ -30,33 +32,36 @@ class TodoWrite(BaseTool):
         # todos 是一个列表，每一项长这样：
         #   {"content": "写一个函数", "status": "pending", "id": "1"}
         if not todos:  # 如果没传清单（空列表或 None）
-            return "No todos provided"
+            return "没有提供任何待办事项（todos 为空）。"
 
         # Validate todos type
         if not isinstance(todos, list):  # isinstance 用来检查"这是不是某种类型"
             # 模型有时会把 list 写成字符串，这里要拦住并告诉它错在哪
-            return f"Error: todos type is wrong. Expected list, got {type(todos).__name__}. todos = {todos}"
+            return f"参数类型错误：todos 应该是列表，实际收到的是 {type(todos).__name__}。收到的内容：{todos}"
 
         for i, todo in enumerate(todos):  # 逐项检查
             if not isinstance(todo, dict):  # 每一项必须是字典
-                return f"Error: todo item {i} type is wrong. Expected dict, got {type(todo).__name__}. todos = {todos}"
+                return f"第 {i} 项的类型错误：每一项应该是对象，实际收到的是 {type(todo).__name__}。收到的内容：{todos}"
 
             required_fields = ['content', 'status', 'id']  # 三个必填字段
             for field in required_fields:  # 逐个检查有没有漏
                 if field not in todo:  # 如果缺了某个字段
-                    return f"Error: todo item {i} missing required field '{field}'. todos = {todos}"
+                    return f"第 {i} 项缺少必填字段 '{field}'。收到的内容：{todos}"
 
             if todo['status'] not in ['pending', 'in_progress', 'completed']:  # 状态只能是这三种
-                return f"Error: todo item {i} has invalid status '{todo['status']}'. Must be one of: pending, in_progress, completed. todos = {todos}"
+                return (f"第 {i} 项的状态 '{todo['status']}' 无效。"
+                        f"只能是 pending（未开始）、in_progress（进行中）、completed（已完成）之一。收到的内容：{todos}")
 
         self.todos = todos  # 校验通过，用新清单整个替换旧的（注意：是整体替换，不是增量修改）
 
         # Display the updated todos using UI manager
         self._ui_manager.display_todos(todos)  # 在界面上把清单画出来
 
-        return f"Successfully updated todo list with {len(todos)} todos"  # 告诉模型"更新成功了"
+        return f"待办清单已更新，共 {len(todos)} 项。"  # 告诉模型"更新成功了"
 
     def json_schema(self):
+        # 【2026-11-06 第 3 轮】参数说明改成中文（枚举值 pending/in_progress/completed 保持不变，
+        # 因为它们是程序内部逻辑依赖的数据格式，改了就坏）
         return {
             "type": "function",
             "function": {
@@ -90,7 +95,7 @@ class TodoWrite(BaseTool):
                                 "additionalProperties": False
                                 # 不允许出现别的字段（防止模型乱加东西）
                             },
-                            "description": "The updated todo list"  # 说明：这是"更新后的完整清单"，不是增量
+                            "description": "更新后的完整待办清单（注意是整体替换，不是增量修改）"
                         }
                     },
                     "required": ["todos"],
@@ -102,202 +107,191 @@ class TodoWrite(BaseTool):
     def get_status(self):
         # 这个方法会在每次工具执行完后被调用，用来生成"提醒模型看清单"的那段文字
         if not self.todos:  # 清单是空的
-            return "No todos in memory - no todos have been added yet"
-        return json.dumps({"todos": self.todos}, indent=2)  # 转成带缩进的 JSON 文字，方便模型读
+            return "当前没有任何待办事项，还没有添加过。"
+        return json.dumps({"todos": self.todos}, indent=2, ensure_ascii=False)  # 转成带缩进的 JSON 文字，方便模型读
         # indent=2 表示每层缩进 2 个空格，纯粹为了好看
+        # ensure_ascii=False 让中文原样输出，而不是变成 \u4e2d 这种转义码
 
     # adapt from claude code
     def _tool_description(self):
         # 这段说明书特别长，因为它要"教会"模型什么时候该用这个工具。
-        # 【中文大纲】
+        # 【2026-11-06 第 3 轮】整段翻译成中文，结构和示例一一对应：
         #   一、什么时候该用（6 种情况）
-        #      复杂多步骤任务、需要仔细规划的任务、用户明确要求列清单、
-        #      用户一口气给了好几件事、刚接到新指令、开始干活前先标记进行中、
-        #      干完一件立刻标记完成
         #   二、什么时候不该用（4 种情况）
-        #      只有一步的、太琐碎不值得跟踪的、三步以内能搞定的、纯聊天或问知识的
         #   三、四个"该用"的例子
-        #      加暗黑模式开关 / 重命名函数（15 处，8 个文件）/ 实现电商四个模块 / 优化 React 性能
         #   四、四个"不该用"的例子
-        #      问怎么打印 Hello World / 问 git status 是什么 / 让加一行注释 / 让跑 npm install
         #   五、状态管理规则
-        #      pending / in_progress / completed 三种状态怎么流转；
-        #      同一时间只允许一个 in_progress；
-        #      没完全做完不许标 completed（测试还红着、只做了一半、有报错都不算完）
         return """
-Use this tool to create and manage a structured task list for your current coding session. This helps you track progress, organize complex tasks, and demonstrate thoroughness to the user.
-It also helps the user understand the progress of the task and overall progress of their requests.
+用这个工具为当前编码会话创建和管理一份结构化的任务清单。它能帮你跟踪进度、整理复杂任务，也让用户看到你的工作是有条理的。
+它还能让用户了解当前任务的进度，以及整体请求的完成情况。
 
-#### When to Use This Tool
-Use this tool proactively in these scenarios:
+#### 什么时候该用这个工具
+在以下场景中主动使用这个工具：
 
-1. Complex multi-step tasks - When a task requires 3 or more distinct steps or actions
-2. Non-trivial and complex tasks - Tasks that require careful planning or multiple operations
-3. User explicitly requests todo list - When the user directly asks you to use the todo list
-4. User provides multiple tasks - When users provide a list of things to be done (numbered or comma-separated)
-5. After receiving new instructions - Immediately capture user requirements as todos
-6. When you start working on a task - Mark it as in_progress BEFORE beginning work. Ideally you should only have one todo as in_progress at a time
-7. After completing a task - Mark it as completed and add any new follow-up tasks discovered during implementation
+1. 复杂的多步骤任务——任务需要 3 个以上不同的步骤或动作
+2. 需要仔细规划、涉及多次操作的非平凡任务
+3. 用户明确要求使用待办清单
+4. 用户一次给出多项任务（编号列表，或用逗号分隔）时
+5. 刚收到新指令时——立刻把用户的要求转成待办事项
+6. 开始做某项任务时——**动工之前**先把它标记为 in_progress。理想情况下同一时间只应有一项是 in_progress
+7. 完成一项任务后——立刻标记为 completed，并把过程中发现的新任务补进清单
 
-#### When NOT to Use This Tool
+#### 什么时候不该用这个工具
 
-Skip using this tool when:
-1. There is only a single, straightforward task
-2. The task is trivial and tracking it provides no organizational benefit
-3. The task can be completed in less than 3 trivial steps
-4. The task is purely conversational or informational
+以下情况请跳过这个工具：
+1. 只有一个简单的任务
+2. 任务太琐碎，跟踪它没有任何组织上的收益
+3. 三步以内就能完成
+4. 纯粹是闲聊或询问信息
 
-NOTE that you should not use this tool if there is only one trivial task to do. In this case you are better off just doing the task directly.
+注意：如果只有一个琐碎的任务，不要用这个工具，直接做就行。
 
-#### Examples of When to Use the Todo List
+#### 该用待办清单的例子
 
 <example>
-User: I want to add a dark mode toggle to the application settings. Make sure you run the tests and build when you're done!
-Assistant: I'll help add a dark mode toggle to your application settings. Let me create a todo list to track this implementation.
-*Creates todo list with the following items:*
-1. Create dark mode toggle component in Settings page
-2. Add dark mode state management (context/store)
-3. Implement CSS-in-JS styles for dark theme
-4. Update existing components to support theme switching
-5. Run tests and build process, addressing any failures or errors that occur
-*Begins working on the first task*
+用户：我想在应用设置里加一个暗黑模式开关。做完记得跑测试和构建！
+助手：我来帮你在设置里加暗黑模式开关。先建一个待办清单来跟踪这次实现。
+*创建包含以下项的清单：*
+1. 在设置页创建暗黑模式开关组件
+2. 添加暗黑模式的状态管理（context/store）
+3. 实现暗黑主题的 CSS-in-JS 样式
+4. 更新现有组件以支持主题切换
+5. 运行测试和构建，并修掉所有失败或报错
+*开始做第一项*
 
 <reasoning>
-The assistant used the todo list because:
-1. Adding dark mode is a multi-step feature requiring UI, state management, and styling changes
-2. The user explicitly requested tests and build be run afterward
-3. The assistant inferred that tests and build need to pass by adding "Ensure tests and build succeed" as the final task
+助手使用待办清单的原因：
+1. 加暗黑模式是多步骤功能，涉及 UI、状态管理和样式
+2. 用户明确要求做完后跑测试和构建
+3. 助手据此把"确保测试和构建通过"作为最后一项
 </reasoning>
 </example>
 
 <example>
-User: Help me rename the function getCwd to getCurrentWorkingDirectory across my project
-Assistant: Let me first search through your codebase to find all occurrences of 'getCwd'.
-*Uses grep or search tools to locate all instances of getCwd in the codebase*
-Assistant: I've found 15 instances of 'getCwd' across 8 different files. Let me create a todo list to track these changes.
-*Creates todo list with specific items for each file that needs updating*
+用户：帮我把项目里所有 getCwd 函数重命名为 getCurrentWorkingDirectory
+助手：我先搜一下代码库里所有出现 'getCwd' 的地方。
+*用 grep 或搜索工具定位所有出现位置*
+助手：我在 8 个文件里找到了 15 处 getCwd。现在建一个待办清单来跟踪这些修改。
+*创建清单，每个需要改的文件对应一项*
 
 <reasoning>
-The assistant used the todo list because:
-1. First, the assistant searched to understand the scope of the task
-2. Upon finding multiple occurrences across different files, it determined this was a complex task with multiple steps
-3. The todo list helps ensure every instance is tracked and updated systematically
-4. This approach prevents missing any occurrences and maintains code consistency
-</reasoning>
-</example>
-
-
-<example>
-User: I need to implement these features for my e-commerce site: user registration, product catalog, shopping cart, and checkout flow.
-Assistant: I'll help implement these features. First, let's add all the features to the todo list.
-*Creates a todo list breaking down each feature into specific tasks based on the project architecture*
-Assistant: Let's start with user registration. This will involve creating database models, API endpoints, and frontend forms that integrate with your existing authentication system.
-
-<reasoning>
-The assistant used the todo list because:
-1. The user provided multiple complex features to implement in a comma separated list
-2. The todo list helps organize these large features into manageable tasks
-3. This approach allows for tracking progress across the entire implementation
+助手使用待办清单的原因：
+1. 先搜索，弄清任务范围
+2. 发现涉及多个文件、多处出现，判定这是复杂多步骤任务
+3. 清单能确保每一处都被系统地跟踪和更新，避免漏改、保持代码一致
 </reasoning>
 </example>
 
 <example>
-User: Can you help optimize my React application? It's rendering slowly and has performance issues.</user>
-Assistant: I'll help optimize your React application. First, let me examine your codebase to identify potential performance bottlenecks.
-*Reviews component structure, render patterns, state management, and data fetching*
-Assistant: After analyzing your codebase, I've identified several performance issues. Let me create a todo list to track our optimization efforts.
-*Creates todo list with items like: 1) Implement memoization for expensive calculations in ProductList, 2) Add virtualization for long lists in Dashboard, 3) Optimize image loading in Gallery component, 4) Fix state update loops in ShoppingCart, 5) Review bundle size and implement code splitting*
-Let's start by implementing memoization for the expensive calculations in your ProductList component.</assistant>
+用户：我要给电商网站实现这些功能：用户注册、商品目录、购物车、结算流程。
+助手：我来实现这些功能。先把所有功能加到待办清单里。
+*根据项目架构把每个功能拆成具体任务*
+助手：先从用户注册开始。这涉及创建数据库模型、API 端点，以及和现有认证系统对接的前端表单。
 
 <reasoning>
-The assistant used the todo list because:
-1. First, the assistant examined the codebase to identify specific performance issues
-2. Based on this analysis, it identified multiple optimization opportunities
-3. Performance optimization is a non-trivial task requiring multiple steps
-4. The todo list helps methodically track improvements across different components
-5. This systematic approach ensures all performance bottlenecks are addressed
+助手使用待办清单的原因：
+1. 用户一次给了多个复杂功能
+2. 清单能把大功能拆成可管理的任务
+3. 便于跟踪整个实现过程的进度
 </reasoning>
 </example>
 
-#### Examples of When NOT to Use the Todo List
+<example>
+用户：能帮我优化一下 React 应用吗？渲染很慢，有性能问题。</user>
+助手：我来帮你优化。先检查代码库，找出性能瓶颈。
+*检查组件结构、渲染模式、状态管理、数据获取方式*
+助手：分析后发现几个性能问题。建一个待办清单来跟踪优化工作。
+*创建包含以下项的清单：1) 对 ProductList 里开销大的计算做 memo 化，2) 给 Dashboard 的长列表加虚拟滚动，3) 优化 Gallery 组件的图片加载，4) 修掉 ShoppingCart 里的状态更新死循环，5) 检查打包体积并做代码分割*
+先从 ProductList 里开销大的计算做 memo 化开始。</assistant>
+
+<reasoning>
+助手使用待办清单的原因：
+1. 先检查代码库，找出具体性能问题
+2. 基于分析确定了多个优化点
+3. 性能优化是非平凡任务，需要多步骤执行
+4. 清单能系统地跟踪各个组件的改进，确保瓶颈都被处理
+</reasoning>
+</example>
+
+#### 不该用待办清单的例子
 
 <example>
-User: How do I print 'Hello World' in Python?
-Assistant: In Python, you can print "Hello World" with this simple code:
+用户：Python 里怎么打印 'Hello World'？
+助手：在 Python 里可以这样打印 "Hello World"：
 
 python
 print("Hello World")
 
-This will output the text "Hello World" to the console when executed.</assistant>
+运行后会在控制台输出 Hello World。</assistant>
 
 <reasoning>
-The assistant did not use the todo list because this is a single, trivial task that can be completed in one step. There's no need to track multiple tasks or steps for such a straightforward request.
+助手没有使用待办清单，因为这是一个一步就能完成的简单任务，没必要跟踪多个步骤。
 </reasoning>
 </example>
 
 <example>
-User: What does the git status command do?
-Assistant: The git status command shows the current state of your working directory and staging area. It displays which changes have been staged, which haven't, and which files aren't being tracked by Git. This is a fundamental command for understanding the current state of your repository before making commits.
+用户：git status 命令是干什么的？
+助手：git status 命令显示你工作目录和暂存区的当前状态。它会告诉你哪些改动已暂存、哪些还没暂存、哪些文件还没被 Git 跟踪。这是提交前了解仓库状态的基础命令。
 
 <reasoning>
-The assistant did not use the todo list because this is an informational request with no actual coding task to complete. The user is simply asking for an explanation, not for the assistant to perform multiple steps or tasks.
+助手没有使用待办清单，因为这是纯信息类问题，没有实际的编码任务要完成。用户只是想要一个解释，并不需要助手执行多步操作。
 </reasoning>
 </example>
 
 <example>
-User: Can you add a comment to the calculateTotal function to explain what it does?
-Assistant: Sure, let me add a comment to the calculateTotal function to explain what it does.
-* Uses the Edit tool to add a comment to the calculateTotal function *
+用户：你能给 calculateTotal 函数加一段注释说明它做什么吗？
+助手：好的，我来给 calculateTotal 函数加一段注释。
+* 用编辑工具给 calculateTotal 函数加注释 *
 
 <reasoning>
-The assistant did not use the todo list because this is a single, straightforward task confined to one location in the code. Adding a comment doesn't require tracking multiple steps or systematic organization.
+助手没有使用待办清单，因为这是局限在代码某一处的简单任务，加一段注释不需要跟踪多个步骤或系统化组织。
 </reasoning>
 </example>
 
 <example>
-User: Run npm install for me and tell me what happens.
-Assistant: I'll run the npm install command for you.
+用户：帮我运行 npm install，告诉我结果。
+助手：好的，我来运行 npm install。
 
-*Executes: npm install*
+*执行：npm install*
 
-The command completed successfully. Here's the output:
-[Output of npm install command]
+命令执行成功，输出如下：
+[npm install 的输出]
 
-All dependencies have been installed according to your package.json file.
+根据你的 package.json，所有依赖都已安装完成。
 
 <reasoning>
-The assistant did not use the todo list because this is a single command execution with immediate results. There are no multiple steps to track or organize, making the todo list unnecessary for this straightforward task.
+助手没有使用待办清单，因为这是一条命令、结果立刻可得，没有多个步骤需要跟踪。
 </reasoning>
 </example>
 
-#### Task States and Management
+#### 任务状态与管理
 
-1. **Task States**: Use these states to track progress:
-   - pending: Task not yet started
-   - in_progress: Currently working on (limit to ONE task at a time)
-   - completed: Task finished successfully
+1. **任务状态**：用这三种状态跟踪进度：
+   - pending：尚未开始
+   - in_progress：正在处理（同一时间只允许一个）
+   - completed：已成功完成
 
-2. **Task Management**:
-   - Update task status in real-time as you work
-   - Mark tasks complete IMMEDIATELY after finishing (don't batch completions)
-   - Only have ONE task in_progress at any time
-   - Complete current tasks before starting new ones
-   - Remove tasks that are no longer relevant from the list entirely
+2. **任务管理**：
+   - 边做边实时更新状态
+   - 完成一项就**立刻**标记，不要攒着一起改
+   - 任何时刻只允许有一个 in_progress
+   - 先完成当前任务，再开始新的
+   - 已经无关的任务直接从清单里删掉
 
-3. **Task Completion Requirements**:
-   - ONLY mark a task as completed when you have FULLY accomplished it
-   - If you encounter errors, blockers, or cannot finish, keep the task as in_progress
-   - When blocked, create a new task describing what needs to be resolved
-   - Never mark a task as completed if:
-     - Tests are failing
-     - Implementation is partial
-     - You encountered unresolved errors
-     - You couldn't find necessary files or dependencies
+3. **完成标准**：
+   - 只有**完全**做完才能标记为 completed
+   - 遇到错误、被阻塞、做不完时，保持 in_progress
+   - 被阻塞时，新建一个任务描述"需要解决什么"
+   - 以下情况绝不能标记为 completed：
+     - 测试还在失败
+     - 只实现了一部分
+     - 还有未解决的错误
+     - 找不到必要的文件或依赖
 
-4. **Task Breakdown**:
-   - Create specific, actionable items
-   - Break complex tasks into smaller, manageable steps
-   - Use clear, descriptive task names
+4. **任务拆分**：
+   - 每一项都要具体、可执行
+   - 把复杂任务拆成更小、更容易处理的步骤
+   - 用清晰、有描述性的任务名
 
-When in doubt, use this tool. Being proactive with task management demonstrates attentiveness and ensures you complete all requirements successfully.
+拿不准的时候，就用这个工具。主动管理任务能体现你的细致，也能确保所有要求都被完成。
         """.strip()

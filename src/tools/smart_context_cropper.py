@@ -10,6 +10,8 @@
 # 它和 history_manager 里的"自动压缩"有什么区别？
 #   自动压缩是"快满了必须删"，是粗暴的强制删除；
 #   这个工具是"模型自己判断哪些没用"，更聪明，但需要模型主动想起用它。
+#
+# 【2026-11-06 第 3 轮】说明书和所有返回给模型的文字已改成中文。
 # =============================================================================
 
 import subprocess  # 导入了但没用到（残留代码，可以删）
@@ -32,16 +34,17 @@ class SmartContextCropper(BaseTool):
         # deleted_messages_summary：被删内容的摘要（这个参数其实没被使用，见下面）
         try:  # 试
             if (crop_amount <= 0):  # 删除数量必须是正数
-                return "Invalid crop amount. It must be positive."
+                return "裁剪数量无效：crop_amount 必须大于 0。"
             result = self._history_manager.crop_message(crop_direction, crop_amount)  # 让历史管理器去删
             return result  # 把"删成功"或"删不了"的结果返回给模型
             # ⚠️ 这里没有处理 deleted_messages_summary。
             #    也就是说：模型辛苦写的摘要，其实根本没被存进对话里，
             #    删掉的内容是真的消失了。这是个明显可以改进的点。
         except Exception as e:  # 出错就捕获
-            return f"smart_context_cropper run Error: {e}"  # 返回错误信息
+            return f"smart_context_cropper 执行出错：{e}"  # 返回错误信息
 
     def json_schema(self):
+        # 【2026-11-06 第 3 轮】参数说明改成中文（枚举值 top/bottom 保持不变，程序逻辑依赖它）
         return {
             "type": "function",
             "function": {
@@ -52,24 +55,23 @@ class SmartContextCropper(BaseTool):
                     "properties": {
                         "need_user_approve": {
                             "type": "boolean",
-                            "description": "Whether the crop messages action requires explicit user approval before execution",
+                            "description": "裁剪聊天记录前是否需要用户先明确同意。",
                             # 删聊天记录算是有风险的操作，所以问模型"要不要先让用户确认"
                             "default": True
                         },
                         "crop_direction": {
                             "type": "string",
                             "enum": ["top", "bottom"],  # enum 表示只能从这两个值里挑一个
-                            "description": "Direction to crop messages. 'top' removes messages from the start (after system message), 'bottom' removes from the end."
-                            # top = 从开头删（系统提示词之后），bottom = 从结尾删
+                            "description": "裁剪方向。top 表示从开头删（系统提示词之后的部分），bottom 表示从结尾删。"
                         },
                         "crop_amount": {
                             "type": "integer",
                             "minimum": 1,  # 最少删 1 条
-                            "description": "Number of messages to remove. Must not exceed the allowed limit for preserving the latest user message."
+                            "description": "要删除的消息条数。不能超过「保留最新用户消息」所允许的上限。"
                         },
                         "deleted_messages_summary": {
                             "type": "string",
-                            "description": "Summary of the deleted messages."  # 被删内容的摘要
+                            "description": "对被删内容的摘要，说明删掉了哪些信息、留下了什么结论。"
                         }
                     },
                     "required": ["need_user_approve", "crop_direction", "crop_amount", "deleted_messages_summary"]
@@ -81,49 +83,33 @@ class SmartContextCropper(BaseTool):
         return ""  # 没有状态要汇报
 
     def _tool_description(self):
-        # 【中文大意】
-        #   这个工具能从顶部或底部裁剪聊天记录，但永远不会删掉"用户最新说的那句"。
-        #
-        #   1. 裁剪规则
-        #      - 必须保留最新一条用户消息
-        #      - 从顶部删 → 删系统提示词之后最老的那些
-        #      - 从底部删 → 优先删最近的那些（比如刚才失败的尝试过程）
-        #
-        #   2. 要不要问用户
-        #      - 如果你很确定删的内容跟当前任务无关，可以直接删，不用问
-        #      - 只要有一点不确定，就先问
-        #
-        #   3. 删除前先摘要
-        #      - 如果被删的内容里有有用信息，先用一句话把结论留下来
-        #      - 如果确实什么都没用，摘要就留空
-        #
-        #   后面跟了两个例子：一个是删顶部（简单的），一个是删底部（调试失败过程，
-        #   配了一段很详细的失败总结，演示"删之前先留结论"该怎么写）。
+        # 【2026-11-06 第 3 轮】整段翻译成中文，两个示例也换成了中文。
         return """
-Crop conversation history from either the top (after system messages) or the bottom, while ensuring the latest user message is never removed.
+从聊天记录的开头或结尾裁剪消息，同时保证"用户最新说的那句"永远不会被删掉。
 
-Before executing smart_context_cropper, follow these steps:
-1. Crop Rules
-    - Always preserve the latest user message.
-    - Top crop → remove the oldest non-system messages that appear after the system message.
-    - Bottom crop → remove the most recent messages first.
+执行 smart_context_cropper 之前，请遵循以下规则：
 
-2. Approval Requirements
-    - Always consider the user's current task.
-    - If you are certain that the messages to be cropped are unrelated to the user's current task, you may proceed without explicit approval.
-    - If there is any uncertainty, request confirmation before cropping.
+1. 裁剪规则
+    - 永远保留最新一条用户消息。
+    - 从顶部裁剪 → 删掉系统提示词之后最老的那些消息。
+    - 从底部裁剪 → 优先删最近的那些消息。
 
-3. Handling Removed Content
-    - If cropped messages contain useful information, provide a concise summary before deletion.
-    - Ensure summaries retain any context that might still be relevant to the user's ongoing task.
-    - If Nothing useful related in deleted message, than deleted_messages_summary will be empty.
+2. 是否需要用户同意
+    - 始终结合用户当前的任务来判断。
+    - 如果你确定要删的内容与当前任务无关，可以不问直接删。
+    - 只要有一点不确定，就先征求用户确认。
+
+3. 如何处理被删内容
+    - 如果被删的消息里有有用信息，删除前先用一句话把结论留下来。
+    - 摘要要保留可能仍然与用户当前任务相关的上下文。
+    - 如果被删内容确实没有任何有用信息，deleted_messages_summary 可以留空。
 
 <example>
-system_prompt: You are a professional programming assistant.
-user_message: Write a Python function to compute the Fibonacci sequence.
-assistant: Here's’s the basic version...
-user_message: Please optimize the performance.
-assistant: Here’s the optimized version...
+系统提示词：你是一个专业的编程助手。
+用户消息：写一个计算斐波那契数列的 Python 函数。
+助手：这是基础版本……
+用户消息：请优化一下性能。
+助手：这是优化后的版本……
 </example>
 <smart_context_cropper>
 smart_context_cropper(
@@ -134,20 +120,20 @@ smart_context_cropper(
 </smart_context_cropper>
 
 <example>
-system_prompt: You are a professional debugging assistant.
-user_message: Diagnose the midnight latency spikes in our API.
-assistant: I will explore a few hypotheses...
-assistant: Attempt 1: Enabled verbose logging and observed long GC pauses; tuned GC, but latency stayed high.
-assistant: Attempt 2: Investigated DB write locks; added an index to the hot table; no measurable improvement.
-assistant: Attempt 3: Correlated spikes with a batch job; disabled an experiment, but the spikes persisted.
-# Once the failures are summarized, the detailed attempt logs can be removed from the bottom to keep context focused.
+系统提示词：你是一个专业的排障助手。
+用户消息：诊断一下我们 API 每天午夜出现的延迟尖峰。
+助手：我先验证几个假设……
+助手：尝试 1：开启详细日志后观察到长时间的 GC 停顿；调整了 GC 参数，但延迟没有下降。
+助手：尝试 2：怀疑是数据库写锁；给热点表加了索引；没有明显改善。
+助手：尝试 3：排查是否与批处理任务相关；关掉了一个实验，但尖峰依然存在。
+# 把三次失败总结完之后，这些详细的尝试记录就可以从底部删掉，让上下文更聚焦。
 </example>
 <smart_context_cropper>
 smart_context_cropper(
     need_user_approve = false,
     crop_direction = "BOTTOM",
     crop_amount = 3,
-    deleted_messages_summary = "Failure summary: (1) GC tuning ineffective despite observed long pauses; (2) DB write-lock hypothesis invalid—adding index did not reduce latency; (3) Batch-job correlation inconclusive—disabling related experiment had no effect. Conclusion: Spikes likely due to overlap of scheduled tasks with DB maintenance. Next steps: inspect cron jobs at 00:00 and DB vacuum/backup windows; add temporary rate-limiting or queueing around that window."
+    deleted_messages_summary = "失败总结：(1) 调整 GC 参数无效，虽然确实观察到了长停顿；(2) 数据库写锁的假设不成立——加索引并没有降低延迟；(3) 批处理任务的相关性无法确认——关掉相关实验后没有变化。结论：尖峰很可能是因为定时任务和数据库维护时段重叠。下一步：检查 00:00 的定时任务和数据库清理/备份窗口，在那段时间加临时限流或排队。"
 )
 </smart_context_cropper>
 

@@ -104,17 +104,17 @@ class ToolManager:
             if tool:  # 如果找到了
                 return await tool.act(**kwargs)  # 把参数拆开交给它，等它干完返回结果
         except Exception as e:  # 如果工具内部抛错
-            return f"Error occurred while running tool '{tool_name}': {str(e)}"
+            return f"运行工具 '{tool_name}' 时出错：{str(e)}"
             # 注意：这里把错误"吞"成了字符串返回，没有继续往上抛。
             # 好处是程序不会崩，坏处是上层再也没法通过异常知道出事了。
-        return "Tool not found"  # 走到这儿说明工具没找到
+        return "找不到这个工具。"  # 走到这儿说明工具没找到
 
     def get_tool_status(self, tool_name):
         # 查某个工具的"状态"（目前只有 todo_write 用得上，用来生成提醒文字）
         tool = self.tools.get(tool_name)  # 按名字找
         if tool:  # 找到了
             return tool.get_status()  # 让它自己汇报
-        return "Tool not found"  # 没找到
+        return "找不到这个工具。"  # 没找到
 
     async def shutdown(self):
         """关闭所有外部资源（2026-11-06 第 2 轮新增）
