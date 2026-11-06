@@ -18,6 +18,7 @@ Conversation management with refactored UI components and history manager integr
 """
 
 import asyncio  # 【2026-11-06 第 2 轮新增】摘要生成要把同步的接口调用丢到线程池，需要用到它
+import os  # 【第 6 轮】用来读"单条工具输出最多保留多少字符"这个配置
 import json  # json 库：把模型给的"参数字符串"解析成真正的 Python 字典
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
 from core.api_client import APIClient  # 导入 API 客户端：真正发请求给大模型的家伙
@@ -31,6 +32,12 @@ from .history.history_manager import HistoryManager, message_text  # 导入历�
 
 # 【2026-11-06 第 2 轮新增】压缩旧对话时用的提示词。
 # 核心思路：明确告诉模型"哪些必须留、哪些可以丢"，否则它会写一堆没用的客套话。
+# 【2026-11-06 第 6 轮新增】单条工具输出写进对话历史时，最多保留多少字符。
+#   为什么要在这里截，而不是只在界面上截？
+#     界面截断只是"不刷屏"，模型拿到的仍然是全文（可能几万字），
+#     照样会把上下文吃满、把预算烧掉。真正省钱的截断必须发生在"写进历史之前"。
+MAX_TOOL_OUTPUT_CHARS = int(os.getenv("MAX_TOOL_OUTPUT_CHARS", "12000"))
+
 SUMMARY_SYSTEM_PROMPT = """你是一个对话压缩器。
 
 用户会给你一段命令行编程助手的工作记录。请把它压缩成一段中文摘要（不超过 400 字），
@@ -341,8 +348,11 @@ class Conversation:
             level = "warn"
         else:
             level = "info"
+        cache_part = ""  # 【第 6 轮】有缓存命中就显示出来，方便判断缓存到底有没有生效
+        if self._api_client.cached_tokens:
+            cache_part = f" {DOT} 缓存命中 {self._api_client.cached_tokens}"
         self._ui_manager.print_status(
-            f"上下文 {used_text}% {DOT} 花费 ${self._api_client.total_cost}", level
+            f"上下文 {used_text}% {DOT} 花费 ${self._api_client.total_cost}{cache_part}", level
         )
 
     # -------------------------------------------------------------------------
@@ -370,7 +380,10 @@ class Conversation:
 
         loop = asyncio.get_running_loop()  # 拿到当前的事件循环
         message, token_usage = await loop.run_in_executor(
-            None, self._api_client.get_completion, request
+            None,
+            self._api_client.get_completion,
+            request,
+            self._api_client.summary_model,  # 【第 6 轮】摘要单独用（更便宜的）模型
         )
         # 为什么要用 run_in_executor？
         #   get_completion 是"同步"的（会一直等到接口返回）。
@@ -428,15 +441,54 @@ class Conversation:
         await self._tool_manager.shutdown()
 
     def _get_messages_with_cache_mark(self):
-        """Get messages with cache mark.（给最后一条消息打上"可缓存"标记）"""
-        messages = self._history_manager.get_current_messages()  # 取出全部消息（拿到的是一份副本）
-        if messages and "content" in messages[-1] and messages[-1]["content"]:
-            # 如果消息列表不为空，最后一条有 content 字段，而且 content 不为空
-            messages[-1]["content"][-1]["cache_control"] = {"type": "ephemeral"}
-            # [-1] 表示"最后一个"。这行是给最后一条消息的最后一个内容块加一个标记，
-            # 告诉支持缓存的接口："这段内容可以缓存起来，下次别重复收费"。
-            # 注意：只有 Anthropic 官方接口认这个字段，走 OpenRouter 时它通常会被忽略。
-        return messages  # 返回加工后的消息列表
+        """给消息打"提示词缓存"断点（2026-11-06 第 6 轮重写）
+
+        原来的写法有两个问题：
+          1. 不管什么接口都往消息里塞 cache_control。这是 Anthropic 的私有字段，
+             发给 OpenAI 官方接口会直接报 400（Unrecognized request argument）。
+          2. 只给"最后一条消息"打一个点。系统提示词这种"每轮都一样"的内容
+             反而没被单独标记，白白浪费了命中率最高的那一段。
+
+        现在改成：
+          - 只有支持缓存的接口才打标记（Anthropic / 模型名含 claude / 显式开启）
+          - 打两个断点：系统提示词（永远命中）+ 最后一条消息（增量命中）
+          - 最多 4 个（Anthropic 的上限，多了会被拒绝）
+        """
+        messages = self._history_manager.get_current_messages()  # 取出全部消息（是一份副本，随便改）
+        if not messages:  # 空列表没什么好标的
+            return messages
+        if not self._api_client.prompt_cache_enabled:  # 当前接口不支持缓存
+            return messages  # 一个字段都不加，避免请求被拒
+
+        breakpoints = []  # 记录要打标记的消息下标
+        for index, message in enumerate(messages):  # 找第一个系统消息
+            if message.get("role") == "system":
+                breakpoints.append(index)
+                break
+
+        last_index = len(messages) - 1
+        if messages[last_index].get("role") != "system":  # 最后一条不是系统消息才单独标一次
+            breakpoints.append(last_index)
+
+        for index in breakpoints[:4]:  # Anthropic 最多接受 4 个断点
+            self._mark_cache_breakpoint(messages[index])
+        return messages
+
+    @staticmethod
+    def _mark_cache_breakpoint(message):
+        """把一条消息的最后一个内容块标记为缓存断点（2026-11-06 第 6 轮新增）
+
+        缓存断点的含义是"从开头到这里为止的内容都可以缓存"。
+        所以标记必须落在"内容块的最后一个"上——标在中间不会生效。
+        """
+        content = message.get("content")
+        if isinstance(content, str):  # 有些消息的 content 直接是字符串
+            content = [{"type": "text", "text": content}]  # 统一包装成内容块列表
+            message["content"] = content
+        if isinstance(content, list) and content:  # 最后一个块是字典才能加字段
+            last_block = content[-1]
+            if isinstance(last_block, dict):
+                last_block["cache_control"] = {"type": "ephemeral"}
 
     async def _get_available_tools(self):
         """
@@ -521,8 +573,13 @@ class Conversation:
             # 让模型自己看到错误、自己想办法补救。这是 agent 能自我纠错的核心。
 
     def _add_tool_response(self, tool_call, content, is_last_tool=False):
-        """Add tool response to message history through history manager.（把工具结果存进历史）"""
-        tool_content = [{"type": "text", "text": content}]  # 包成标准的"内容块"
+        """Add tool response to message history through history manager.（把工具结果存进历史）
+
+        【2026-11-06 第 6 轮】在写进历史前先截断。原因是：
+          界面上的截断只影响"你看到什么"，模型收到的还是全文。
+          一条 `dir /s` 或 `npm install` 的输出动辄几万字，直接吃满上下文。
+        """
+        tool_content = [{"type": "text", "text": self._truncate_tool_output(content)}]  # 包成标准的"内容块"（已截断）
 
         # Add reminder after the last tool call in each iteration
         if is_last_tool:  # 只有最后一个工具结果后面才加提醒
@@ -537,6 +594,31 @@ class Conversation:
             "content": tool_content  # 内容（可能有一段结果 + 一段提醒）
         }
         self.add_message(tool_message)  # 存进历史
+
+    def _truncate_tool_output(self, content) -> str:
+        """把过长的工具输出掐头去尾（2026-11-06 第 6 轮新增）
+
+        策略：保留开头 70% + 结尾 30%，中间替换成一句说明。
+        为什么留头尾？
+          开头通常是"命令在干什么、有没有报错"，结尾通常是"最终结果"，
+          中间的大段重复日志恰恰是最没用的部分。
+        为什么要在说明里教它怎么取全文？
+          否则模型以为数据只有这么多，会基于残缺信息做判断。
+          告诉它"可以用 sed -n 或 grep 分段取"，它就会自己去补。
+        """
+        text = content if isinstance(content, str) else str(content)  # 统一成字符串
+        if len(text) <= MAX_TOOL_OUTPUT_CHARS:  # 没超限，原样返回
+            return text
+        head_length = int(MAX_TOOL_OUTPUT_CHARS * 0.7)  # 开头保留多少
+        tail_length = MAX_TOOL_OUTPUT_CHARS - head_length  # 结尾保留多少
+        omitted = len(text) - MAX_TOOL_OUTPUT_CHARS  # 中间省略了多少
+        return (
+            text[:head_length]
+            + f"\n\n... [工具输出过长，中间省略了 {omitted} 个字符。"
+            + "如需完整内容，请分段读取：例如 `sed -n '开始行,结束行 p' 文件`，"
+            + "或用 `grep` 只取你需要的部分。] ...\n\n"
+            + text[-tail_length:]
+        )
 
     def _create_simple_message(self, content):
         """Create a simple message object.（自己造一个"回复对象"，模仿 SDK 的格式）"""

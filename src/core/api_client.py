@@ -32,11 +32,22 @@ class APIClient:
     _instance = None  # 类属性：用来存放"唯一的那一个实例"，一开始是空的
     _initialized = False  # 类属性：记录"是否已经初始化过"，防止重复初始化
     _total_cost = 0  # 类属性：累计花了多少钱，所有请求共用这一个数字
+    _cached_tokens = 0  # 【第 6 轮】累计"命中缓存"的 token 数（只有支持的接口才不为 0）
 
     @property
     def total_cost(self):
         # @property 装饰器：让这个方法可以像"属性"一样访问，写 client.total_cost 就行，不用加括号
         return round(self._total_cost, 2)  # 返回累计花费，保留 2 位小数
+
+    @property
+    def cached_tokens(self):
+        """累计命中缓存的 token 数（第 6 轮新增）
+
+        为什么值得看这个数字？
+          命中缓存的那部分输入，价格通常只有正常输入的一成左右。
+          如果它一直是 0，说明缓存压根没生效，你正在按原价重复付费。
+        """
+        return self._cached_tokens
 
     def __new__(cls):
         # __new__ 是"造对象"的第一步（比 __init__ 更早），单例模式就是在这里做手脚
@@ -51,6 +62,11 @@ class APIClient:
             self.api_key = os.getenv("OPENAI_API_KEY")  # 从环境变量里取密钥
             self.base_url = os.getenv("OPENAI_BASE_URL")  # 从环境变量里取接口地址（比如 openrouter）
             self.model = os.getenv("OPENAI_MODEL")  # 从环境变量里取要用的模型名字
+            # 【第 6 轮】生成摘要单独用一个模型：摘要不需要太聪明，用小模型能省不少钱。
+            #   没配 OPENAI_SUMMARY_MODEL 就退回主模型，行为和以前一样。
+            self.summary_model = os.getenv("OPENAI_SUMMARY_MODEL") or self.model
+            # 【第 6 轮】是否给消息打"提示词缓存"标记。见 _detect_prompt_cache()。
+            self.prompt_cache_enabled = self._detect_prompt_cache()
 
             # Check if required environment variables exist
             if not self.api_key:  # 如果密钥是空的
@@ -67,25 +83,64 @@ class APIClient:
             )
             self._initialized = True  # 标记"已经初始化完成"，下次再创建就跳过这一段
 
-    def get_completion(self, request_params: Dict[str, Any]) -> Tuple[Any, Any]:
+    def _detect_prompt_cache(self) -> bool:
+        """判断当前接口要不要打提示词缓存标记（2026-11-06 第 6 轮新增）
+
+        为什么要判断？
+          cache_control 是 Anthropic 的私有字段。发给 OpenAI 官方接口会被拒绝
+          （400 Unrecognized request argument），发给别的中转站也可能报错。
+          所以默认只在"看起来像 Anthropic"时才开。
+
+        判断顺序：
+          1. 环境变量 ENABLE_PROMPT_CACHE 明确写了 1/0 → 听它的
+          2. 地址里含 anthropic → 开
+          3. 模型名里含 claude → 开
+          4. 其他情况 → 关（宁可不缓存，也不要请求报错）
+        """
+        flag = os.getenv("ENABLE_PROMPT_CACHE")
+        if flag is not None and flag.strip() != "":
+            return flag.strip().lower() in ("1", "true", "yes", "on")
+        base = (self.base_url or "").lower()
+        model = (self.model or "").lower()
+        return "anthropic" in base or "claude" in model
+
+    def _record_usage(self, token_usage):
+        """把一次请求的用量记到总账上（2026-11-06 第 6 轮新增，原来这段是重复代码）
+
+        记两样东西：
+          - 花费：有些中转站会返回 cost 字段，没有就算 0
+          - 缓存命中量：Anthropic 返回 cache_read_input_tokens，
+            OpenAI 返回 prompt_tokens_details.cached_tokens，两种都试一下
+        """
+        if token_usage is None:  # 没用量就没什么可记的
+            return
+        extra = getattr(token_usage, "model_extra", {}) or {}
+        if isinstance(extra, dict):
+            self._total_cost += extra.get("cost", 0) or 0
+
+        cached = 0
+        details = getattr(token_usage, "prompt_tokens_details", None)
+        if details is not None:
+            cached = getattr(details, "cached_tokens", 0) or 0
+        if not cached:  # Anthropic 用的是另一个字段名
+            cached = getattr(token_usage, "cache_read_input_tokens", 0) or 0
+        self._cached_tokens += cached or 0
+
+    def get_completion(self, request_params: Dict[str, Any], model: Optional[str] = None) -> Tuple[Any, Any]:
         """
         发一次"普通"请求（非流式）：等模型把话全部说完，一次性拿到结果。
 
         参数 request_params：一个字典，里面装着 messages（消息列表）、tools（工具清单）等
         返回：一个元组 (模型回复对象, token 用量)
         """
-        request_params["model"] = self.model  # 把模型名字填进请求参数（不让调用方自己指定）
+        request_params["model"] = model or self.model  # 【第 6 轮】允许调用方指定模型（摘要用小模型）
         try:  # 开始"试一试"，如果里面出错会跳到 except
             response = self.client.chat.completions.create(**request_params)
             # ** 的意思是"把字典拆开当参数传进去"，等价于 create(messages=..., tools=..., model=...)
             # 这一行就是真正在发网络请求，也是最慢的一行
             message = response.choices[0].message  # 从返回结果里取出"模型的那条回复"（取第一个候选）
             token_usage = response.usage  # 取出这次消耗了多少 token（字数统计）
-            cost = getattr(token_usage, 'model_extra', {})
-            # getattr 的意思是"尝试取某个属性，没有就返回默认值"
-            # 有些中转站（如 OpenRouter）会额外返回一个 cost 字段表示这次花了多少钱
-            if isinstance(cost, dict):  # 如果取到的是个字典
-                self._total_cost += cost.get("cost", 0)  # 把这次的花费加到总账上（没有 cost 字段就算 0）
+            self._record_usage(token_usage)  # 【第 6 轮】统一记账（花费 + 缓存命中）
 
             return message, token_usage  # 把回复和用量一起返回给调用方
         except Exception as e:  # 捕获任何异常，e 是错误信息本体
@@ -116,9 +171,7 @@ class APIClient:
                 # Handle token usage information
                 if hasattr(chunk, 'usage') and chunk.usage:  # 如果这一片里带着用量信息
                     token_usage = chunk.usage  # 记下来
-                    cost = getattr(token_usage, 'model_extra', {})  # 再试试能不能拿到花费
-                    if isinstance(cost, dict):  # 如果能
-                        self._total_cost += cost.get("cost", 0)  # 加到总账
+                    self._record_usage(token_usage)  # 【第 6 轮】统一记账
                     continue  # 这一片只有用量、没有文字，直接跳过，处理下一片
 
                 if chunk.choices[0].delta.content:
