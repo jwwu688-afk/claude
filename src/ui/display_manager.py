@@ -100,15 +100,17 @@ class DisplayManager:
         text.append(str(info_message), style="qs.dim")
         self._console.print(text)
 
-    def print_status(self, text_content: str) -> None:
-        """打印状态行（2026-11-06 第 4 轮新增）
+    def print_status(self, text_content: str, level: str = "info") -> None:
+        """打印状态行（2026-11-06 第 4 轮新增，第 5 轮加了按水位变色）
 
         样式：  ⎿  上下文 12.3% · 花费 $0.01
-        用 ⎿ 表示"这是上面那轮对话的补充信息"，比单独一行括号更清晰。
+        颜色随上下文占用变化：<50% 暗灰、50%~75% 黄色、>75% 红色。
+        这样"快满了"这件事会自己跳出来，不用你去读数字。
         """
+        color = {"info": "qs.dim", "warn": "qs.warn", "err": "qs.err"}.get(level, "qs.dim")
         text = Text()
-        text.append(f"  {theme.RESULT} ", style="qs.dim")  # 两个空格缩进 + 转折符号
-        text.append(text_content, style="qs.dim")  # 内容暗灰
+        text.append(f"  {theme.RESULT} ", style=f"bold {theme.ACCENT}")  # 转折符号用强调色，和正文区分
+        text.append(text_content, style=color)  # 内容按水位变色
         self._console.print(text)
 
     # -------------------------------------------------------------------------
@@ -134,7 +136,7 @@ class DisplayManager:
         失败时整行变红，成功时暗灰——这样一眼就能从满屏输出里找到出问题的那次调用。
         """
         text = Text()
-        text.append(f"  {theme.RESULT}  ", style="qs.dim")  # 缩进两格 + 转折符号 + 空格
+        text.append(f"  {theme.RESULT}  ", style=f"bold {theme.ACCENT}")  # 转折符号用强调色，方便定位
         style = "qs.dim" if success else "qs.err"  # 成功用暗灰，失败用红
         text.append(str(result), style=style)
         self._console.print(text)

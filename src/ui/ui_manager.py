@@ -92,12 +92,13 @@ class UIManager:
         """Print info message.（打印提示）"""
         self.display_manager.print_info(info_message, emoji)
 
-    def print_status(self, text: str) -> None:
-        """打印状态行（2026-11-06 第 4 轮新增）
+    def print_status(self, text: str, level: str = "info") -> None:
+        """打印状态行（2026-11-06 第 4 轮新增，第 5 轮加了颜色分级）
 
         用在每轮对话结束时显示"上下文用了多少、花了多少钱"。
+        level 决定颜色：info 暗灰 / warn 黄 / err 红。
         """
-        self.display_manager.print_status(text)
+        self.display_manager.print_status(text, level)
 
     # Streaming methods
     # ↓ 流式显示相关，同样是转手

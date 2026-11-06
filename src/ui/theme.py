@@ -12,6 +12,7 @@
 
 from rich.console import Console  # rich 的控制台对象
 from rich.theme import Theme  # 主题：给"样式名"起别名，后面用名字引用颜色
+import colorsys  # 用来在"色相环"上取色，做出连续渐变（2026-11-06 第 5 轮新增）
 
 # --- 颜色 -------------------------------------------------------------------
 ACCENT = "cyan"  # 强调色：标题、提示符
@@ -57,3 +58,23 @@ def prompt_text() -> str:
       现代终端（Windows Terminal、iTerm、VS Code 终端）都认这种颜色码。
     """
     return f"\x1b[36m{PROMPT}\x1b[0m "
+
+
+def gradient_color(index: int, total: int, dim: bool = False) -> str:
+    """生成渐变色：青 → 蓝 → 紫 → 洋红 → 红橙（2026-11-06 第 5 轮新增）
+
+    参数：
+        index：第几个字符（从左往右数）
+        total：一共多少个字符
+        dim：是否要"暗一点"的版本（用来画边框、分隔线，避免抢主体）
+
+    为什么用 HSV 而不是直接给 RGB？
+      HSV 里的 H（色相）是一个 0~1 的环，只要把 H 从 0.5 走到 1.12，
+      颜色就会沿"青→蓝→紫→红"平滑过渡，比自己手挑几个 RGB 值省事得多。
+    """
+    hue = 0.5 + (index / max(1, total - 1)) * 0.62  # 0.5 是青色，+0.62 走到 1.12
+    hue = hue % 1.0  # 超过 1 就绕回环的起点（1.12 → 0.12，接近红橙）
+    r, g, b = colorsys.hsv_to_rgb(hue, 0.72, 0.62 if dim else 1.0)
+    # 第二个参数是饱和度（0~1），压到 0.72 让颜色不那么刺眼
+    # 第三个参数是明度：dim 时压到 0.62
+    return f"rgb({int(r * 255)},{int(g * 255)},{int(b * 255)})"

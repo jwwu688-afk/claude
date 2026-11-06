@@ -329,7 +329,21 @@ class Conversation:
 
     def _print_context_window_and_total_cost(self):
         # 打印一行状态："上下文窗口用了 12.3%，一共花了 0.45 美元"
-        self._ui_manager.print_status(f"上下文 {self._history_manager.current_context_window}% {DOT} 花费 ${self._api_client.total_cost}")
+        # 【第 5 轮】按上下文水位给状态行变色：过半发黄，超过 75% 发红，快满了自己会"跳"出来
+        used_text = self._history_manager.current_context_window
+        try:
+            used = float(used_text)  # 这里拿到的是字符串形式的百分比，转成数字才能比较
+        except ValueError:
+            used = 0.0
+        if used >= 75:
+            level = "err"
+        elif used >= 50:
+            level = "warn"
+        else:
+            level = "info"
+        self._ui_manager.print_status(
+            f"上下文 {used_text}% {DOT} 花费 ${self._api_client.total_cost}", level
+        )
 
     # -------------------------------------------------------------------------
     # 【2026-11-06 第 2 轮新增】摘要式压缩相关
