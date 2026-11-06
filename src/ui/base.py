@@ -31,10 +31,16 @@ class BaseInputHandler(ABC):
         pass  # 只有声明没有实现
 
     @abstractmethod
-    async def wait_for_user_approval(self, content: str, emoji: str = "🤖") -> bool:
-        """Wait for user approval.（等用户确认：同意还是拒绝）"""
-        # 注意这里标注返回 bool（真假值），但实际实现返回的是"两个值的元组"，
-        # 标注和实现对不上，属于小瑕疵，不影响运行
+    async def wait_for_user_approval(self, default_yes: bool = True) -> tuple[bool, str]:
+        """Wait for user approval.（等用户确认：同意还是拒绝，外加可能的拒绝理由）
+
+        【2026-11-06 第 8.2 轮】签名改了，顺手把原来"标注 bool、实际返回元组"
+        的不一致也修掉：现在就是 Tuple[bool, str]，第一个是要不要执行，
+        第二个是用户如果不执行时说的那句话（没有就是空串）。
+
+        提问文字不再从参数传进来 —— 画问题归显示层（approval_question），
+        输入层只负责读一行、解释一行，两件事分开才好替换。
+        """
         pass
 
 

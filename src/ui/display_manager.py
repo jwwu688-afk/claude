@@ -155,6 +155,50 @@ class DisplayManager:
         self._console.print(text)
 
     # -------------------------------------------------------------------------
+    # 二·五、授权提问（2026-11-06 第 8.2 轮新增）
+    # -------------------------------------------------------------------------
+    def approval_question(self, question: str, default_yes: bool = True) -> None:
+        """画"要不要执行"这一次提问（2026-11-06 第 8.2 轮新增）
+
+        改前是这样的三行英文，而且必须打字回 yes / no：
+            🤖
+            Please confirm if you want to execute the tool call: Tool: task, args: {...}
+            Answer yes or no, if refusing please provide a reason
+
+        改后只留一个问题 + 一行提示，直接回车就是同意：
+            ⏺ cmd_runner(dir)
+              ? 是否执行？ 回车确认 · 输入 n 拒绝 · 或直接输入你的想法
+
+        为什么把选项压成"回车 / 一句话"两选：
+          Claude Code 里的授权就是一次回车，多打一个 y 都是多余的摩擦。
+          而"输入别的什么"天然表达"我有意见"，直接当拒绝理由交给模型，
+          比让它先选 no、再单独问一遍理由少一次往返。
+        """
+        line = Text()
+        line.append("  ? ", style=f"bold {theme.ACCENT}")  # 问号用品牌橙，在一屏暗灰里能立刻被看到
+        line.append(question, style="")
+        # 提示和问题放同一行：每次授权都多占一行，一屏里几次调用就挤没了。
+        # 这里用暗灰小字跟在后面，读的时候可以忽略，需要时又不用去别处找。
+        line.append("  ", style="")
+        line.append("回车确认" if default_yes else "回车拒绝", style="qs.dim")
+        line.append(" · 输入 " + ("n 拒绝" if default_yes else "y 允许"), style="qs.dim")
+        line.append(" · 或直接说你想怎么改", style="qs.dim")
+        self._console.print(line)
+
+    def tool_denied(self, reason: str = "") -> None:
+        """工具被用户拒绝时补一行说明（2026-11-06 第 8.2 轮新增）
+
+        改前拒绝之后屏幕上什么都没有，只有下一轮模型的话。
+        用户看不到"我这一下确实生效了"，会怀疑是不是没点上。
+        """
+        text = Text()
+        text.append(f"  {theme.RESULT}  ", style="qs.dim")
+        text.append("已拒绝", style="qs.warn")
+        if reason:
+            text.append(f"：{reason}", style="qs.dim")
+        self._console.print(text)
+
+    # -------------------------------------------------------------------------
     # 三、流式显示
     # -------------------------------------------------------------------------
     def start_stream_display(self, refresh_rate: int = 10) -> None:

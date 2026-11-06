@@ -33,6 +33,7 @@ class APIClient:
     _initialized = False  # 类属性：记录"是否已经初始化过"，防止重复初始化
     _total_cost = 0  # 类属性：累计花了多少钱，所有请求共用这一个数字
     _cached_tokens = 0  # 【第 6 轮】累计"命中缓存"的 token 数（只有支持的接口才不为 0）
+    _prompt_tokens = 0  # 【第 8.2 轮】累计"输入 token"总数，专门当命中率的分母
 
     @property
     def total_cost(self):
@@ -48,6 +49,32 @@ class APIClient:
           如果它一直是 0，说明缓存压根没生效，你正在按原价重复付费。
         """
         return self._cached_tokens
+
+    @property
+    def prompt_tokens(self):
+        """累计输入的 token 总数（2026-11-06 第 8.2 轮新增）
+
+        它是"缓存命中率"的分母。为什么不能直接用最后一条消息的 prompt_tokens？
+          因为状态行显示的是"这一整段会话的成本表现"，
+          单次数字会随着你输入的长短剧烈跳动，看不出趋势。
+        """
+        return self._prompt_tokens
+
+    @property
+    def cache_hit_rate(self) -> float:
+        """缓存命中率，百分比（2026-11-06 第 8.2 轮新增）
+
+        为什么把"命中 8640 个 token"换成百分比？
+          8640 这个数字本身没有参照系：它可能是 20 万输入里的 4%（很差），
+          也可能是 1 万输入里的 86%（很好）。用户每次都要自己心算，
+          等于没显示。百分比一眼就知道"缓存到底有没有在替我省钱"。
+
+        口径说明见 _record_usage 里的注释：不同厂商对"输入 token"的定义不一样，
+        这里统一折算成"命中缓存的部分 ÷ 全部输入"。
+        """
+        if not self._prompt_tokens:  # 还没发过请求，或者接口不返回用量
+            return 0.0
+        return 100.0 * self._cached_tokens / self._prompt_tokens
 
     def __new__(cls):
         # __new__ 是"造对象"的第一步（比 __init__ 更早），单例模式就是在这里做手脚
@@ -105,12 +132,26 @@ class APIClient:
         return "anthropic" in base or "claude" in model
 
     def _record_usage(self, token_usage):
-        """把一次请求的用量记到总账上（2026-11-06 第 6 轮新增，原来这段是重复代码）
+        """把一次请求的用量记到总账上（2026-11-06 第 6 轮新增；第 8.2 轮补了分母）
 
-        记两样东西：
+        记三样东西：
           - 花费：有些中转站会返回 cost 字段，没有就算 0
           - 缓存命中量：Anthropic 返回 cache_read_input_tokens，
             OpenAI 返回 prompt_tokens_details.cached_tokens，两种都试一下
+          - 输入总量：命中率的分母
+
+        为什么分母要分情况算（第 8.2 轮）？
+          两家对 "prompt_tokens" 的定义不一样，
+          混着算会得出超过 100% 的命中率，那个数字一眼就是错的：
+
+            OpenAI 系：prompt_tokens 已经把缓存命中部分算进去了，
+                      所以分母就是 prompt_tokens。
+            Anthropic 系：input_tokens 不含缓存读写，
+                      真正喂进去的是 input + cache_read + cache_creation，
+                      三个加起来才是分母。
+
+        怎么区分？OpenAI 一定带 prompt_tokens_details 这个对象，
+        Anthropic 系则会出现 cache_read_input_tokens 字段。
         """
         if token_usage is None:  # 没用量就没什么可记的
             return
@@ -118,13 +159,31 @@ class APIClient:
         if isinstance(extra, dict):
             self._total_cost += extra.get("cost", 0) or 0
 
-        cached = 0
+        prompt_tokens = getattr(token_usage, "prompt_tokens", 0) or 0  # 输入 token（口径随厂商变）
         details = getattr(token_usage, "prompt_tokens_details", None)
-        if details is not None:
+
+        cached = 0
+        if details is not None:  # OpenAI 口径
             cached = getattr(details, "cached_tokens", 0) or 0
-        if not cached:  # Anthropic 用的是另一个字段名
-            cached = getattr(token_usage, "cache_read_input_tokens", 0) or 0
+
+        cache_read = getattr(token_usage, "cache_read_input_tokens", 0) or 0  # Anthropic 口径
+        cache_creation = getattr(token_usage, "cache_creation_input_tokens", 0) or 0
+        if not cached:  # OpenAI 没给，就试 Anthropic 的字段名
+            cached = cache_read
+
+        if details is not None:  # OpenAI：prompt_tokens 已包含缓存部分
+            total_input = prompt_tokens
+        elif cache_read or cache_creation:  # Anthropic：input 不含缓存，要把两块加回来
+            total_input = prompt_tokens + cache_read + cache_creation
+        else:  # 什么缓存字段都没有：分母就是普通输入
+            total_input = prompt_tokens
+
+        # 兜底：万一只拿到 cached、没拿到 prompt_tokens（部分中转站会这样），
+        # 至少别让分母小于分子，否则命中率会算出 300% 这种笑话。
+        total_input = max(total_input, cached)
+
         self._cached_tokens += cached or 0
+        self._prompt_tokens += total_input or 0
 
     def get_completion(self, request_params: Dict[str, Any], model: Optional[str] = None) -> Tuple[Any, Any]:
         """

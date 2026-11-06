@@ -58,9 +58,33 @@ class UIManager:
         """Get user input with specified prompt.（等用户输入；prompt 为 None 时用统一的 ❯）"""
         return await self.input_handler.get_user_input(prompt)
 
-    async def wait_for_user_approval(self, content: str, emoji: str = "🤖") -> tuple[bool, str]:
-        """Wait for user approval with optional denial message.（等用户确认）"""
-        return await self.input_handler.wait_for_user_approval(content, emoji)
+    async def wait_for_user_approval(self, question: str = "是否执行？", default_yes: bool = True) -> tuple[bool, str]:
+        """问一次"要不要执行"，等用户回车或给一句反馈（2026-11-06 第 8.2 轮重写）
+
+        三件事按顺序做：
+          1. 让显示层画问题（⏺ 头部上面已经画过了，这里只画 ? 那一行）
+          2. 让输入层读一行
+          3. 把这一行解释成（是否执行, 拒绝理由）
+
+        改前的用法是传一整句 "Tool: task, args: {...}"，界面上会把整个参数字典
+        原样铺出来，长参数直接占满一屏。现在参数由 format_tool_call 压成
+        "cmd_runner(dir)" 这种一行摘要，问题本身只问"是否执行"。
+        """
+        self.display_manager.approval_question(question, default_yes)  # 画问题 + 提示
+        return await self.input_handler.wait_for_user_approval(default_yes)  # 读一行并解释
+
+    def format_tool_call(self, tool_name: str, tool_args: dict) -> str:
+        """把一次工具调用压成一行可读文字（2026-11-06 第 8.2 轮新增）
+
+        返回形如 "cmd_runner(dir)"、"task(修复登录问题)"。
+        批准提问、日志、拒绝提示都复用这一个格式，屏幕上不会三种写法并存。
+        """
+        preview = self._args_preview(tool_args)  # 复用已有的"挑最关键字段"逻辑
+        return f"{tool_name}({preview})" if preview else tool_name
+
+    def show_tool_denied(self, reason: str = "") -> None:
+        """显示"这次工具调用被拒绝了"（2026-11-06 第 8.2 轮新增）"""
+        self.display_manager.tool_denied(reason)
 
     async def get_choice_input(self, prompt: str, choices: list, case_sensitive: bool = False) -> Optional[str]:
         """Get user input with predefined choices.（让用户从固定选项里选）"""
@@ -154,7 +178,7 @@ class UIManager:
         self.display_manager.tool_header(tool_name, args_preview)
 
     def _args_preview(self, tool_args) -> str:
-        """把工具参数压成一行可读的摘要（2026-11-06 第 4 轮新增）
+        """把工具参数压成一行可读的摘要（2026-11-06 第 4 轮新增，第 8.2 轮补齐文件类工具）
 
         为什么要做这件事？
           直接把字典打印出来是 cmd_runner({'command': 'dir', 'timeout': 30})，
@@ -162,8 +186,15 @@ class UIManager:
           这里针对常见工具挑出"最能说明意图"的那个字段：
             cmd_runner  → 直接显示命令本身：dir
             task        → 显示任务描述：修复登录问题
+            file_*      → 显示路径或匹配模式：src/main.py、**/*.py
             todo_write  → 显示条数：4 项
             其他        → 截断后的原样
+
+        【第 8.2 轮】补了 path / pattern 两类。
+          不补的话，第 8 轮新增的五个文件工具在审批时是这样：
+              ? 执行 file_edit({'path': 'a.py', 'old_string': 'hi', 'new_string': 'bye'})？
+          模型可能塞进几百行 new_string，整屏都是转义引号。
+          现在只显示 file_edit(a.py)——看路径就够判断该不该放行了。
         """
         if not tool_args:  # 没有参数
             return ""
@@ -172,6 +203,10 @@ class UIManager:
                 return self.display_manager.shorten(tool_args["command"], 60)
             if tool_args.get("description"):  # 派活类工具
                 return self.display_manager.shorten(tool_args["description"], 60)
+            if tool_args.get("pattern"):  # 搜索类工具（file_grep / file_glob）
+                return self.display_manager.shorten(tool_args["pattern"], 60)
+            if tool_args.get("path"):  # 文件类工具（file_read / file_write / file_edit）
+                return self.display_manager.shorten(tool_args["path"], 60)
             if isinstance(tool_args.get("todos"), list):  # 待办类工具
                 return f"{len(tool_args['todos'])} 项"
         return self.display_manager.shorten(tool_args, 80)  # 兜底：整体截断

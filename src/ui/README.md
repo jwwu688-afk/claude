@@ -1,91 +1,99 @@
-# UI Module
+# UI 模块
 
-This module provides a clean separation of UI concerns from business logic, making the application more maintainable and testable.
+这个模块把"界面上的事"和"业务逻辑"彻底分开：输入归 `InputHandler` 管，显示归 `DisplayManager` 管，
+上层只跟 `UIManager` 打交道。这样代码更好维护，也更容易单独测试。
 
-## Quick Start
+> 最后核对：2026-11-06（第 8.2 轮）。下面的类名和方法名都与当前代码一致。
+
+## 快速上手
 
 ```python
 from ui.ui_manager import UIManager
 
-# Create UI manager instance
+# 创建界面管理器（单例，全程序共用一个）
 ui = UIManager()
 
-# Display messages
-ui.print_assistant_message("Hello **world**!")
-ui.print_error("Something went wrong")
-ui.print_success("Operation completed")
+# 显示各类消息
+ui.print_assistant_message("你好 **世界**！")
+ui.print_error("出错了")
+ui.print_success("操作完成")
 
-# Get user input
+# 获取用户输入
 user_input = await ui.get_user_input()
-approval = await ui.wait_for_user_approval("Delete file?")
+# 确认：回车即同意；输入别的内容 = 拒绝 + 那句内容当作说明（返回 (是否执行, 理由)）
+should_run, reason = await ui.wait_for_user_approval("是否执行？")
 
-# Streaming display
+# 流式显示
 ui.start_stream_display()
-ui.print_streaming_content("Streaming...")
+ui.print_streaming_content("正在逐字输出…")
 ui.stop_stream_display()
 ```
 
-## Module Structure
+## 模块结构
 
 ### `UIManager`
-Main coordinator that provides a unified interface to all UI operations. Implements singleton pattern.
+总协调者（外观模式 / Facade）：给所有界面操作提供统一入口，采用单例模式，全程序只有一份状态。
 
-### `InputHandler` 
-Handles all user input operations:
-- `get_user_input()` - Basic input with prompt
-- `wait_for_user_approval()` - Yes/no confirmation
-- `get_choice_input()` - Input with predefined choices
+### `InputHandler`
+负责所有"从键盘拿输入"的操作：
+- `get_user_input()` —— 带提示符的基础输入
+- `wait_for_user_approval()` —— 读一行并解释成 (是否执行, 拒绝理由)：回车走默认值，命中同意/拒绝词表照词表，其他内容一律当"拒绝 + 那句反馈"
+- `interpret_approval()` —— 上面那条规则的纯函数版本，不读键盘，方便单测
+- `get_choice_input()` —— 从预设选项里选一个
 
 ### `DisplayManager`
-Manages all display operations:
-- `print_assistant_message()` - Markdown formatted messages
-- `print_error/success/info()` - Styled status messages
-- `start/stop_stream_display()` - Streaming content
-- `print_streaming_content()` - Stream chunks
+负责所有"往屏幕上打印"的操作：
+- `print_assistant_message()` —— 按 Markdown 渲染模型回复
+- `print_error/success/info()` —— 带样式的错误 / 成功 / 提示消息
+- `print_status()` —— 状态行（上下文水位、花费、缓存命中率，前两项会按水位变色）
+- `start/stop_stream_display()` —— 流式显示的开始与结束
+- `print_streaming_content()` —— 逐段显示模型吐出来的文字
+- `tool_header()/tool_result()` —— 工具调用的两行式输出（⏺ / ⎿）
+- `approval_question()/tool_denied()` —— 授权提问（? 那一行）与被拒绝后的提示
 
-### `Base Classes`
-Abstract interfaces for extensibility:
-- `BaseInputHandler` - Input handler interface
-- `BaseDisplayManager` - Display manager interface
-- `UIConfig` - Configuration settings
+### 基类（`base.py`）
+为以后扩展预留的抽象接口：
+- `BaseInputHandler` —— 输入组件的合同
+- `BaseDisplayManager` —— 显示组件的合同
+- `UIConfig` —— 一组可配置项（各类图标、刷新频率）
 
-## Features
+## 功能特性
 
-- **Markdown Support**: Rich text formatting with Rich library
-- **Streaming Display**: Real-time content updates
-- **Emoji Indicators**: Visual feedback for different message types
-- **Async Input**: Non-blocking user input handling
-- **Singleton Pattern**: Consistent state across application
-- **Type Hints**: Full type annotation support
-- **Extensible**: Easy to add new UI backends
+- **Markdown 渲染**：用 Rich 库显示富文本
+- **流式显示**：内容实时刷新；等待模型时还有 ✻ 旋转动画和秒数（第 7 轮新增）
+- **图标与配色**：第 7 轮起改为 Claude 风格的圆点 / 星形 + 品牌橙，emoji 已大幅收敛
+- **异步输入**：等键盘输入时不阻塞事件循环
+- **单例模式**：界面状态全程序一致
+- **类型标注**：关键方法都带类型提示
+- **方便扩展**：抽象基类留好了换界面后端的位置
 
-## Benefits
+## 这样拆分的好处
 
-1. **Separation of Concerns**: UI logic separated from business logic
-2. **Maintainability**: Clear interfaces and organized code
-3. **Testability**: Easy to mock UI for testing
-4. **Reusability**: UI components can be used across modules
-5. **Configurability**: Customizable UI behavior
-6. **Future-Proof**: Easy to add new UI features
+1. **职责分离**：界面逻辑不再混在业务逻辑里
+2. **好维护**：接口清晰，各管一摊
+3. **好测试**：界面可以整个换成假对象（mock）
+4. **可复用**：别的模块也能直接用这些组件
+5. **可配置**：`UIConfig` 定义了配置项，配色集中在 `theme.py`（见文末说明）
+6. **好扩展**：以后加新界面功能不用动上层
 
-## Migration from Old Code
+## 从旧写法迁移过来
 
-### Before:
+### 改前
 ```python
-# In Conversation class
+# 在 Conversation 类里自己管输入和显示
 user_input = await self.get_user_input()
-self.print_assistant_messages("Hello")
+self.print_assistant_messages("你好")
 ```
 
-### After:
+### 改后
 ```python
-# Using UI module
+# 改用 ui 模块
 ui = UIManager()
 user_input = await ui.get_user_input()
-ui.print_assistant_message("Hello")
+ui.print_assistant_message("你好")
 ```
 
-## Configuration
+## 配置
 
 ```python
 from ui.base import UIConfig
@@ -98,4 +106,6 @@ config = UIConfig(
 )
 ```
 
-
+注意：`UIConfig` 目前只是把配置项定义好了，`UIManager` 还没有接收它——
+上面这段只能说明"配置长什么样"，不会真的改变界面。
+实际的配色、提示符、spinner 文案统一放在 `ui/theme.py` 里（第 7 轮起），改那里才会生效。

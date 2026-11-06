@@ -12,6 +12,7 @@
 
 import asyncio  # 用来创建"后台任务"（连 MCP 服务器比较慢，不能卡住启动）
 from tools.cmd_runner import CmdRunner  # 导入命令执行工具
+from tools.file_tools import FileRead, FileWrite, FileEdit, FileGlob, FileGrep  # 【第 8 轮】五个文件专用工具
 from tools.mcp_tool import McpTool  # 导入"MCP 工具包装器"（把外部工具包成我们能用的样子）
 from tools.smart_context_cropper import SmartContextCropper  # 导入上下文裁剪工具
 from tools.task import Task  # 导入子任务工具（让模型能派活）
@@ -45,7 +46,16 @@ class ToolManager:
             self._register_tool(SmartContextCropper.get_tool_name(), SmartContextCropper())  # 登记裁剪工具
             self._register_tool(TodoWrite.get_tool_name(), TodoWrite())  # 登记待办工具
             self._register_tool(Task.get_tool_name(), Task())  # 登记子任务工具
-            self._register_tool(CmdRunner.get_tool_name(), CmdRunner())  # 登记命令行工具（最重要，放最后）
+            self._register_tool(CmdRunner.get_tool_name(), CmdRunner())  # 命令行工具：跑命令、跑测试、git 操作
+            # 【2026-11-06 第 8 轮】五个文件工具排在最后登记。
+            #   按上面"越重要越晚登记"的约定：现在读/改文件是最高频的操作，
+            #   它们应该比 cmd_runner 更靠后、在给模型的清单里更显眼。
+            #   顺序按"读 → 写 → 改 → 找文件 → 搜内容"排，和模型干活的思路一致。
+            self._register_tool(FileRead.get_tool_name(), FileRead())  # 读文件（带行号）
+            self._register_tool(FileWrite.get_tool_name(), FileWrite())  # 新建 / 整体覆盖文件
+            self._register_tool(FileEdit.get_tool_name(), FileEdit())  # 精确替换一段（带 diff）
+            self._register_tool(FileGlob.get_tool_name(), FileGlob())  # 按文件名找文件
+            self._register_tool(FileGrep.get_tool_name(), FileGrep())  # 按内容搜索
             ToolManager._initialized = True  # 打标记
 
     def _ensure_mcp_registration(self):

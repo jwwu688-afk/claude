@@ -4,8 +4,11 @@
 #
 #   把消息发给模型 → 模型说要调工具 → 执行工具 → 把结果放回消息列表 → 再发给模型 → ...
 #
-# 这个"再发一次"的动作是靠函数自己调用自己完成的（叫"递归"），
-# 所以你会看到 _recursive_message_handling 这个方法里面又调用了它自己。
+# 这个"再发一次"的动作，原来是靠函数自己调用自己完成的（叫"递归"）。
+# 【2026-11-06 第 8 轮】已改成 while 循环驱动 _run_one_iteration()：
+#   每用一次工具、每等一次用户输入，原来都会让调用栈厚一层，
+#   Python 默认递归上限 1000，长任务跑到几百轮就会 RecursionError。
+#   现在栈深度始终是常数，跑多少轮都不会涨。
 #
 # 另外这里还管着"子 agent"（subagent）：主 agent 可以把一个复杂任务
 # 分包给一个临时的小 agent 去做，那个小 agent 的聊天记录会单独放在一边，
@@ -37,6 +40,13 @@ from .history.history_manager import HistoryManager, message_text  # 导入历�
 #     界面截断只是"不刷屏"，模型拿到的仍然是全文（可能几万字），
 #     照样会把上下文吃满、把预算烧掉。真正省钱的截断必须发生在"写进历史之前"。
 MAX_TOOL_OUTPUT_CHARS = int(os.getenv("MAX_TOOL_OUTPUT_CHARS", "12000"))
+
+# 【2026-11-06 第 8 轮】只读工具清单：这些工具不改磁盘文件、不启动外部进程，
+# 没必要每次都弹窗打断用户。第 8 轮新加的三个文件检索工具都在这里。
+# 注意 smart_context_cropper 不在此列——它会真的删掉聊天记录，属于有风险的操作。
+READ_ONLY_TOOLS = {
+    "file_read", "file_glob", "file_grep", "todo_write",
+}
 
 SUMMARY_SYSTEM_PROMPT = """你是一个对话压缩器。
 
@@ -203,15 +213,40 @@ class Conversation:
                 self._history_manager.history_token_usage.pop()
 
     async def _recursive_message_handling(self):
+        """主循环驱动器（2026-11-06 第 8 轮重写）
+
+        原来整个方法是"自己调自己"的递归：每用一次工具、每等一次用户输入，
+        调用栈就厚一层。Python 默认递归上限是 1000（本机实测），
+        一次长任务跑上几百轮就会抛 RecursionError，而且异常冒到最外层
+        会被 start_conversation 捕获成"发生系统错误"，整个对话直接结束。
+
+        现在改成 while：每一轮交给 _run_one_iteration() 干完
+        "问模型一次 + 处理工具结果"，由它决定还要不要继续转：
+          返回 True  → 还有后续（工具结果要再问、或要等用户下一句）
+          返回 False → 这一页该收尾（子 agent 交差、请求彻底失败）
+
+        栈深度始终只有一层，跑多少轮都不会涨；异常也照样往上冒，
+        和原来的捕获行为一致。
+
+        为什么保留这个老名字？start_conversation / start_task 都调它，
+        改名要牵动多处；而且它确实还是"整个对话的心跳"。
         """
-        主循环，整个程序的心跳。每调用一次，就是"问模型一次 → 处理它的回答"。
+        while True:
+            should_continue = await self._run_one_iteration()  # 跑一轮
+            if not should_continue:  # 该收尾了
+                return
+
+    async def _run_one_iteration(self) -> bool:
+        """单层迭代：问模型一次 → 处理它的回答（2026-11-06 第 8 轮从递归体拆出）
 
         流程：
           1. 看看上下文是不是太长了，太长就先压缩
           2. 把消息 + 工具清单打包，发给模型
           3. 模型边想边说，界面边收边显示
-          4. 如果模型说要调工具 → 执行工具 → 把结果塞回消息列表 → 回到第 1 步（递归）
-          5. 如果模型没调工具 → 这一轮说完了 → 等用户下一句话 → 回到第 1 步（递归）
+          4. 如果模型说要调工具 → 执行工具 → 把结果塞回消息列表 → 返回 True 让外层再转一圈
+          5. 如果模型没调工具 → 这一轮说完了 → 等用户下一句话 → 同样返回 True
+
+        返回值含义见 _recursive_message_handling 的说明。
         """
 
         # Check for auto compression
@@ -293,7 +328,7 @@ class Conversation:
                 # Create error response
                 response_message = self._create_error_message(str(e))  # 造一条"出错提示"当作模型的回复
                 self._ui_manager.print_assistant_message(response_message.content)  # 显示出来
-                return  # 直接结束这一轮，不再往下走
+                return False  # 【第 8 轮】彻底失败：让外层 while 停下来，别再往下走
 
         if token_usage:  # 如果拿到了用量（流式成功时走这里）
             self._history_manager.update_token_usage(token_usage)  # 记账
@@ -317,13 +352,13 @@ class Conversation:
             await self._handle_tool_calls(response_message.tool_calls)  # 一个个执行
             # Update token usage in history manager
             self._print_context_window_and_total_cost()  # 打印"上下文用了百分之几、一共花了多少钱"
-            await self._recursive_message_handling()  # 递归：把工具结果再发给模型，让它接着说
+            return True  # 【第 8 轮】交给外层 while 再转一圈：把工具结果发给模型，让它接着说
         else:
             # 情况 B：模型没要用工具，说明这一轮它说完了
             self._print_context_window_and_total_cost()  # 打印用量
             # No tool calls, wait for user input
             if self._task_depth > 0:  # 如果我是子 agent
-                return  # 活干完了，直接返回，把结论交给主 agent——不要再去问用户要输入
+                return False  # 【第 8 轮】活干完了，让外层 while 停下，把结论交给主 agent——不要再去问用户要输入
             user_input = await self._ui_manager.get_user_input()  # 主 agent 就等用户说下一句
             user_message = {
                 "role": "user",  # 用户说的
@@ -332,7 +367,7 @@ class Conversation:
                 ]
             }
             self.add_message(user_message)  # 存进历史
-            await self._recursive_message_handling()  # 递归：带着新问题再问模型
+            return True  # 【第 8 轮】交给外层 while 再转一圈：带着新问题再问模型
 
     def _print_context_window_and_total_cost(self):
         # 打印一行状态："上下文窗口用了 12.3%，一共花了 0.45 美元"
@@ -350,7 +385,10 @@ class Conversation:
             level = "info"
         cache_part = ""  # 【第 6 轮】有缓存命中就显示出来，方便判断缓存到底有没有生效
         if self._api_client.cached_tokens:
-            cache_part = f" {DOT} 缓存命中 {self._api_client.cached_tokens}"
+            # 【2026-11-06 第 8.2 轮】从"命中 8640 个 token"改成百分比。
+            #   原因：绝对数没有参照系，8640 可能是 20 万输入的 4%（很差），
+            #   也可能是 1 万输入的 86%（很好），用户每次都得自己心算。
+            cache_part = f" {DOT} 缓存命中 {self._api_client.cache_hit_rate:.0f}%"
         self._ui_manager.print_status(
             f"上下文 {used_text}% {DOT} 花费 ${self._api_client.total_cost}{cache_part}", level
         )
@@ -503,6 +541,25 @@ class Conversation:
         exclude = {"task"} if self.is_subagent else None  # 如果是子 agent，就排除 task 工具
         return await self._tool_manager.get_tools_description(exclude=exclude)  # 向工具管理器要清单
 
+    @staticmethod
+    def _needs_user_approval(tool_name: str, args: dict) -> bool:
+        """判断这次工具调用要不要弹确认（2026-11-06 第 8 轮新增）
+
+        原来这里写死 args.get('need_user_approve', True)：模型没写就一律要问。
+        第 8 轮新增 file_read / file_glob / file_grep 之后，如果读个文件
+        也要打断用户一次，几乎没法用。所以按三条规则判定：
+
+          1. 模型显式写了 need_user_approve → 听它的（兼容 cmd_runner 等老工具的写法）
+          2. 没写、且在只读工具清单里 → 不打断用户
+          3. 其余一律要问（安全优先）
+
+        这只是过渡：模型仍然可以自己把危险操作标成 false，
+        真正的白名单 / 黑名单 / 路径边界规则放到第 9 轮做。
+        """
+        if "need_user_approve" in args:  # 显式写了就按显式的值来
+            return bool(args["need_user_approve"])
+        return tool_name not in READ_ONLY_TOOLS  # 没写：只读工具免确认，其他都要问
+
     async def _handle_tool_calls(self, tool_calls):
         """Handle tool calls with user approval when needed.（逐个处理模型的工具申请）"""
         for i, tool_call in enumerate(tool_calls):  # 一个个处理，i 是序号
@@ -524,31 +581,48 @@ class Conversation:
                 continue  # 跳过这一个，处理下一个
 
             # Check if user approval is needed
-            # 【2026-11-06 优化】默认值从 False 改成 True（失败时更安全）
-            #   原来的逻辑：模型没写 need_user_approve 就当 False，直接执行。
-            #   问题是"要不要问用户"全凭模型自己说，它漏写或者故意写成 false，
-            #   危险命令就会静默跑掉。现在改成"没明确说就默认要问"。
-            #   注意这只是兜底，真正的权限规则（白名单/黑名单/路径边界）在后续优化里做。
-            need_user_approve = args.get('need_user_approve', True)
+            # 【2026-11-06 第 8 轮】改成集中判定（见 _needs_user_approval）：
+            #   第 1 轮把默认值从 False 改成 True，是"失败时更安全"的兜底；
+            #   但新增三个只读工具后，读个文件也弹确认会非常打扰。
+            #   现在按"只读 / 其他"分流，模型显式写的值仍然优先。
+            #   注意这只是过渡，完整的白名单/黑名单/路径边界规则在第 9 轮做。
+            need_user_approve = self._needs_user_approval(tool_call.function.name, args)
             should_execute = True  # 默认"要执行"（下面如果要问用户，会根据用户的回答改写它）
+            content = ""  # 用户拒绝时说的话（没有就是空串）
+
+            # 【2026-11-06 第 8.2 轮】先把"要干什么"画出来，再问"要不要干"。
+            #   改前是反过来的：先弹一段 "Tool: xxx, args: {...}"，用户点完同意，
+            #   下面才出现 ⏺ cmd_runner(dir) 那行。结果是同一个命令在屏幕上出现两次，
+            #   第一次还是一坨没排版的字典。现在头部只画一次，顺序也符合人的阅读习惯。
+            self._ui_manager.show_preparing_tool(tool_call.function.name, args)
 
             if need_user_approve:  # 如果模型说这个操作有风险、需要用户点头
-                approval_content = f"Tool: {tool_call.function.name}, args: {args}"  # 拼一句"我要干什么"给用户看
-                should_execute, content = await self._ui_manager.wait_for_user_approval(approval_content)
-                # 等用户回答，返回两个值：要不要执行、如果拒绝的话理由是什么
+                # 【第 8.2 轮】问题只问"是否执行"，参数已经在上面那行里了。
+                #   回车即同意；输入别的内容 = 拒绝 + 那句内容作为说明（见 interpret_approval）。
+                should_execute, content = await self._ui_manager.wait_for_user_approval()
 
             if should_execute:  # 用户同意（或本来就不需要问）
-                await self._execute_tool(tool_call, args, is_last_tool)  # 真正执行
+                # show_header=False：头部上面已经画过了，别再画一遍
+                await self._execute_tool(tool_call, args, is_last_tool, show_header=False)
             else:  # 用户拒绝了
+                # 【第 8.2 轮】补一行"已拒绝"，否则用户不知道自己那一下有没有生效
+                self._ui_manager.show_tool_denied(content)
                 self._add_tool_response(tool_call, f"用户拒绝执行这个工具。用户的说明：{content}", is_last_tool)
                 # 把"用户拒绝了，理由是..."当作工具结果告诉模型，让它换个做法
 
-    async def _execute_tool(self, tool_call, args, is_last_tool=False):
-        """Execute a tool call and handle the response.（执行一个工具，成功失败都要有回应）"""
+    async def _execute_tool(self, tool_call, args, is_last_tool=False, show_header=True):
+        """Execute a tool call and handle the response.（执行一个工具，成功失败都要有回应）
+
+        参数 show_header（2026-11-06 第 8.2 轮新增）：
+          False 表示"⏺ 工具名(参数) 这一行已经画过了"。
+          需要审批的调用会先画头再提问，所以进来时开关是关的；
+          只读工具直接进这里，开关还是开的，自己画。
+        """
         tool_args = {k: v for k, v in args.items() if k != 'need_user_approve'}
         # 上面这行是"过滤字典"：把 need_user_approve 这个标记去掉，
         # 因为它是给我们看的，不是给工具本身用的参数。用的是字典推导式。
-        self._ui_manager.show_preparing_tool(tool_call.function.name, tool_args)  # 显示"准备调用 xx 工具"
+        if show_header:  # 没画过才画，避免同一个调用出现两行头
+            self._ui_manager.show_preparing_tool(tool_call.function.name, tool_args)  # 显示"准备调用 xx 工具"
 
         try:  # 试：执行工具
             tool_response = await self._tool_manager.run_tool(tool_call.function.name, **tool_args)
@@ -658,6 +732,11 @@ class Conversation:
 # 3. 整个类是单例，子 agent 复用的是同一个对象，靠 _task_depth 和
 #    "消息历史翻页"来隔离。这样一次只能跑一个子 agent，没法并行。
 #
-# 4. 权限判断目前还是"模型说什么就是什么"（只是把默认值改成了要问）。
-#    真正的权限规则（命令白名单、危险命令黑名单、工作区路径边界）待后续优化。
+# 4. 【第 8 轮已部分处理】权限判断主要还是"模型说什么就是什么"，
+#    本轮只加了"只读工具免确认"的过渡规则（见 _needs_user_approval）。
+#    真正的权限规则（命令白名单、危险命令黑名单、工作区路径边界、
+#    以及"不再询问"的记忆）放在第 9 轮做。
+#
+# 5. 【第 8 轮已完成】主循环原来是递归，已改成 while + 单层迭代
+#    （_recursive_message_handling → _run_one_iteration），栈深度不再随轮数增长。
 # =============================================================================
