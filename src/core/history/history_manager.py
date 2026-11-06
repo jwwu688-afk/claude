@@ -211,8 +211,33 @@ class HistoryManager(BaseHistoryManager):
         # assert 是"断言"：条件不成立就直接抛错。这里确保至少有两页，否则说明逻辑出问题了
         task_messages = self.messages_history.pop()  # pop() 把最后一页整页撕下来，并拿到手
         self.history_token_usage.pop()  # 用量记录也撕掉
-        response = task_messages[-1]["content"]  # 取出这一页最后一条消息的内容（也就是子 agent 的最终答复）
+        if not task_messages:  # 【2026-11-06 优化】万一这一页是空的
+            return ""  # 返回空字符串，避免下面取最后一条时越界
+        response = self._content_to_text(task_messages[-1])  # 取出最后一条消息，并转成纯文本
         return response  # 返回给主 agent
+
+    def _content_to_text(self, message) -> str:
+        """把一条消息的 content 转换成纯文本（2026-11-06 新增）
+
+        为什么要这一步？
+          content 在消息里是"内容块列表"，长这样：
+              [{"type": "text", "text": "任务做完了，结论是……"}]
+          直接把它 return 出去，主 agent 收到的会是这段 Python 代码的字符串形式，
+          里面带着 {'type': 'text', ...} 这些噪音，既浪费 token 又干扰理解。
+          所以这里把里面的文字抽出来拼成一段干净的话。
+        """
+        content = message.get("content") if isinstance(message, dict) else getattr(message, "content", None)
+        # 上面这行：字典就按字典取，对象就按属性取（和 _role_of 一个道理）
+
+        if isinstance(content, str):  # 情况一：本来就是一段文字
+            return content
+        if isinstance(content, list):  # 情况二：是内容块列表（最常见）
+            texts = []  # 准备装每一块的文字
+            for block in content:  # 逐块检查
+                if isinstance(block, dict) and block.get("type") == "text":  # 只挑"文字"类型的块
+                    texts.append(block.get("text", ""))  # 把文字取出来
+            return "\n".join(texts)  # 用换行拼成一段
+        return "" if content is None else str(content)  # 其他情况：能转文字就转，什么都没有就返回空串
 
     def _requires_compression(self) -> bool:
         if self._compress_threshold and self.history_token_usage:  # 有阈值配置，也有用量记录
@@ -237,20 +262,33 @@ class HistoryManager(BaseHistoryManager):
             # delete_message_num is hardcode to 3 right now
             self._compress_single_session(current_messages, user_indices[0], 3)  # 就删掉紧跟在它后面的 3 条
 
+    @staticmethod
+    def _role_of(message) -> any:
+        """读取一条消息的 role，字典和对象两种写法都支持（2026-11-06 新增）
+
+        为什么需要这个函数？
+          历史记录里存的是"字典"，但单元测试里用的是"自定义对象"。
+          字典要写 msg["role"]，对象要写 msg.role，两者不能通用。
+          所以统一从这里取，谁都不用再关心传进来的是哪种形态。
+        """
+        if isinstance(message, dict):  # 如果是字典（真实运行时的形态）
+            return message.get("role")  # 用中括号取，取不到返回 None
+        return getattr(message, "role", None)  # 否则按对象取属性，取不到返回 None
+
     def _get_user_message_indices(self, messages: list) -> list[int]:
         """Get index positions of all user messages（找出所有用户消息的位置）"""
-        return [i for i, msg in enumerate(messages) if msg.role == Role.USER]
+        return [i for i, msg in enumerate(messages) if self._role_of(msg) == Role.USER]
         # 列表推导式：遍历每一条，如果是用户说的，就把它的位置 i 记下来
-        # ⚠️ 注意这里写的是 msg.role（当成对象取属性），但实际存进列表的是字典，
-        #    字典应该用 msg["role"]。所以一旦真的触发压缩，这一行会报错。
-        #    详见文件末尾的备注。
+        # 【2026-11-06 优化】原来写的是 msg.role，但真实消息是字典，会抛 AttributeError。
+        #    现在统一走 _role_of()，字典和对象两种形态都能读（细节见该方法）。
 
     def _compress_multiple_sessions(self, messages: list, user_indices: list[int]) -> None:
         """delete the oldest chat session（删掉最老的那一轮对话）"""
         second_oldest_user_index = user_indices[1]  # 找出"第二老"的那句用户消息的位置
 
-        system_messages = [msg for msg in messages[:second_oldest_user_index] if msg.role == Role.SYSTEM]
+        system_messages = [msg for msg in messages[:second_oldest_user_index] if self._role_of(msg) == Role.SYSTEM]
         # 从开头到"第二老"之前，把里面的系统消息挑出来（保住规则设定）
+        # 【2026-11-06 优化】同样把 msg.role 改成 _role_of(msg)
         recent_messages = messages[second_oldest_user_index:]  # 从"第二老"开始往后的全部内容（保住近期对话）
 
         self.messages_history[-1] = system_messages + self._create_compression_notice(messages) + recent_messages
@@ -258,7 +296,8 @@ class HistoryManager(BaseHistoryManager):
 
     def _compress_single_session(self, messages: list, user_index: int, delete_message_num: int) -> None:
         """delete assistant messages and tool message close to user input（删掉紧跟用户发言后的若干条）"""
-        system_messages = [msg for msg in messages[:user_index] if msg.role == Role.SYSTEM]  # 保住系统消息
+        system_messages = [msg for msg in messages[:user_index] if self._role_of(msg) == Role.SYSTEM]  # 保住系统消息
+        # 【2026-11-06 优化】同样把 msg.role 改成 _role_of(msg)
 
         start_index = min(user_index + 1 + delete_message_num, len(messages))
         # 计算"从第几条开始保留"：用户消息后面跳过 delete_message_num 条
@@ -273,24 +312,34 @@ class HistoryManager(BaseHistoryManager):
         if not messages:  # 如果消息列表是空的
             return []  # 就返回空列表，不用公告
 
-        message_class = type(messages[0])  # 看看现有消息是什么类型（这里是字典）
-        compression_notice = message_class(
-            # 用同样的类型造一条新消息，保持数据结构一致
-            role=Role.USER,  # 用"用户"身份说这句话，模型更容易接受
-            content="[Previous conversation history has been compressed to save context window space]"
-            # 内容就是告诉模型："之前的对话被压缩掉了，别问我细节"
-        )
+        # 【2026-11-06 优化】原来 content 直接写的是字符串，
+        #   而其他消息的 content 都是 [{"type": "text", "text": ...}] 这种"内容块列表"。
+        #   两种结构混在一起，任何按统一格式读 content 的代码（比如 _content_to_text）
+        #   都会出错。现在统一成内容块列表。
+        notice_text = "[Previous conversation history has been compressed to save context window space]"
+
+        first = messages[0]  # 看一眼现有消息是什么形态
+        if isinstance(first, dict):  # 真实运行时都是字典
+            compression_notice = {
+                "role": Role.USER,  # 用"用户"身份说这句话，模型更容易接受
+                "content": [{"type": "text", "text": notice_text}]  # 和其他消息结构保持一致
+            }
+        else:  # 少数情况（比如单元测试里用的是自定义对象）
+            compression_notice = type(first)(role=Role.USER, content=notice_text)
+            # 按同样的类型造一条，字段直接给字符串，这样那些按对象访问的代码也不会崩
         return [compression_notice]  # 包成列表返回
 
 # =============================================================================
 # 备注（这段代码里有两个需要注意的地方）
 #
-# 1. 属性访问的 bug：_get_user_message_indices 和 _compress_multiple_sessions、
-#    _compress_single_session 里都写了 msg.role，但 messages 里装的是字典，
-#    字典要用 msg["role"] 才对。所以一旦 token 超过 80% 触发压缩，
-#    程序会抛 AttributeError 直接崩掉。修法：把 msg.role 改成 msg["role"]。
+# 1. 【2026-11-06 已修复】属性访问的 bug：
+#    原来 _get_user_message_indices、_compress_multiple_sessions、
+#    _compress_single_session 里都写的是 msg.role，但真实消息是字典，
+#    所以 token 一超过 80% 触发压缩就会抛 AttributeError 崩掉。
+#    现在统一改用 _role_of() 读取，字典和对象两种形态都能用。
 #
-# 2. 压缩的策略很"暴力"：直接把旧消息删掉，只留一句"压缩过了"的公告。
+# 2. 压缩的策略仍然很"暴力"：直接把旧消息删掉，只留一句"压缩过了"的公告。
 #    模型因此会真的忘记之前聊了什么。更温柔的做法是：
 #    让一个小模型把旧对话总结成一段摘要，再用摘要替换原文。
+#    （这条留到第 2 轮优化，涉及"摘要式压缩"）
 # =============================================================================

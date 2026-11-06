@@ -18,7 +18,6 @@ Conversation management with refactored UI components and history manager integr
 """
 
 import json  # json 库：把模型给的"参数字符串"解析成真正的 Python 字典
-import sys  # sys 库：这里只用到 sys.exit() 来强行结束程序
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
 from core.api_client import APIClient  # 导入 API 客户端：真正发请求给大模型的家伙
 from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器：负责生成"系统提示词"
@@ -148,9 +147,26 @@ class Conversation:
             self._ui_manager.print_error(f"System error occurred during running task: {e}")  # 报错
             traceback.print_exc()  # 打印现场
             self._task_depth -= 1  # 深度 -1，把计数器还原
-            sys.exit(1)  # 直接结束整个程序（这是个比较粗暴的处理方式，见文末备注）
+            self._discard_current_chat()  # 【2026-11-06 优化】把出错的那一页消息丢掉
+            # 【2026-11-06 优化】原来是 sys.exit(1)，直接把整个程序干掉：
+            #   子 agent 只要有一个工具抛异常，你的 CLI 就退出、主对话上下文全丢。
+            #   现在改成"把错误当成子任务的结果交回去"，主 agent 可以自己决定换个做法。
+            return f"Task failed: {e}"  # 返回失败说明，让主 agent 看到并自行补救
         self._task_depth -= 1  # 正常结束时也要把深度还原
         return self._history_manager.finish_chat_get_response()  # 收起这一页，把最后一条回复返回给主 agent
+
+    def _discard_current_chat(self):
+        """丢掉当前这一页消息，并且保证历史栈不会错位（2026-11-06 新增）
+
+        背景：start_task 会"翻到新的一页"写子 agent 的对话，
+        正常结束时会用 finish_chat_get_response() 把这一页收掉。
+        但如果中途出错提前返回，这一页就留在栈上了——
+        下次再开子任务时，"当前页"会指错位置，整个对话就乱套了。
+        """
+        if len(self._history_manager.messages_history) >= 2:  # 至少有两页，说明确实有一页待收
+            self._history_manager.messages_history.pop()  # 把这一页撕掉
+            if self._history_manager.history_token_usage:  # 用量记录也跟着删一条，保持两边对齐
+                self._history_manager.history_token_usage.pop()
 
     async def _recursive_message_handling(self):
         """
@@ -332,8 +348,13 @@ class Conversation:
                 continue  # 跳过这一个，处理下一个
 
             # Check if user approval is needed
-            need_user_approve = args.get('need_user_approve', False)  # 问参数里有没有"需要用户同意"这个标记
-            should_execute = True  # 默认"要执行"
+            # 【2026-11-06 优化】默认值从 False 改成 True（失败时更安全）
+            #   原来的逻辑：模型没写 need_user_approve 就当 False，直接执行。
+            #   问题是"要不要问用户"全凭模型自己说，它漏写或者故意写成 false，
+            #   危险命令就会静默跑掉。现在改成"没明确说就默认要问"。
+            #   注意这只是兜底，真正的权限规则（白名单/黑名单/路径边界）在后续优化里做。
+            need_user_approve = args.get('need_user_approve', True)
+            should_execute = True  # 默认"要执行"（下面如果要问用户，会根据用户的回答改写它）
 
             if need_user_approve:  # 如果模型说这个操作有风险、需要用户点头
                 approval_content = f"Tool: {tool_call.function.name}, args: {args}"  # 拼一句"我要干什么"给用户看
@@ -420,9 +441,9 @@ class Conversation:
 # =============================================================================
 # 备注（读代码时可以先跳过，了解大概后回来看）：
 #
-# 1. start_task 出错时用 sys.exit(1) 直接把整个程序干掉。
-#    也就是说：子 agent 干活时只要有一个工具抛异常，你的 CLI 就直接退出，
-#    主对话的上下文全丢。更合理的做法是：把错误当作子任务的返回值交回去。
+# 1. 【2026-11-06 已修复】start_task 出错时原来用 sys.exit(1) 把整个程序干掉。
+#    现在改成返回 "Task failed: ..." 交给主 agent，同时用 _discard_current_chat()
+#    把出错的那一页消息收掉，避免历史栈错位。
 #
 # 2. _get_messages_with_cache_mark 只给"最后一条消息"打缓存标记。
 #    但最后一条每轮都在变，所以实际上很难命中缓存。
@@ -430,4 +451,7 @@ class Conversation:
 #
 # 3. 整个类是单例，子 agent 复用的是同一个对象，靠 _task_depth 和
 #    "消息历史翻页"来隔离。这样一次只能跑一个子 agent，没法并行。
+#
+# 4. 权限判断目前还是"模型说什么就是什么"（只是把默认值改成了要问）。
+#    真正的权限规则（命令白名单、危险命令黑名单、工作区路径边界）待后续优化。
 # =============================================================================

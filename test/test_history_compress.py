@@ -12,6 +12,12 @@
 #   而真实的对话流程存的是"字典"（要用 ["role"] 取值）。
 #   因为测试用了类，所以测试能过；但真实运行时一压缩就会 AttributeError 崩掉。
 #   也就是说：这个测试给了人"压缩功能正常"的错觉。
+#
+# 【2026-11-06 优化后的状态】
+#   1. history_manager 已改成 _role_of() 统一读取，字典和对象都能用，
+#      所以"真实运行时崩溃"的问题已经修掉（见优化文档第 1 轮）。
+#   2. 本文件原来因为单例状态串味，跑起来必然失败；
+#      现在每个用例都通过 fresh_manager() 拿全新实例，可以独立运行了。
 # =============================================================================
 
 import sys  # 改模块搜索路径
@@ -30,17 +36,30 @@ from core.history.history_manager import HistoryManager, TokenUsage, Role  # 导
 @dataclass
 class MockMessage:
     # 一个"假消息"类：只有角色和内容两个字段
-    # 注意：真实代码里存的是字典，这里用类是为了方便（但这也掩盖了 bug，见文件开头说明）
+    # 注意：真实代码里存的是字典，这里用类是为了方便（history_manager 里已兼容两种形态）
     role: Role  # 谁说的
     content: str  # 说了什么
+
+
+def fresh_manager(model_max_tokens=100, compress_threshold=0.8):
+    """每个用例都拿一个全新的管理器（2026-11-06 新增）
+
+    为什么要重置？
+      HistoryManager 是单例，整个进程只有一个。
+      如果不在用例之间重置，上一个用例塞进去的消息会留到下一个用例里，
+      导致条数、用户消息数量全部对不上，测试就会莫名其妙地失败。
+      （本文件原来就有这个毛病，跑起来必然挂掉。）
+    """
+    HistoryManager._instance = None  # 丢掉旧实例
+    HistoryManager._initialized = False  # 清掉初始化标记，逼它重新初始化
+    return HistoryManager(model_max_tokens=model_max_tokens, compress_threshold=compress_threshold)
 
 
 def test_auto_compression_not_triggered():
     """测试当不满足压缩条件时，不会触发压缩"""
     print("测试: 不满足压缩条件时不触发压缩")
 
-    manager = HistoryManager(model_max_tokens=100, compress_threshold=0.8)  # 造一个管理器
-    # 注意：单例——如果前面已经造过，这里返回的是同一个，参数会被忽略
+    manager = fresh_manager(model_max_tokens=100)  # 换成"全新管理器"（原来直接 new，会带上上个用例的数据）
 
     # 添加一些消息
     manager.add_message(MockMessage(Role.SYSTEM, "You are a helpful assistant"))  # 系统消息
@@ -73,7 +92,7 @@ def test_auto_compression_multiple_sessions():
     """测试多会话压缩（用户说过好几轮时，删最老的那一轮）"""
     print("\n测试: 多会话压缩")
 
-    manager = HistoryManager(model_max_tokens=10, compress_threshold=0.8)  # 上限故意设很小
+    manager = fresh_manager(model_max_tokens=10, compress_threshold=0.8)  # 上限故意设很小
 
     # 添加系统消息
     manager.add_message(MockMessage(Role.SYSTEM, "You are a helpful assistant"))
@@ -132,7 +151,7 @@ def test_auto_compression_single_session():
     """测试单会话压缩（只有一轮对话时，只删紧跟用户发言后的几条）"""
     print("\n测试: 单会话压缩")
 
-    manager = HistoryManager(model_max_tokens=10, compress_threshold=0.8)
+    manager = fresh_manager(model_max_tokens=10, compress_threshold=0.8)
 
     # 添加系统消息
     manager.add_message(MockMessage(Role.SYSTEM, "You are a helpful assistant"))
@@ -180,7 +199,7 @@ def test_token_usage_update():
     """测试token使用量更新（记账是否正确）"""
     print("\n测试: Token使用量更新")
 
-    manager = HistoryManager(model_max_tokens=100)  # 造管理器
+    manager = fresh_manager(model_max_tokens=100)  # 造一个全新的管理器
 
     # 模拟token使用量对象（类似OpenAI的返回）
     class MockTokenUsage:
@@ -205,7 +224,7 @@ def test_requires_compression_logic():
     """测试压缩条件判断逻辑（什么时候该压、什么时候不该压）"""
     print("\n测试: 压缩条件判断")
 
-    manager = HistoryManager(model_max_tokens=100, compress_threshold=0.8)
+    manager = fresh_manager(model_max_tokens=100, compress_threshold=0.8)
 
     # 没有token使用记录时
     assert not manager._requires_compression()  # 还没用过，当然不用压

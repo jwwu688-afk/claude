@@ -50,11 +50,16 @@ class ToolManager:
         # 这个方法是后台跑的：连上所有 MCP 服务器，把它们提供的工具都登记进来
         sessions = await self._mcp_client.get_sessions()  # 等所有服务器连接完成，拿到会话列表
         for session in sessions:  # 一个个服务器
-            response = await session.list_tools()  # 问它："你都有什么工具？"
-            tools = response.tools  # 拿到工具清单
-            for tool in tools:  # 遍历每一个工具
-                mcp_tool = McpTool(tool, session)  # 包装成我们内部能用的工具对象
-                self._register_tool(tool.name, mcp_tool)  # 用工具原名登记
+            try:  # 【2026-11-06 优化】单个服务器"问工具清单"失败时不要连累其他服务器
+                #   比如某个服务器启动成功但 list_tools 报错，
+                #   原来会直接抛出异常，导致整个工具清单都拿不到。
+                response = await session.list_tools()  # 问它："你都有什么工具？"
+                tools = response.tools  # 拿到工具清单
+                for tool in tools:  # 遍历每一个工具
+                    mcp_tool = McpTool(tool, session)  # 包装成我们内部能用的工具对象
+                    self._register_tool(tool.name, mcp_tool)  # 用工具原名登记
+            except Exception as e:  # 这个服务器出问题了
+                print(f"[MCP] 获取工具列表失败：{e}（已跳过该服务器）")
 
     def _register_tool(self, name, tool_instance):
         self.tools[name] = tool_instance  # 就是往字典里塞一条

@@ -51,45 +51,59 @@ class MCPClient:
     async def connect_to_server(self):
         """Connect to all MCP servers（连接配置文件里列出的所有服务器）"""
         mcp_servers = self.config.list_servers()  # 拿到所有服务器名字的列表
+        if not mcp_servers:  # 【2026-11-06 优化】没有配置任何服务器
+            return  # 直接返回，连日志都不用打（配置缺失的情况已经在 server_config 里提示过了）
 
         for name in mcp_servers:  # 一个个连
             server = self.config.get_server(name)  # 按名字取出这个服务器的配置
+            if server is None:  # 【2026-11-06 优化】理论上不会发生，但防一手
+                continue  # 跳过
 
-            server_params = StdioServerParameters(
-                # 把配置包装成 MCP 库要求的格式
-                command=server.command,  # 用哪个程序来启动它（比如 D:\Anaconda\envs\claude\python.exe）
-                args=server.args,  # 启动参数（比如要运行哪个 .py 文件）
-                env=None  # 环境变量：None 表示直接继承当前程序的环境变量
-            )
+            try:  # 【2026-11-06 优化】每个服务器单独 try：
+                #   原来只要有一个服务器启动失败（路径写错、依赖没装），
+                #   异常会一路抛到 get_sessions()，导致所有外部工具都用不了，
+                #   甚至让程序启动阶段就报错。现在改成"坏的跳过，好的继续"。
+                server_params = StdioServerParameters(
+                    # 把配置包装成 MCP 库要求的格式
+                    command=server.command,  # 用哪个程序来启动它（比如 D:\Anaconda\envs\claude\python.exe）
+                    args=server.args,  # 启动参数（比如要运行哪个 .py 文件）
+                    env=None  # 环境变量：None 表示直接继承当前程序的环境变量
+                )
 
-            stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
-            # 上面这行做两件事：
-            #   1. 真的去启动那个外部程序，并建立输入输出通道
-            #   2. 把这个通道登记到资源栈里，以后统一关闭
-            # stdio, write 是通道的两端：一个用来读，一个用来写
-            stdio, write = stdio_transport  # 把返回的两个对象分别取出来
-            session = await self.exit_stack.enter_async_context(ClientSession(stdio, write))
-            # 在通道上建立一个"会话"，同样登记到资源栈
+                stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+                # 上面这行做两件事：
+                #   1. 真的去启动那个外部程序，并建立输入输出通道
+                #   2. 把这个通道登记到资源栈里，以后统一关闭
+                # stdio, write 是通道的两端：一个用来读，一个用来写
+                stdio, write = stdio_transport  # 把返回的两个对象分别取出来
+                session = await self.exit_stack.enter_async_context(ClientSession(stdio, write))
+                # 在通道上建立一个"会话"，同样登记到资源栈
 
-            await session.initialize()  # 握手：双方交换版本和能力信息（必须做，不然对方不认你）
-            self.sessions.append(session)  # 把这条会话存起来备用
+                await session.initialize()  # 握手：双方交换版本和能力信息（必须做，不然对方不认你）
+                self.sessions.append(session)  # 把这条会话存起来备用
+            except Exception as e:  # 这个服务器连接失败
+                print(f"[MCP] 连接服务器 '{name}' 失败：{e}（已跳过，其他工具不受影响）")
+                # 打印原因后继续下一个，不中断整体流程
 
     async def get_sessions(self) -> list[ClientSession]:
         await self.connect_server_task  # 等后台那个连接任务全部完成
         return self.sessions  # 把所有会话交出去
 
 # =============================================================================
-# 备注（这段代码的几个隐患，了解即可）
+# 备注（这段代码的几个隐患，以及本轮处理情况）
 #
-# 1. 配置文件不存在就崩：MCPConfig 找不到 ~/.quickstar/mcp.json 时会抛 FileNotFoundError，
-#    而这个对象是在 ToolsManager 创建时就 new 出来的，所以整个 CLI 会起不来。
-#    更合理的做法：文件不存在就当"没有外部工具"，安静跳过。
+# 1. 【2026-11-06 已修复】配置文件不存在就崩：
+#    原来 MCPConfig 找不到 ~/.quickstar/mcp.json 时会抛 FileNotFoundError，
+#    而这个对象在 ToolsManager 创建时就 new 出来，导致整个 CLI 起不来。
+#    现在改为"打印提示 + 跳过外部工具"，内置工具照常可用。
 #
-# 2. 一个服务器出错会连累全部：for 循环里没有任何 try，
-#    只要有一个服务器启动失败，后面的都不会连，而且异常会一路抛到 get_sessions。
+# 2. 【2026-11-06 已修复】一个服务器出错会连累全部：
+#    现在 for 循环里给每个服务器单独套了 try，坏的跳过、好的继续。
 #
 # 3. 退出时不清理：exit_stack 从头到尾没有被 aclose()，
 #    所以程序结束时那些外部服务器进程可能会变成"孤儿进程"留在后台。
+#    这块留到第 2 轮优化（要在同一个事件循环任务里关闭，否则会报
+#    "Attempted to exit cancel scope in a different task"）。
 #
 # 4. 只支持 stdio：HTTP / SSE 类型的服务器在 server_config 里被直接跳过了。
 # =============================================================================
