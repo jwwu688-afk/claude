@@ -4,9 +4,13 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "thinker"
-version = "0.2.0"
+version = "0.2.1"
 description = "Thinker - a terminal coding agent"
-requires-python = ">=3.8"
+# 【2026-11-07 第 13.1 轮】下限从 3.8 改成 3.9。
+#   代码里已经用了 `tuple[bool, str]`、`list[ClientSession]` 这类内置泛型注解，
+#   它们在 3.8 上会在模块导入时求值失败（TypeError: 'type' object is not subscriptable）。
+#   声明一个跑不起来的下限，比不声明更坑人——照着装的人会以为是自己环境坏了。
+requires-python = ">=3.9"
 dependencies = [
     "openai",
     "python-dotenv",

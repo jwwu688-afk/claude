@@ -155,6 +155,17 @@ class MCPClient:
         #   因为那个任务现在会一直挂着待命，等它"结束"就等于死等。
         return self.sessions  # 把所有会话交出去
 
+    @property
+    def is_closing(self) -> bool:
+        """是否已经在收尾（2026-11-07 第 13.1 轮新增）
+
+        为什么需要它：退出时后台任务是被"取消"的，此时还没干完的 list_tools
+        会抛一个消息为空的异常。调用方分不清"真出错了"和"正在关闭"，
+        就会在退出瞬间打印一行看着像故障的提示。
+        把判断依据放在这里，调用方只需要问一句"现在是不是在关"。
+        """
+        return self._closed or self._shutdown.is_set()
+
     async def aclose(self):
         """主动关闭所有 MCP 连接（2026-11-06 新增）
 

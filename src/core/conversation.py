@@ -190,7 +190,20 @@ class Conversation:
             # 系统提示词用新生成的替换旧的：里面的日期、目录、项目记忆可能是几天前的，
             # 照搬会让模型拿着过期信息干活。user / assistant / tool 消息原样保留。
             self._history_manager.messages_history[-1] = [system_message] + restored
-            self._ui_manager.print_info(f"已恢复上次会话：{len(restored)} 条消息")
+
+            # 【2026-11-07 第 13.1 轮】恢复完必须补一次用量估算。
+            #   改前这里只换了消息列表，没碰 history_token_usage——
+            #   它还是空的，而 _requires_compression() 看到空账本就返回 False，
+            #   于是恢复一个已经用到 80% 的长会话时，第一次请求会把整份历史原样发出去，
+            #   大概率 400（context_length_exceeded）。
+            #   注意 system_message 也要算进去：它是最大的一块固定开销。
+            estimated_tokens = self._history_manager.seed_usage_from_messages(
+                [system_message] + restored
+            )
+            self._ui_manager.print_info(
+                f"已恢复上次会话：{len(restored)} 条消息"
+                f"（按字符估算上下文约 {estimated_tokens:,} token）"
+            )
         else:
             self._session = SessionStore.create(
                 cwd=os.getcwd(),

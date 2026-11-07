@@ -81,7 +81,14 @@ class ToolManager:
                     mcp_tool = McpTool(tool, session)  # 包装成我们内部能用的工具对象
                     self._register_tool(tool.name, mcp_tool)  # 用工具原名登记
             except Exception as e:  # 这个服务器出问题了
-                print(f"[MCP] 获取工具列表失败：{e}（已跳过该服务器）")
+                # 【2026-11-07 第 13.1 轮】退出瞬间的失败不是失败。
+                #   程序收尾时后台任务被取消，没跑完的 list_tools 会抛一个 str 为空的异常，
+                #   原来会打印成"[MCP] 获取工具列表失败：（已跳过该服务器）"——
+                #   冒号后面什么都没有，看起来像故障，实际只是正在退出。
+                #   真正的失败也补上异常类型：原来只有 {e}，遇到空消息就完全没线索。
+                if self._mcp_client.is_closing:
+                    return
+                print(f"[MCP] 获取工具列表失败：{type(e).__name__}: {e}（已跳过该服务器）")
 
     def _register_tool(self, name, tool_instance):
         self.tools[name] = tool_instance  # 就是往字典里塞一条
@@ -105,19 +112,35 @@ class ToolManager:
             descriptions.append(tool_instance.json_schema())  # 取它的"自我介绍"，加进清单
         return descriptions  # 返回清单
 
-    # TODO：Array out of bounds should directly throw exception again
-    # ↑ 原作者的待办：这里不该把异常吃掉，应该直接抛出去（见下面）
     async def run_tool(self, tool_name, **kwargs):
-        # 执行工具。**kwargs 表示"可以接收任意多个命名参数"，会打包成一个字典
+        """执行一个工具，出错直接往上抛（2026-11-07 第 13.1 轮）
+
+        【改前】这里套了一层 try/except，把任何异常都转成一句
+        "运行工具 'xxx' 时出错：……" 返回。看着"更稳"，实际有三个问题：
+
+          1. 调用方 `Conversation._execute_tool` 自己也有一层 try/except，
+             但异常在这里就被吞掉了，那一层永远走不到 —— 它写好的失败分支是死代码。
+          2. **界面永远显示成功**：`_execute_tool` 只有进了 except 才会传
+             `success=False`，所以哪怕工具炸了，用户看到的仍是绿色的成功结果。
+          3. 模型拿到的只有一句"出错"，没有异常类型，很难判断该换参数还是换工具。
+
+        这个项目是教学向的，"工具失败 = 给模型一条失败消息"是主线之一
+        （见 `Conversation._execute_tool` 的注释），而这层吞异常恰好把主线掩盖了。
+
+        【改后】这里只负责"找工具 → 调用"，不负责兜错：
+          - 异常交给 `Conversation._execute_tool` 统一处理，
+            它会同时做两件事：界面标红 + 把失败原因写进历史让模型自我纠正；
+          - 找不到工具抛 KeyError 而不是返回一句中文，理由同上——
+            调用方需要知道"这是失败"，而不是拿到一句长得像正常结果的话。
+
+        **kwargs 表示"可以接收任意多个命名参数"，会打包成一个字典传下去。
+        """
         tool = self.tools.get(tool_name)  # 按名字找工具，找不到返回 None
-        try:  # 试
-            if tool:  # 如果找到了
-                return await tool.act(**kwargs)  # 把参数拆开交给它，等它干完返回结果
-        except Exception as e:  # 如果工具内部抛错
-            return f"运行工具 '{tool_name}' 时出错：{str(e)}"
-            # 注意：这里把错误"吞"成了字符串返回，没有继续往上抛。
-            # 好处是程序不会崩，坏处是上层再也没法通过异常知道出事了。
-        return "找不到这个工具。"  # 走到这儿说明工具没找到
+        if tool is None:  # 找不到就直接抛，不再伪装成"正常结果"
+            available = "、".join(sorted(self.tools)) or "（无）"
+            # 把可用清单带回给模型：它下次就会照着清单挑，而不是继续猜名字
+            raise KeyError(f"找不到工具 '{tool_name}'。当前可用：{available}")
+        return await tool.act(**kwargs)  # 把参数拆开交给它，等它干完返回结果
 
     def get_tool_status(self, tool_name):
         # 查某个工具的"状态"（目前只有 todo_write 用得上，用来生成提醒文字）

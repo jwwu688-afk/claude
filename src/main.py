@@ -34,7 +34,7 @@ from rich.text import Text  # 富文本：可以给一段文字的不同部分�
 # 为什么要放这里：改完代码后如果用户没重新启动进程，看到的还是旧界面，
 # 容易反复"改了没效果"。标题带版本号，一眼就能确认当前跑的是哪一份代码。
 # 改界面时顺手升一位（与 pyproject.toml 的 version 保持一致）。
-VERSION = "0.2.0"
+VERSION = "0.2.1"
 
 
 def _readable_dir(path: str) -> str:

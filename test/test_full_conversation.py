@@ -25,6 +25,14 @@ current_dir = os.path.dirname(os.path.abspath(__file__))  # 拿到当前文件�
 src_path = os.path.join(current_dir, '../src')  # 拼出 ../src 这个目录
 sys.path.insert(0, src_path)  # 把它插到搜索路径最前面
 
+# 【2026-11-07 第 13.1 轮】构造 Conversation 会顺带构造 APIClient，
+# 而 APIClient 要求三个环境变量齐全，缺一个就抛 ValueError。
+# 这里用 setdefault 给一份假配置：不覆盖 .env 或系统里已有的真实值，
+# 而且本测试全程不发网络请求（只检查方法存在 + 本地流式打印）。
+os.environ.setdefault("OPENAI_API_KEY", "test-key-for-unit-test")
+os.environ.setdefault("OPENAI_BASE_URL", "http://127.0.0.1:1/v1")
+os.environ.setdefault("OPENAI_MODEL", "test-model")
+
 from core.conversation import Conversation  # 导入对话总管
 
 
@@ -32,17 +40,18 @@ async def test_conversation_integration():
     """Test that conversation class can handle streaming properly（检查对话类能不能处理流式输出）"""
     print("🧪 Testing conversation streaming integration...")  # 打印"开始测试"
 
+    conv = None  # 【第 13.1 轮】提前声明：finally 里要用它，而 Conversation() 自己也可能抛错
     try:  # 整体包一层 try，出错就打印原因并返回 False
         conv = Conversation()  # 创建对话总管（单例，全程序一个）
 
         # Test the streaming message handling directly
-        conv.messages = [
-            {"role": "system", "content": "你是一个乐于助人的助手。"},  # 系统设定
-            {"role": "user", "content": "简短地跟我打个招呼"}  # 用户请求
-        ]
-        # ⚠️ 这一行其实会报错：messages 在 Conversation 里是个只读属性（@property），
-        #    不能直接赋值。所以这个测试跑起来会直接跳到 except 分支。
-        #    要改的话，得通过 _history_manager.add_message() 往里面加消息。
+        # 【2026-11-07 第 13.1 轮】改成通过 add_message 往里加。
+        #   原来写的是 `conv.messages = [...]`，但 messages 是只读 property
+        #   （内部返回 get_current_messages() 的深拷贝，就是为了防止外部直接改），
+        #   赋值必然抛 AttributeError，所以这个冒烟测试从来没跑通过——
+        #   报的还是一个"can't set attribute"，看着像环境问题，实际是测试自己写错。
+        conv.add_message({"role": "system", "content": "你是一个乐于助人的助手。"})  # 系统设定
+        conv.add_message({"role": "user", "content": "简短地跟我打个招呼"})  # 用户请求
 
         print("📡 Testing recursive_message_handling with streaming...")  # 打印进度
 
@@ -88,6 +97,20 @@ async def test_conversation_integration():
         import traceback  # 这里才导入 traceback（一般应该放文件开头）
         traceback.print_exc()  # 打印完整的出错现场
         return False
+
+    finally:
+        # 【2026-11-07 第 13.1 轮】把 MCP 后台任务收掉。
+        #   构造 Conversation 会顺带建 ToolManager → MCPClient，后者起了一个
+        #   "连接 → 待命 → 关闭"的后台任务。不收尾的话，asyncio.run 结束时
+        #   它是被"从外部取消"的，anyio 会在另一个任务里关闭 cancel scope，于是打印：
+        #     RuntimeError: Attempted to exit cancel scope in a different task than it was entered in
+        #   测试结果是过了，但屏幕上那段红字会被当成真的失败。
+        #   main.py 里的 `finally: await conversation.shutdown()` 解决的是同一件事。
+        if conv is not None and hasattr(conv, "shutdown"):
+            try:
+                await conv.shutdown()
+            except Exception:  # 收尾失败不该改变测试结论
+                pass
 
 
 if __name__ == "__main__":

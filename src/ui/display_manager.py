@@ -62,6 +62,12 @@ class DisplayManager:
         self._spinner_thread = None  # 【第 10 轮】spinner 线程
         self._body_cache_key = None  # 【第 10 轮】正文渲染缓存：上次渲染时的 buffer 内容
         self._body_cache_value = None  # 【第 10 轮】正文渲染缓存：对应的 renderable
+        # 【2026-11-07 第 13.1 轮】这两个属性原来只在 start_stream_display 里赋值，
+        #   于是"没走 start 就直接喂内容"的调用方（脚本、测试、或将来新增的调用点）
+        #   会在 print_streaming_content 里撞 AttributeError: '_stream_mode'。
+        #   默认值取 plain + 未开始，让这类调用退化成"逐段打印"，而不是直接崩。
+        self._stream_mode: str = "plain"  # plain = 追加式打印（默认）；live = rich Live
+        self._body_started: bool = False  # plain 模式下正文是否已开始（● 是否已打印）
 
     # -------------------------------------------------------------------------
     # 一、消息类
@@ -483,7 +489,11 @@ class DisplayManager:
         #   但正文开始后，空白 chunk（比如段落间的 '\n\n'）必须照写不误——
         #   否则段落之间的空行被吞掉，两段话会粘在同一行上。
         if chunk and chunk.strip() and not self._stream_has_content:
-            self._thought_seconds = time.time() - self._stream_start
+            # 【2026-11-07 第 13.1 轮】_stream_start 为 0 表示没走过 start_stream_display。
+            #   此时算"想了多久"没有基准，会得出一个几十亿秒的荒唐数字，
+            #   所以只在这种"临时打印"场景下跳过计时，其余逻辑照旧。
+            if self._stream_start:
+                self._thought_seconds = time.time() - self._stream_start
             self._stream_has_content = True
             self._stop_spinner()  # 先把 spinner 那行擦掉，否则它会和正文抢同一行
             self._console.print()  # 回复块和上面的输入区之间留一个空行

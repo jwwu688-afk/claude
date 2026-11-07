@@ -18,9 +18,6 @@ from abc import ABC, abstractmethod  # 导入"抽象基类"工具：用来定义
 import copy  # copy 库：用来做"深拷贝"，复制一份互不影响的数据
 from dataclasses import dataclass  # dataclass 装饰器：让"只装数据的类"写起来更省事
 import os  # os 库：读环境变量
-from pyexpat.errors import messages
-# ↑ 这行是原作者手滑多导入的（pyexpat 是解析 XML 用的库），代码里根本没用它。
-#   不影响运行，但属于可以删掉的垃圾行。保留在这里是为了跟原版保持一致。
 from typing import Any  # 【第 9 轮】类型标注：原来自定义函数写成 -> any（内置函数 any），是错的
 from dotenv import load_dotenv  # 导入用于读取 .env 文件的函数
 from ui.ui_manager import UIManager  # 导入界面管理器：压缩时要给用户提示一句
@@ -37,9 +34,6 @@ class TokenUsage:
     input_tokens: int  # 输入用了多少（你发给模型的字）
     output_tokens: int  # 输出用了多少（模型回给你的字）
     total_tokens: int  # 一共用了多少
-
-
-from enum import Enum  # 又导入了一次 Enum（重复导入，无害，也是可以删的垃圾行）
 
 
 class Role(str, Enum):
@@ -112,6 +106,82 @@ def _tool_calls(message) -> list:
     """
     value = message.get("tool_calls") if isinstance(message, dict) else getattr(message, "tool_calls", None)
     return list(value) if value else []
+
+
+# -----------------------------------------------------------------------------
+# 【2026-11-07 第 13.1 轮新增】恢复会话时用的"用量估算"
+#
+# 为什么需要估算，而不是等接口返回真实值？
+#   `--continue` 恢复时只把消息列表换掉，用量账本 history_token_usage 还是空的；
+#   而 _requires_compression() 看的是账本最后一条，空账本 → 直接返回 False。
+#   于是"恢复一个已经用到 80% 的会话"会原封不动把整份历史发出去，
+#   大概率 400（context_length_exceeded）——而"崩溃后接着聊"正是第 13 轮的目标。
+#   精确值只有发完请求才知道，可压缩判断必须发生在发请求之前，所以只能估：
+#   它只需要回答"大概在不在阈值附近"，不需要精确到个位。
+# -----------------------------------------------------------------------------
+
+def estimate_tokens(text: str) -> int:
+    """按字符粗估一段文字的 token 数（2026-11-07 第 13.1 轮）
+
+    口径（经验值，宁可略高）：
+      中文 / 中文标点 / 全角符号   1 字 ≈ 1 token
+      ASCII、代码、命令输出        约 3.5 字符 ≈ 1 token，即 0.28 token/字符
+
+    为什么分两段算，而不是统一乘一个系数：
+      这个项目的上下文里既有中文注释，又有大段代码和命令输出。
+      统一按 0.5 算的话，纯中文会低估一半（可能撞 400），
+      纯代码会高估一倍（白白多压一次）。分开算只多一个循环，误差立刻收敛。
+
+    为什么"宁可略高"：
+      估高了最多多触发一次压缩，代价是一次摘要调用的钱；
+      估低了会撞 context_length_exceeded，整轮对话直接结束。两者代价不对等。
+    """
+    if not text:
+        return 0
+    cjk = 0
+    for ch in text:
+        code = ord(ch)
+        # CJK 统一表意文字 + 中文标点 + 全角符号。中文文本里这三段几乎覆盖全部，
+        # 用三个区间判断比引入 unicodedata 查表快得多，也不需要额外依赖。
+        if 0x4E00 <= code <= 0x9FFF or 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF:
+            cjk += 1
+    ascii_like = len(text) - cjk
+    return int(cjk + ascii_like * 0.28) + 1  # +1 防止极短文本被估成 0
+
+
+def _tool_call_arguments(call) -> str:
+    """取出一次工具申请的参数字符串（字典和对象两种形态都支持）
+
+    为什么单独抽出来：历史里 assistant 的 tool_calls 从 JSONL 读回来是字典，
+    而运行时（直接来自 SDK）是对象。两种都得能读，否则估算会漏掉最大的一块。
+    """
+    function = call.get("function") if isinstance(call, dict) else getattr(call, "function", None)
+    if function is None:
+        return ""
+    arguments = function.get("arguments") if isinstance(function, dict) else getattr(function, "arguments", "")
+    return arguments or ""
+
+
+def estimate_messages_tokens(messages: list) -> int:
+    """估一整段消息列表的 token 数（2026-11-07 第 13.1 轮）
+
+    除了正文，还要算两样容易被漏掉的东西：
+
+      1. tool_calls 的参数。一次 file_edit 的 new_string 可能有几千字符，
+         它不在 content 里。只算 content 会严重低估——而"改文件的会话"
+         恰恰是最容易撑爆上下文的那类。
+      2. 每条消息的固定开销。role、分隔符、结构包装都要占 token，
+         按 4 token/条算（OpenAI 文档给的数量级），几十条消息加起来也有几百。
+
+    空消息列表返回 0，调用方据此跳过记账。
+    """
+    total = 0
+    for message in messages:
+        total += 4  # 每条消息的格式开销
+        total += estimate_tokens(message_text(message))  # 正文（含内容块列表）
+        for call in _tool_calls(message):  # 工具申请的参数
+            total += estimate_tokens(_tool_call_arguments(call))
+    return total
 
 
 def _owner_index(messages: list, index: int) -> int:
@@ -267,6 +337,42 @@ class HistoryManager(BaseHistoryManager):
         由 Conversation 在启动时注入；不注入则压缩时直接丢弃旧消息。
         """
         self._summarizer = summarizer
+
+    def seed_usage_from_messages(self, messages: list) -> int:
+        """把恢复回来的历史折算成一条用量记录（2026-11-07 第 13.1 轮新增）
+
+        什么时候调：`Conversation.start_conversation` 走 resume 分支、
+        把 messages_history[-1] 换成「新 system + 恢复的旧消息」之后，立刻调一次。
+
+        为什么这件事不能省：
+          第 13 轮做完 `--continue` 之后，`history_token_usage` 在恢复路径上从来没人写过。
+          它是个空列表，而 `_requires_compression()` 的第一句就是
+          `if self._compress_threshold and self.history_token_usage:`——
+          空列表直接短路成 False。于是恢复一份"上次已经用到 80%"的会话，
+          第一次请求会把整份历史原样发出去，大概率 400。
+          也就是说：恢复功能本身能用，但"恢复一个长会话"这个最该被支持的场景反而最容易崩。
+
+        为什么写进 history_token_usage[-1]（覆盖）而不是累加：
+          这份账本的口径是"当前这一页纸总共占了多少"，不是"本次新增多少"。
+          恢复出来的是完整一页，所以应当覆盖成一个整页的估值。
+
+        返回值是估算出的 token 数，方便调用方在界面上打一行提示。
+        """
+        estimated = estimate_messages_tokens(messages)
+        usage = TokenUsage(input_tokens=estimated, output_tokens=0, total_tokens=estimated)
+        # output_tokens 记 0：恢复的历史全是"输入"，之前生成的那些回复早就计过费了，
+        # 这里只为回答"上下文有多满"，不参与成本统计。
+
+        if self.history_token_usage:  # 正常应该为空（刚启动），但不假设调用方一定这么用
+            self.history_token_usage[-1] = usage
+        else:
+            self.history_token_usage.append(usage)
+
+        # 清掉"已压过"标记：新的用量意味着可以重新判断要不要压。
+        # 这个标记是第 9 轮为防连环压缩加的（见 auto_messages_compression），
+        # 恢复场景必须重置，否则第一次判断会被误跳过。
+        self._compressed_for_current_usage = False
+        return estimated
 
     def add_message(self, message) -> None:
         self.messages_history[-1].append(message)  # 往"当前这一页"的末尾追加一条

@@ -10,12 +10,14 @@
 #
 # ⚠️ 两个注意点：
 #   1. 这个脚本会真的调用大模型，会花钱
-#   2. 下面有一处漏了 await（见对应行的注释），所以实际很可能跑不通
+#   2. 【2026-11-07 第 13.1 轮已修】原来这里漏了一个 await，
+#      等于从来没能跑通过——见下面 `await tool_manager.get_tools_description()` 旁的注释
 # =============================================================================
 
 """
 Test streaming functionality with tool calls（测试带工具调用的流式输出）
 """
+import asyncio  # 【第 13.1 轮】要 await 异步方法，得用 asyncio.run 启动事件循环
 import sys  # 改模块搜索路径
 import os  # 拼路径
 
@@ -28,8 +30,11 @@ from core.api_client import APIClient  # 导入 API 客户端
 from tools.tool_manager import ToolManager  # 导入工具管理器
 
 
-def test_streaming_with_tools():
-    """Test streaming with tool calls（测试带工具调用的流式输出）"""
+async def test_streaming_with_tools():
+    """Test streaming with tool calls（测试带工具调用的流式输出）
+
+    【2026-11-07 第 13.1 轮】改成 async 函数：里面的工具清单必须 await 才能拿到。
+    """
     print("🧪 Testing streaming functionality with tools...")
 
     try:  # 整体包一层
@@ -42,11 +47,11 @@ def test_streaming_with_tools():
                 {"role": "system", "content": "你是一个乐于助人的助手。"},  # 系统设定
                 {"role": "user", "content": "请列出当前目录下的文件"}  # 让它列文件
             ],
-            "tools": tool_manager.get_tools_description()
-            # ⚠️ 这里漏了 await！get_tools_description 是异步方法，
-            #    不写 await 拿到的是一个"协程对象"（还没开始执行的东西），
-            #    直接塞进请求参数里，接口那边会报错。
-            #    正确写法：await tool_manager.get_tools_description()，并且整个函数要改成 async。
+            "tools": await tool_manager.get_tools_description()
+            # 【2026-11-07 第 13.1 轮】这里原来漏了 await。
+            #   get_tools_description 是 async 方法，不 await 拿到的是一个协程对象，
+            #   塞进请求参数后 SDK 序列化时才会报错——而且报的是看不懂的类型错误。
+            #   因为这个脚本要真调模型（花钱），所以这个笔误一直没人踩出来。
         }
 
         print("📡 Making streaming request with tools...")  # 提示发请求
@@ -88,5 +93,5 @@ def test_streaming_with_tools():
 
 
 if __name__ == "__main__":
-    success = test_streaming_with_tools()  # 跑测试
+    success = asyncio.run(test_streaming_with_tools())  # 【第 13.1 轮】异步函数要用 asyncio.run 启动
     sys.exit(0 if success else 1)  # 用退出码报告结果
