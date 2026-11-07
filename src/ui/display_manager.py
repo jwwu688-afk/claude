@@ -21,12 +21,14 @@ Display management functionality for outputting content to users.（负责往屏
 """
 
 from rich.console import Console  # rich 库的"控制台"对象，是打印的入口
+from rich.cells import cell_len  # 【第 10 轮】算字符串占几列（中文算 2），spinner 要对齐宽度
 from rich.markdown import Markdown  # 把 markdown 文本变成带格式的漂亮输出
 from rich.live import Live  # "实时刷新"组件，流式输出的核心
 from rich.padding import Padding  # 给内容加内边距（这里用来做左缩进）
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
 from rich.table import Table  # 【第 7 轮】用来做「圆点 + 正文」的两列布局
 from typing import Optional  # 类型标注：表示"可能是这个，也可能是 None"
+import os  # 【第 10 轮】读取 THINKER_NO_SPINNER 开关
 import sys  # 【第 10 轮】等待动画直接往 stdout 写，需要它
 import threading  # 【第 10 轮】单行 spinner 跑在后台线程里
 import time  # 【第 7 轮】计算"已经等了多久"给 spinner 用
@@ -36,6 +38,11 @@ from . import theme  # 本项目统一的配色和符号（见 theme.py）
 
 class DisplayManager:
     """Manages all display operations including streaming content.（管理所有显示操作，包括流式内容）"""
+
+    # 【第 10 轮】spinner 每帧都补齐到这个宽度（终端列数，中文算 2 列）。
+    # 为什么固定：秒数从 (9s) 变 (10s) 会多一列，如果这一帧比上一帧短，
+    # 右边就会留下上一帧的残影。固定宽度 + 空格填充，覆盖永远干净。
+    _SPINNER_CELLS = 28
 
     def __init__(self, console: Optional[Console] = None):
         """
@@ -244,6 +251,7 @@ class DisplayManager:
           屏幕上就是橙色的 ✻ 和绿色的 ● 交替闪。
           单行场景根本不需要 Live：`\\r\\x1b[2K` + 重写，一行永远只有一行。
         """
+        self._stop_spinner()  # 【第 10 轮】幂等兜底：上一轮若因异常没走到 stop，这里把泄漏的线程收掉
         self._stream_buffer = ""  # 清空缓冲区，准备接收新内容
         self._stream_has_content = False  # 本轮是否已经出现过"真正的文字"
         self._thought_seconds = 0.0  # 思考耗时先归零
@@ -252,7 +260,10 @@ class DisplayManager:
         self._refresh_rate = refresh_rate
         self._spinner_stop = threading.Event()
         self._spinner_thread = None
-        if self._is_tty():  # 被重定向到文件/管道时没有光标可以移动，不该启动 spinner
+        # 【第 10 轮】THINKER_NO_SPINNER=1 可以彻底关掉等待动画。
+        #   留这个开关是因为不同终端的 ANSI 支持差异很大（Windows Terminal 正常，
+        #   某些 IDE 内置终端对 \r 覆盖的处理不好）。真遇到问题可以一键退回"无动画"。
+        if self._is_tty() and os.getenv("THINKER_NO_SPINNER") != "1":
             self._spinner_thread = threading.Thread(target=self._spin_loop, daemon=True)
             self._spinner_thread.start()
 
@@ -271,28 +282,37 @@ class DisplayManager:
     def _spin_loop(self) -> None:
         """等待动画：一根原地转的橙色星芒（2026-11-07 第 10 轮新增）
 
-        每 120ms 重画一次同一行，写法是 `\\r`（回到行首）+ 新内容 + 几个空格。
+        每 200ms 重画一次同一行，写法是 `\\r`（回到行首）+ 内容 + 补齐空格。
 
-        为什么末尾要补空格、而不是发 `\\x1b[2K` 清行？
-          2K 是标准 CSI，Windows Terminal 支持，但不是所有终端实现都老实执行
-          （实测在伪终端里抓取时，清行之后上一帧的尾巴还留在右边，
-          屏幕上就是"✻ 正在思考… (1s)  Thought for 1s … (1s)"这种粘连）。
-          用空格把旧内容覆盖掉，不依赖终端对清行指令的支持，最稳。
-          秒数只会变长（0s → 10s 多一位），补 4 个空格足够吃掉上一帧多出来的部分。
+        两条硬规则（都是踩出来的）：
+
+        1. **每帧总宽度必须完全一致**。秒数从 (9s) 变 (10s) 会多一个字符，
+           如果这一帧比上一帧短，右边就会留下上一帧的残影。所以每帧都
+           pad 到固定 CELLS 列，用空格把旧内容吃掉。
+        2. **不依赖 `\\x1b[2K` 清行**。2K 是标准 CSI，Windows Terminal 支持，
+           但伪终端里实测清行之后尾巴还在（会看到 "✻ 正在思考… (1s)  Thought …" 粘连）。
+           空格覆盖不依赖终端对指令的支持，最稳。
 
         线程是 daemon：万一主流程异常退出，它不会拖住进程。
         """
         try:
+            # 延迟 200ms 再出现。模型快速返回时（工具调用轮次常常只有几十毫秒），
+            # spinner 根本来不及显示就被擦掉，那一瞬间的"画出-擦掉"就是一次闪烁。
+            # 等 200ms 还没结果才显示，短等待彻底安静。
+            if self._spinner_stop.wait(0.2):
+                return
             while not self._spinner_stop.is_set():
                 elapsed = time.time() - self._stream_start
-                frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]
+                frame = theme.SPIN_FRAMES[int(elapsed * 5) % len(theme.SPIN_FRAMES)]
+                plain = f"{frame} 正在思考… ({int(elapsed)}s)"
+                pad = max(0, self._SPINNER_CELLS - cell_len(plain))  # 补齐到固定宽度
                 line = (
                     f"{theme.ACCENT_ANSI}{frame}{theme.RESET_ANSI} "
                     f"{theme.DIM_ANSI}正在思考… ({int(elapsed)}s){theme.RESET_ANSI}"
                 )
-                sys.stdout.write("\r" + line + " " * 4)
+                sys.stdout.write("\r" + line + " " * pad + "\x1b[K")
                 sys.stdout.flush()
-                self._spinner_stop.wait(0.12)  # 用 Event.wait 代替 sleep：能立刻响应停止
+                self._spinner_stop.wait(0.2)  # 5 帧/秒。Event.wait 能立刻响应停止
         except Exception:  # spinner 出问题绝不能影响主流程
             pass
 
@@ -315,7 +335,9 @@ class DisplayManager:
             self._spinner_thread = None
             stopped = True
         if stopped and self._is_tty():
-            sys.stdout.write("\r" + " " * 60 + "\r")
+            # 三重保险：回车回到行首、2K 清整行、空格彻底覆盖、再回车归位。
+            # 只靠其中一种在某些终端上会漏（实测过 2K 之后尾巴还在的情况）。
+            sys.stdout.write("\r\x1b[2K" + " " * 60 + "\r")
             sys.stdout.flush()
 
     def _start_body_live(self) -> None:

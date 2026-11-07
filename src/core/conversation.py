@@ -318,6 +318,11 @@ class Conversation:
                 response_message = self._create_simple_message(full_content)  # 就用攒下来的文字自己造一个
 
         except Exception as e:  # 如果流式这一套失败了
+            # 【第 10 轮】异常路径也必须把等待动画收掉。
+            #   原来 stop_stream_display() 只写在 for 循环后面，网络中断或
+            #   解析出错时会直接跳到 except，spinner 线程就一直活着——
+            #   下一轮再启动一个，两个线程往同一行写，屏幕剧烈闪烁。
+            self._ui_manager.stop_stream_display(show_done=False)
             self._ui_manager.print_error(f"处理流式响应时出错：{e}")  # 报错
             self._ui_manager.print_info(f"错误类型：{type(e).__name__}")  # 打印错误类型
             traceback.print_exc()  # 打印完整现场

@@ -134,9 +134,13 @@ class UIManager:
         """Start streaming display mode.（开始流式显示）"""
         self.display_manager.start_stream_display(refresh_rate)
 
-    def stop_stream_display(self) -> None:
-        """Stop streaming display mode.（结束流式显示）"""
-        self.display_manager.stop_stream_display()
+    def stop_stream_display(self, show_done: bool = True) -> None:
+        """Stop streaming display mode.（结束流式显示）
+
+        参数 show_done（第 10 轮新增）：异常路径传 False，避免在报错信息后面
+        再补一行 `✻ Cooked for Ns`——那时候根本没正常收尾，打这行只会误导。
+        """
+        self.display_manager.stop_stream_display(show_done)
 
     def print_streaming_content(self, chunk: str) -> None:
         """Print streaming content chunk.（显示一小段流式内容）"""
