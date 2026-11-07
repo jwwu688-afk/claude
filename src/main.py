@@ -29,6 +29,12 @@ from rich import box  # rich 的边框样式集合（这里用圆角那个）
 from rich.panel import Panel  # 面板：带边框的一块区域
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
 
+# 【第 10 轮】版本号显示在欢迎页标题里。
+# 为什么要放这里：改完代码后如果用户没重新启动进程，看到的还是旧界面，
+# 容易反复"改了没效果"。标题带版本号，一眼就能确认当前跑的是哪一份代码。
+# 改界面时顺手升一位（与 pyproject.toml 的 version 保持一致）。
+VERSION = "0.2.0"
+
 
 def _readable_dir(path: str) -> str:
     """把路径显示得短一点
@@ -58,7 +64,7 @@ def welcome():
     model = os.getenv("OPENAI_MODEL", "未配置")  # 当前用的模型
     body = Text(justify="center")  # 全部内容居中
     body.append(f"{STAR} ", style=f"bold {ACCENT}")  # 星号用品牌橙
-    body.append("Welcome to Thinker", style=f"bold {ACCENT}")  # 标题也用一个颜色，不花
+    body.append(f"Welcome to Thinker v{VERSION}", style=f"bold {ACCENT}")  # 标题带版本号，方便确认跑的是哪份代码
     body.append("\n\n")  # 标题和下面的信息之间留一行空白
     body.append(f"{model} · MCP 客户端版", style="")  # 第二行：模型 + 版本性质
     body.append("\n")

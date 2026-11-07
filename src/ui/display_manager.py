@@ -456,6 +456,7 @@ class DisplayManager:
                 self._thought_seconds = time.time() - self._stream_start
                 self._stream_has_content = True
                 self._stop_spinner()  # 先把 spinner 那行擦掉，否则它会和正文抢同一行
+                self._console.print()  # 回复块和上面的输入区之间留一个空行
                 if self._thought_seconds >= 1:  # 想得太快就别挂 Thought 行了
                     self._console.print(self._thought_line())
                 self._start_body_live()
