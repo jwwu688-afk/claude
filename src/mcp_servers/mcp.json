@@ -3,11 +3,11 @@
 		"weather": {
 			"type": "stdio",
 			"command": "D:\\Anaconda\\envs\\claude\\python.exe",
-			"args": ["D:\\code\\claude\\src\\mcp_servers\\weather.py"]
+			"args": ["D:\\code\\thinker\\src\\mcp_servers\\weather.py"]
 		},
 		"calculator": {
 			"command": "D:\\Anaconda\\envs\\claude\\python.exe",
-			"args": ["D:\\code\\claude\\src\\mcp_servers\\calculator.py"]
+			"args": ["D:\\code\\thinker\\src\\mcp_servers\\calculator.py"]
 		}
 	}
 }

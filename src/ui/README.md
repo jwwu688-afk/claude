@@ -3,7 +3,7 @@
 这个模块把"界面上的事"和"业务逻辑"彻底分开：输入归 `InputHandler` 管，显示归 `DisplayManager` 管，
 上层只跟 `UIManager` 打交道。这样代码更好维护，也更容易单独测试。
 
-> 最后核对：2026-11-06（第 8.2 轮）。下面的类名和方法名都与当前代码一致。
+> 最后核对：2026-11-07（第 10 轮）。下面的类名和方法名都与当前代码一致。
 
 ## 快速上手
 
@@ -48,7 +48,7 @@ ui.stop_stream_display()
 - `print_status()` —— 状态行（上下文水位、花费、缓存命中率，前两项会按水位变色）
 - `start/stop_stream_display()` —— 流式显示的开始与结束
 - `print_streaming_content()` —— 逐段显示模型吐出来的文字
-- `tool_header()/tool_result()` —— 工具调用的两行式输出（⏺ / ⎿）
+- `tool_header()/tool_result()` —— 工具调用的两行式输出（● / ⎿）
 - `approval_question()/tool_denied()` —— 授权提问（? 那一行）与被拒绝后的提示
 
 ### 基类（`base.py`）
@@ -109,3 +109,12 @@ config = UIConfig(
 注意：`UIConfig` 目前只是把配置项定义好了，`UIManager` 还没有接收它——
 上面这段只能说明"配置长什么样"，不会真的改变界面。
 实际的配色、提示符、spinner 文案统一放在 `ui/theme.py` 里（第 7 轮起），改那里才会生效。
+
+## 第 10 轮的两条硬规矩
+
+1. **圆点只能用 `theme.BULLET`（`●` U+25CF），不要写 `⏺`（U+23FA）。**
+   后者会被 Windows 终端交给 emoji 字体渲染，颜色不受 rich 控制，还会和橙色 `✻`
+   交替闪成"橙绿闪烁"。同理，任何"要靠颜色区分"的符号都要挑纯文本字符。
+2. **等待态与正文态之间要有一次性开关（`_stream_has_content`）。**
+   流式接口会发空 delta，如果按"缓冲区当前是否为空"判断，界面会在 spinner
+   和正文之间反复横跳。

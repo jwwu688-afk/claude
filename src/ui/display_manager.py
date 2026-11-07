@@ -20,7 +20,7 @@
 Display management functionality for outputting content to users.（负责往屏幕输出内容）
 """
 
-from rich.console import Console  # rich 库的"控制台"对象，是打印的入口
+from rich.console import Console, Group  # rich 库的"控制台"对象；Group 把几块内容竖着拼起来
 from rich.markdown import Markdown  # 把 markdown 文本变成带格式的漂亮输出
 from rich.live import Live  # "实时刷新"组件，流式输出的核心
 from rich.padding import Padding  # 给内容加内边距（这里用来做左缩进）
@@ -45,6 +45,8 @@ class DisplayManager:
         self._console = console or theme.console  # 默认共用 theme 里的全局控制台，保证风格一致
         self._live: Optional[Live] = None  # 存放流式显示对象，一开始没有
         self._stream_buffer: str = ""  # 存放已经收到但还没显示完的文字
+        self._stream_has_content: bool = False  # 【第 10 轮】本轮是否已出现过真文字（防橙绿交替闪）
+        self._thought_seconds: float = 0.0  # 【第 10 轮】"想"到第一个字花了多久，用于 Thought for Ns 行
         self._stream_start: float = 0.0  # 【第 7 轮】这一轮开始等待的时间点，用来算 spinner 上的秒数
 
     # -------------------------------------------------------------------------
@@ -52,21 +54,26 @@ class DisplayManager:
     # -------------------------------------------------------------------------
     @staticmethod
     def _bullet_block(content_renderable):
-        """把 ⏺ 和正文排成 Claude Code 那样（2026-11-06 第 7 轮新增）
+        """把 ● 和正文排成 Claude Code 那样（2026-11-06 第 7 轮新增）
 
         要的效果是：
-            ⏺ 目录里有 a、b、c 三个文件，
+            ● 目录里有 a、b、c 三个文件，
               另外还有两个子目录。
         也就是「圆点和第一行文字同一行，后续行对齐在文字下面」。
 
         怎么做到的？
-          用两列网格：第一列只放 1 个字符宽的 ⏺，第二列放正文。
+          用两列网格：第一列只放 1 个字符宽的 ●，第二列放正文。
           网格会把两列顶部对齐，正文折行时自然就落在第二列的起始位置。
+
+        【2026-11-07 第 10 轮】圆点从 ⏺ 改成 ●，并上绿色。
+          原因见 theme.py 顶部说明：⏺ 会被终端当成 emoji 渲染成彩色，
+          颜色不受控，还会和橙色 ✻ 交替闪。● 是纯几何字符，颜色想写什么就是什么。
         """
-        grid = Table.grid(padding=(0, 0))  # 不留额外间距：⏺ 本身在终端里占两格宽，天然有一个空格
+        grid = Table.grid(padding=(0, 0))  # 不留额外间距：● 本身在终端里占两格宽，天然有一个空格
         grid.add_column(width=2)  # 第一列：圆点占 2 列（符号 1 列 + 1 个空格），正文从第 3 列开始
         grid.add_column()  # 第二列：正文，占满剩余宽度
-        grid.add_row(Text(theme.BULLET, style=""), content_renderable)
+        grid.add_row(Text(theme.BULLET, style=f"bold {theme.BULLET_COLOR}"), content_renderable)
+        # ↑ 圆点用加粗绿色：截图里助手回复和工具调用前面都是这个绿点
         return grid
 
     def print_assistant_message(self, content: str, emoji: str = "", header: bool = True) -> None:
@@ -144,11 +151,13 @@ class DisplayManager:
     def tool_header(self, tool_name: str, args_preview: str = "") -> None:
         """打印一行"工具调用"（2026-11-06 第 4 轮新增）
 
-        样式：  ⏺ cmd_runner(dir)
+        样式：  ● cmd_runner(dir)
         参数太长时由调用方先截断，这里只负责排版。
+
+        【第 10 轮】圆点改成绿色 ●，和截图里 `● Skill(using-superpowers)` 一致。
         """
         text = Text()
-        text.append(f"{theme.BULLET} ", style="")  # 圆点：白色，Claude Code 里它不上色
+        text.append(f"{theme.BULLET} ", style=f"bold {theme.BULLET_COLOR}")  # 绿点
         text.append(tool_name, style="bold")  # 工具名加粗
         if args_preview:  # 有参数就用暗色括起来
             text.append(f"({args_preview})", style="qs.dim")
@@ -222,6 +231,8 @@ class DisplayManager:
         屏幕上不会多出一个空圆点。
         """
         self._stream_buffer = ""  # 清空缓冲区，准备接收新内容
+        self._stream_has_content = False  # 【第 10 轮】本轮是否已经出现过"真正的文字"
+        self._thought_seconds = 0.0  # 【第 10 轮】思考耗时先归零
         self._stream_start = time.time()  # 【第 7 轮】记下开始等待的时刻
         self._live = Live(
             console=self._console,
@@ -238,10 +249,41 @@ class DisplayManager:
             ✻ 正在思考… (3s)
         因为 Live 每秒钟会刷新十几次，这个函数会被反复调用，
         每次都用"当前时间 - 开始时间"算秒数，秒数就会自己往上走。
+
+        【2026-11-07 第 10 轮】修掉"橙绿交替闪"：
+          原来判断的是 `if not self._stream_buffer` —— 缓冲区是"当前这一帧有没有字"。
+          但流式接口会先发几个空 delta（""、"\n"），缓冲区的真假状态就跟着抖，
+          于是这一帧画 spinner（橙 ✻）、下一帧画正文（绿 ●）、再下一帧又回到 spinner，
+          屏幕上就是两个标志交替闪。
+          现在改用"一次性开关" _stream_has_content：只要出现过一次真文字，
+          后面哪怕收到空 delta，也永远停在正文态，不再退回 spinner。
         """
-        if not self._stream_buffer:  # 还没收到任何文字，说明模型还在想
+        if not self._stream_has_content:  # 还没收到真正的内容，说明模型还在想
             return self._spinner_renderable()
-        return self._bullet_block(Markdown(self._stream_buffer))  # 圆点与正文同排（Claude Code 样式）
+
+        # 【第 10 轮】正文态。如果"想"的时间超过 1 秒，先在正文上方补一行
+        # `  Thought for 3s (ctrl+o to expand)`，对齐截图。
+        # 少于 1 秒不显示——否则每句回复上面都挂一行 "Thought for 0s"，纯噪音。
+        body = self._bullet_block(Markdown(self._stream_buffer))
+        if self._thought_seconds >= 1:
+            return Group(self._thought_line(), body)
+        return body
+
+    def _thought_line(self) -> Text:
+        """生成 `  Thought for 3s (ctrl+o to expand)` 这一行（2026-11-07 第 10 轮新增）
+
+        和截图一致：缩进两格、整行暗灰。
+        ctrl+o 展开思考内容这个功能还没做，所以后面括号里的提示只是占位——
+        真要按了没反应，比不写更容易让人困惑，所以这里只保留耗时本身。
+
+        嗯，还是照截图带上括号提示吧：它是"这一行是什么"的解释，
+        没有 ctrl+o 也不影响理解。
+        """
+        text = Text()
+        text.append("  ")
+        text.append(f"Thought for {int(round(self._thought_seconds))}s", style="qs.dim")
+        text.append(" (ctrl+o to expand)", style="qs.dim")
+        return text
 
     def _spinner_renderable(self):
         """生成等待动画的一帧（2026-11-06 第 7 轮新增）
@@ -256,17 +298,21 @@ class DisplayManager:
         line.append(f" ({elapsed:.0f}s)", style="qs.dim")  # 秒数，给自己一个"还在动"的反馈
         return line
 
-    def stop_stream_display(self) -> None:
+    def stop_stream_display(self, show_done: bool = True) -> None:
         """Stop streaming display mode.（结束流式显示模式）
 
         【2026-11-06 第 4 轮】补一个换行。
         原因：Live 结束后，光标会停在最后一行末尾（没有换行符），
         紧跟着打印的状态行就会粘在正文屁股后面，看起来像
         "……助手的话  ⎿ 上下文 3.5%"。这里补一行就分开了。
+
+        【2026-11-07 第 10 轮】结尾补一行 `✻ Cooked for 7s · done 11:38`，
+        对齐截图里 Claude Code 的收尾行。只在"这一轮模型真的说了话"时打印——
+        纯工具调用的轮次不打印，否则一屏里会出现三四条 Cooked。
         """
         if self._live:  # 如果当前确实在刷新
-            had_content = bool(self._stream_buffer.strip())  # 之前有没有真的输出过文字
-            if not had_content:  # 【第 7 轮】这一轮只有工具调用、没有文字
+            had_content = self._stream_has_content  # 之前有没有真的输出过文字
+            if not had_content:  # 这一轮只有工具调用、没有文字
                 # 把这块区域标记成"临时的"：rich 在 stop() 时会自动擦掉它，
                 # 而不是把最后一帧 spinner 留在屏幕上。
                 # 不能只 update(Text(""))——那样在非交互环境（输出被重定向）里会残留一行。
@@ -275,6 +321,23 @@ class DisplayManager:
             self._live = None  # 清空引用
             if had_content:  # 有文字才补换行（纯工具调用的轮次不需要）
                 self._console.print()
+                if show_done:  # 收尾行
+                    self._print_done_line()
+
+    def _print_done_line(self) -> None:
+        """打印这一轮的收尾行（2026-11-07 第 10 轮新增）
+
+        样式和截图一致：
+            ✻ Cooked for 7s · done 11:38
+        整行暗灰——它是"记账"信息，不该和正文抢注意力。
+        """
+        elapsed = max(1, int(round(time.time() - self._stream_start)))  # 至少显示 1s
+        finished_at = time.strftime("%H:%M")  # 当地时间的时:分
+        text = Text()
+        text.append(f"{theme.STAR} ", style="qs.dim")
+        text.append(f"Cooked for {elapsed}s", style="qs.dim")
+        text.append(f" {theme.DOT} done {finished_at}", style="qs.dim")
+        self._console.print(text)
 
     def print_streaming_content(self, chunk: str) -> None:
         """
@@ -287,6 +350,13 @@ class DisplayManager:
             self._stream_buffer = ""  # 就建一个空的
 
         self._stream_buffer += chunk  # 把新来的这一小段接到后面
+        # 【第 10 轮】只有"有实义的字"才算内容开始。
+        #   流式接口经常先发 "\n"、"" 这种空 delta，如果拿它们当"已经有内容"，
+        #   界面就会在 spinner 和正文之间反复横跳（这正是之前橙绿交替闪的第二个成因）。
+        if chunk and chunk.strip():
+            if not self._stream_has_content:  # 第一次收到真文字：把"思考耗时"定格
+                self._thought_seconds = time.time() - self._stream_start
+            self._stream_has_content = True
         # 不用手动 update：Live 会按 refresh_per_second 自己去取 _stream_renderable()
 
     def get_stream_buffer(self) -> str:
@@ -296,6 +366,8 @@ class DisplayManager:
     def clear_stream_buffer(self) -> None:
         """Clear the stream buffer.（清空缓冲区）"""
         self._stream_buffer = ""
+        self._stream_has_content = False  # 【第 10 轮】连同"已有内容"的标记一起复位
+        self._thought_seconds = 0.0
 
     # -------------------------------------------------------------------------
     # 四、待办清单

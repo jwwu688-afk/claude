@@ -17,7 +17,10 @@ Input handling functionality for user interactions.（处理用户交互中的�
 """
 
 import asyncio  # 用来做异步操作
+import os  # 【第 10 轮】读压缩阈值，底部状态栏要显示
 from typing import Optional  # 类型标注工具（表示"可能是这个值，也可能没有"）
+
+from rich.text import Text  # 富文本：给横线染色
 
 from . import theme  # 【2026-11-06 第 4 轮】输入提示符的样式从这里取
 
@@ -27,7 +30,51 @@ class InputHandler:
 
     def __init__(self):
         """Initialize the input handler.（初始化，这里没什么要做的）"""
-        pass  # 什么都不做
+        self._console = theme.console  # 【第 10 轮】画输入框横线要用
+        self._status_shown = False  # 【第 10 轮】底部状态栏只画一次
+
+    def _draw_rule(self) -> None:
+        """画输入框下方那条横线（2026-11-07 第 10 轮新增）
+
+        截图里每轮输入下面都有一条贯穿窗口的暗灰细线，作用是"把这一轮输入和
+        后面的输出分开"。没有它，用户输入和模型回复之间只有空行，长对话里
+        很难一眼看出"我上一次说的是哪句"。
+
+        宽度取终端当前宽度；取不到就退化成 60 列，绝不因为宽度异常抛错。
+        """
+        try:
+            width = max(20, self._console.width - 1)
+        except Exception:  # 某些非交互环境拿不到宽度
+            width = 60
+        self._console.print(Text("─" * width, style="qs.dim"))
+        if not self._status_shown:  # 第一次输入完成才画状态栏，位置正好在横线下面
+            self._status_shown = True
+            self._draw_status_bar()
+
+    def _draw_status_bar(self) -> None:
+        """画输入框下面那行黄色状态提示（2026-11-07 第 10 轮新增）
+
+        截图原文是 `▸▸ auto mode on (shift+tab to cycle) · ← for agents`。
+        那两项对应"权限模式切换"和"agent 面板"，本项目都还没有，
+        照抄会变成按了没反应的假按钮——所以保留字形和配色，
+        内容换成本项目真实存在的操作提示。
+
+        只画一次：它是"底栏"，不是每轮都要重复的日志。
+        """
+        threshold = os.getenv("COMPRESS_THRESHOLD", "0.8")
+        try:
+            threshold_pct = f"{float(threshold) * 100:.0f}%"
+        except ValueError:  # 环境变量写错也不能让界面崩
+            threshold_pct = "80%"
+
+        line = Text()
+        line.append(f"{theme.ARROWS} ", style=f"bold {theme.WARN}")
+        line.append("默认模式", style=theme.WARN)
+        line.append(f" {theme.DOT} ", style="qs.dim")
+        line.append("ctrl+c 退出", style="qs.dim")
+        line.append(f" {theme.DOT} ", style="qs.dim")
+        line.append(f"上下文 {threshold_pct} 自动压缩", style="qs.dim")
+        self._console.print(line)
 
     async def get_user_input(self, prompt: str = None) -> str:
         """
@@ -39,17 +86,23 @@ class InputHandler:
         Returns:
             User input as string（用户输入的字符串）
         """
-        # 【2026-11-06 第 4 轮】改成一个青色的 ❯ 提示符，并去掉原来单独一行的 👤
+        # 【2026-11-06 第 4 轮】改成一个橙色的 > 提示符，并去掉原来单独一行的 👤
         #   原来每次输入前都打一个 emoji，屏幕上会堆一排人头，很乱。
+        # 【2026-11-07 第 10 轮】用户输入完补一条横线，对齐 Claude Code 的输入框。
+        #   只在"用默认提示符"时画——授权提问那种缩进的小提示不画线。
+        draw_rule = prompt is None
         if prompt is None:  # 调用方没指定提示符
-            prompt = theme.prompt_text()  # 用统一的 ❯
+            prompt = theme.prompt_text()  # 用统一的 >
         loop = asyncio.get_event_loop()  # 拿到当前的"事件循环"（异步任务的总调度台）
-        return await loop.run_in_executor(None, input, prompt)
+        answer = await loop.run_in_executor(None, input, prompt)
         # 上一行是关键：把 input 函数丢到"执行器"里去跑
         #   None 表示用默认的线程池
         #   input 是要执行的函数，prompt 是传给它的参数
         # await 表示"在这儿等结果，但等着的时候不占着 CPU"
         # 这样 input() 在等键盘时，主程序还能继续处理别的事情
+        if draw_rule:
+            self._draw_rule()
+        return answer
 
     # 【2026-11-06 第 8.2 轮】"同意"和"拒绝"的精确词表。
     #   为什么不用原来那种 "yes" in text 的子串匹配？

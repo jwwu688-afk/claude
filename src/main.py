@@ -24,16 +24,15 @@
 import asyncio  # 导入 asyncio 工具箱：让程序在"等网络回复"的时候还能去干别的事（异步）
 import os  # 用来读环境变量（拿模型名、压缩阈值）和当前目录
 from core.conversation import Conversation  # 导入对话总管 Conversation 类，后面靠它启动聊天
-from ui.theme import console, ACCENT, DIM, WIDTH, STAR  # 统一的控制台、Claude 橙、暗灰、框宽、星号
-from rich import box  # rich 的边框样式集合（这里用圆角那个）
-from rich.panel import Panel  # 面板：带边框的一块区域
+from ui import theme  # 配色、符号、logo 都从这里取
+from ui.theme import console, ACCENT, DIM  # 统一的控制台、Claude 橙、暗灰
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
 
 
 def _readable_dir(path: str) -> str:
     """把路径显示得短一点
 
-    目录太长会把框撑破，只保留最后两级就够了，比如 D:\\code\\claude → …/code/thinker
+    目录太长会把欢迎区撑得很宽，只保留最后两级就够了。
     """
     parts = path.replace("\\", "/").rstrip("/").split("/")  # 统一成 / 再切开
     if len(parts) <= 2:  # 短路径就原样显示
@@ -42,50 +41,49 @@ def _readable_dir(path: str) -> str:
 
 
 def welcome():
-    """画欢迎框（2026-11-06 第 7 轮按 Claude Code 样式重写）
+    """画欢迎区（2026-11-07 第 10 轮按 Claude Code 2.1.296 实拍重做）
 
-    整体结构和 Claude Code 一致：
-        框里是对齐居中的标题和一两行环境信息，框外是一行暗灰的操作提示。
-    刻意做得"空"一点——留白本身就是 Claude Code 的观感来源。
+    改前的样子是一个居中的圆角框，标题在框里居中。
+    实拍截图显示真正的 Claude Code 是"**没有框**"的：左边一个橙色方块 logo，
+    右边紧挨着三行左对齐的文字（产品+版本 / 模型+计费 / 当前目录）。
+
+    为什么不再用 Panel：
+      框会把视觉重心拉到中心的标题上，而 Claude Code 的重心是"Logo + 环境信息"
+      这一块整体。去掉框之后，下面所有输出都能从第 0 列开始，排版也更整齐。
+
+    布局（三行文字对齐 logo 的前三行，第四行只有 logo）：
+        ▄▄▄▄▄▄▄  ▄▄▄▄▄▄   Thinker v0.1.0
+        ███████  ██████   spark-x2.6 · API Usage Billing
+        ███████  ██████   …/code/thinker
+        ▀▀▀▀▀▀▀  ▀▀▀▀▀▀
     """
     console.print()  # 顶部先空一行，别贴着终端边界
 
     model = os.getenv("OPENAI_MODEL", "未配置")  # 当前用的模型
-    body = Text(justify="center")  # 全部内容居中
-    body.append(f"{STAR} ", style=f"bold {ACCENT}")  # 星号用品牌橙
-    body.append("Welcome to Thinker", style=f"bold {ACCENT}")  # 标题也用一个颜色，不花
-    body.append("\n\n")  # 标题和下面的信息之间留一行空白
-    body.append(f"{model} · MCP 客户端版", style="")  # 第二行：模型 + 版本性质
-    body.append("\n")
-    body.append(_readable_dir(os.getcwd()), style=DIM)  # 第三行：当前目录（暗灰）
+    version = "0.1.0"  # 与 pyproject.toml 的 version 保持一致
+    info_lines = [
+        f"Thinker v{version}",  # 第一行：产品名 + 版本
+        f"{model} · API Usage Billing",  # 第二行：模型 + 计费方式
+        _readable_dir(os.getcwd()),  # 第三行：当前目录
+    ]
 
-    box_width = min(WIDTH, max(40, console.width - 4))  # 框宽：不超过 WIDTH，也不超出终端
-    console.print(
-        Panel(
-            body,
-            box=box.ROUNDED,  # 圆角边框，就是 Claude Code 那个框的样子
-            border_style=DIM,  # 边框用暗灰，不抢内容
-            padding=(1, 4),  # 上下各空 1 行、左右各空 4 格
-            width=box_width,
-        )
-    )
+    # 逐行拼：logo 第 i 行 + 间隔 + 第 i 行文字。
+    # logo 有 4 行、文字只有 3 行，所以最后一行只画 logo。
+    gap = " " * (theme.LOGO_GAP - 1)  # logo 和文字之间的空隙（少算 1 格，因为要补一个分隔空格）
+    for index, logo_line in enumerate(theme.LOGO_LINES):
+        line = Text()
+        line.append(logo_line, style=f"bold {theme.ACCENT}")  # logo 整块用品牌橙
+        if index < len(info_lines):  # 这一行还有文字要配
+            line.append(gap)
+            # 第一、二行是主体信息用默认色，第三行是路径用暗灰
+            style = DIM if index == 2 else ""
+            line.append(info_lines[index], style=style)
+        console.print(line)
 
-    # 框下面一行操作提示。Claude Code 在这里放 tips，我们只保留最必要的三条。
-    threshold = os.getenv("COMPRESS_THRESHOLD", "0.8")  # 压缩阈值，默认 80%
-    try:
-        threshold_pct = f"{float(threshold) * 100:.0f}%"
-    except ValueError:  # 环境变量写错了也不能让欢迎页崩
-        threshold_pct = "80%"
+    console.print()  # logo 和下面的内容之间留一行
+    # 底部状态栏不在这里画。截图里它出现在"输入框横线之下"，
+    # 所以交给 InputHandler 在第一次输入完成后补上（见 input_handler._draw_status_bar）。
 
-    hint = Text()
-    hint.append("  ")
-    hint.append("输入问题开始", style=DIM)
-    hint.append(" · ", style=DIM)
-    hint.append("Ctrl+C 退出", style=DIM)
-    hint.append(" · ", style=DIM)
-    hint.append(f"上下文 {threshold_pct} 自动压缩", style=DIM)
-    console.print(hint)
-    console.print()  # 最后空一行，让输入提示符不贴着提示文字
 
 
 async def main():
