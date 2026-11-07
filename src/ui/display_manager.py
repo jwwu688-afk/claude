@@ -303,7 +303,7 @@ class DisplayManager:
                 return
             while not self._spinner_stop.is_set():
                 elapsed = time.time() - self._stream_start
-                frame = theme.SPIN_FRAMES[int(elapsed * 5) % len(theme.SPIN_FRAMES)]
+                frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]
                 plain = f"{frame} 正在思考… ({int(elapsed)}s)"
                 pad = max(0, self._SPINNER_CELLS - cell_len(plain))  # 补齐到固定宽度
                 line = (
@@ -312,7 +312,9 @@ class DisplayManager:
                 )
                 sys.stdout.write("\r" + line + " " * pad + "\x1b[K")
                 sys.stdout.flush()
-                self._spinner_stop.wait(0.2)  # 5 帧/秒。Event.wait 能立刻响应停止
+                # 10 帧/秒。之前降成 5 帧是想减少重绘，结果四帧星芒切换得太慢，
+                # 视觉上反而"一顿一顿"更像在闪——转得连续才不像故障。
+                self._spinner_stop.wait(0.1)
         except Exception:  # spinner 出问题绝不能影响主流程
             pass
 
@@ -337,7 +339,7 @@ class DisplayManager:
         if stopped and self._is_tty():
             # 三重保险：回车回到行首、2K 清整行、空格彻底覆盖、再回车归位。
             # 只靠其中一种在某些终端上会漏（实测过 2K 之后尾巴还在的情况）。
-            sys.stdout.write("\r\x1b[2K" + " " * 60 + "\r")
+            sys.stdout.write("\r\x1b[2K" + " " * 100 + "\r")
             sys.stdout.flush()
 
     def _start_body_live(self) -> None:
@@ -404,25 +406,33 @@ class DisplayManager:
         if self._live:  # 这一轮真的输出了正文
             self._live.stop()
             self._live = None
-            # 真终端里 Live.stop() 自己会补一个换行；输出被重定向到文件/管道时不会，
-            # 那样 Cooked 行就会粘在正文末尾（实测"…可以帮你？  ✻ Cooked for 1s"）。
-            # 所以只在非 tty 场景补这一行，tty 下补了会多出一个空行。
-            if not self._is_tty():
-                self._console.print()
+            # 【第 10 轮】正文和 Cooked 之间留一个空行，对齐 Claude Code 的呼吸感。
+            # 为什么是两次 print：
+            #   Live 结束时正文行末尾没有换行符，第一次 print 只是"结束这一行"，
+            #   第二次才产生真正的空行。tty 下 Live.stop 已经补过一次换行，
+            #   所以会变成两个空行——正好，间距再大一点也不挤。
+            self._console.print()
+            self._console.print()
             if show_done:
                 self._print_done_line()
+                self._console.print()  # Cooked 之后也留一行，和下一轮内容分开
 
     def _print_done_line(self) -> None:
         """打印这一轮的收尾行（2026-11-07 第 10 轮新增）
 
-        样式和截图一致：
-            ✻ Cooked for 7s · done 11:38
-        整行暗灰——它是"记账"信息，不该和正文抢注意力。
+        样式：
+            Cooked for 7s · done 11:38
+
+        为什么前面不用 ✻（Claude Code 原版是 `✻ Cooked for 7s`）：
+          整个界面上"星号"只应该有一个含义——"正在等模型"。收尾行再挂一个灰 ✻，
+          视觉上和等待时的橙 ✻ 撞车，用户会以为"标志在橙和灰之间换色"。
+          去掉之后，行首符号只剩 `●`（回复）、`⎿`（结果/状态），
+          橙 ✻ 只在真正等待时出现。
         """
         elapsed = max(1, int(round(time.time() - self._stream_start)))  # 至少显示 1s
         finished_at = time.strftime("%H:%M")  # 当地时间的时:分
         text = Text()
-        text.append(f"{theme.STAR} ", style="qs.dim")
+        text.append("  ")
         text.append(f"Cooked for {elapsed}s", style="qs.dim")
         text.append(f" {theme.DOT} done {finished_at}", style="qs.dim")
         self._console.print(text)
