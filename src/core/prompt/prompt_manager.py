@@ -15,6 +15,7 @@
 
 from abc import ABC, abstractmethod  # 抽象基类工具
 
+from core.auto_memory import render_for_prompt as render_auto_memory  # 【第 12 轮】自动记忆
 from core.prompt.enviroment import get_enviroment_info  # 导入函数：生成环境信息文字
 from core.prompt.memory import load as load_project_memory  # 导入函数：加载 THINKER.md
 from core.prompt.system_rule import get_system_rule  # 导入函数：生成行为规矩文字
@@ -45,6 +46,12 @@ class PromptManager(BasePromptManager):
         # 每次调用都会重新拼一遍（所以日期永远是当天的）
         # 【2026-11-06 第 3 轮】原来是三引号模板里嵌两段内容，会导致第二段（环境信息）
         #   前面多出 8 个空格缩进，看着很别扭。改成直接拼接，顺便去掉多余空白。
+        #
+        # 【2026-11-07 第 12 轮】四段式：规矩 → 项目记忆 → 自动记忆 → 环境信息。
+        #   项目记忆（THINKER.md）和自动记忆（MEMORY.md）是两回事：
+        #     前者是人写的项目规矩，全文注入；
+        #     后者是模型自己积累的经验，只注入索引，细节靠 file_read 按需取。
+        #   两者都放在中间，因为"规矩"要最先立住、"环境"要在最后便于引用。
         sections = [get_system_rule()]  # 第一段：行为规矩
 
         memory = load_project_memory()  # 第二段：项目记忆（找不到就是空字符串）
@@ -52,5 +59,10 @@ class PromptManager(BasePromptManager):
             sections.append(memory)
             # 没有记忆文件时整段跳过——免得系统提示词里出现"以下是项目记忆：（空）"
 
-        sections.append(get_enviroment_info())  # 第三段：当前环境信息
+        auto_memory = render_auto_memory()  # 第三段：模型自己的记忆（索引 + 使用说明）
+        if auto_memory:
+            sections.append(auto_memory)
+            # 目录不存在时返回空串，同样整段跳过
+
+        sections.append(get_enviroment_info())  # 第四段：当前环境信息
         return "\n\n".join(sections).strip()

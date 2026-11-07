@@ -39,6 +39,7 @@ import locale  # 读系统默认编码（中文 Windows 上有些老文件是 GB
 import os  # 读环境变量、取工作目录、遍历文件夹
 import re  # file_grep 用的正则表达式
 from pathlib import Path  # 路径对象，处理绝对路径 / 相对路径比字符串方便
+from core.auto_memory import is_memory_path  # 【第 12 轮】识别记忆目录，给它开越界特批
 from tools.base_tool import BaseTool  # 导入父类：所有工具都得有 act / json_schema / get_status
 
 
@@ -88,8 +89,16 @@ def _within_workspace(path: Path) -> bool:
     用 relative_to 而不是字符串 startswith：
       startswith("D:/code/thinker") 会把 "D:/code/thinker-other" 也当成在内部，
       relative_to 是按"路径段"比较的，不会误判。
+
+    【2026-11-07 第 12 轮】给记忆目录开了个特批口子：
+      自动记忆存在 ~/.thinker/projects/<项目>/memory/ 下，天生在工作区之外。
+      不开这个口子，模型就永远写不进记忆——功能整个是废的。
+      这个特批是安全的：记忆目录是程序自己算出来的固定路径，
+      不是模型随便指定的，能访问的范围也只有那一个文件夹。
     """
     if _allow_outside():  # 用户明确放开了边界
+        return True
+    if is_memory_path(path):  # 记忆目录，只读只写它自己那一亩三分地
         return True
     try:
         path.resolve().relative_to(WORKSPACE_ROOT)  # 不在里面会抛 ValueError

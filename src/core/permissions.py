@@ -30,6 +30,8 @@
 import re  # 用正则匹配危险命令
 from dataclasses import dataclass  # 装判断结果的小容器
 
+from core.auto_memory import is_memory_path  # 【第 12 轮】识别"记忆目录"，那里读写免审批
+
 
 # 只读工具：不改磁盘、不启进程，没必要每次都打断用户
 READ_ONLY_TOOLS = {
@@ -39,6 +41,13 @@ READ_ONLY_TOOLS = {
 # 会改磁盘的工具：这一版一律要问（第 10 轮再做"工作区内的小改动免确认"）
 WRITE_TOOLS = {
     "file_write", "file_edit",
+}
+
+# 【2026-11-07 第 12 轮】只对"记忆目录"免审批的三个工具。
+# 为什么不把 file_glob / file_grep 也放进来：模型要知道有哪些记忆，读索引就够了，
+# 不需要在记忆目录里搜索。范围越窄越安全。
+_MEMORY_TOOLS = {
+    "file_read", "file_write", "file_edit",
 }
 
 
@@ -152,6 +161,17 @@ def classify(tool_name: str, args: dict) -> Decision:
     # 规则 2a：只读工具。模型显式要求"问一下"时，尊重它（加严）。
     if tool_name in READ_ONLY_TOOLS:
         return Decision(bool(hint), "low", "")
+
+    # 规则 2a-2：【2026-11-07 第 12 轮】记忆目录的读写免确认。
+    #   自动记忆（~/.thinker/projects/<项目>/memory/）是模型自己的笔记本：
+    #     · 它只会往里写一两百字的小文件
+    #     · 写错了用户随时能打开看、能改
+    #     · 每记一条都弹确认的话，对话节奏会被打断得没法用
+    #   这是本轮唯一主动放宽的地方，所以做了一个很窄的例外：
+    #   路径必须真的落在那个目录里（is_memory_path 会 resolve 后按路径段比较），
+    #   换成工作区里任何一个别的文件都不生效。
+    if tool_name in _MEMORY_TOOLS and is_memory_path(args.get("path")):
+        return Decision(False, "low", "")
 
     # 规则 2b / 3：执行命令。
     #   这里是本轮最关键的一刀：cmd_runner 的 need_user_approve **完全不再参与判定**。

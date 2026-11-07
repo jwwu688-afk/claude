@@ -139,6 +139,14 @@ class Conversation:
 
     async def start_conversation(self):
         """Start a new conversation.（开始一次全新的对话：这是用户按下回车后的第一步）"""
+        # 【第 12 轮】先把记忆目录建出来。
+        #   为什么要在这里做：模型第一次想写记忆时，如果目录不存在，
+        #   file_write 可能因为"父目录不存在"失败，那次记忆就丢了。
+        #   提前建成空目录，写入路径就永远是通的。exist_ok=True，重复调用无副作用。
+        from core.auto_memory import ensure_dir as ensure_memory_dir
+
+        ensure_memory_dir()
+
         # Initialize with system message
         system_message = {
             # 一条消息就是一个字典，必须有两样东西：role（谁说的）和 content（说了什么）
