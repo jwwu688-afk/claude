@@ -94,6 +94,15 @@ def prompt_text() -> str:
     return f"\x1b[38;5;209m{PROMPT}\x1b[0m "
 
 
+# 【第 10 轮】等待动画不走 rich，而是直接往 stdout 写转义码。
+# 原因见 display_manager._spin_loop 的说明：rich 的 Live 用"光标上移+覆盖"重绘，
+# 不清行，高度一变就有残影。单行 spinner 必须能精确擦掉自己，所以手工控制。
+ACCENT_ANSI = "\x1b[38;5;209m"  # 品牌橙（256 色）
+DIM_ANSI = "\x1b[38;5;244m"  # 暗灰（256 色）
+RESET_ANSI = "\x1b[0m"
+CLEAR_LINE = "\r\x1b[2K"  # 回车 + 清整行，单行重绘的标准写法
+
+
 def dim_text(text: str) -> str:
     """把一段文字染色成暗灰（给 input() 的提示文字用）
 

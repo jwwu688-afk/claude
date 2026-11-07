@@ -20,13 +20,15 @@
 Display management functionality for outputting content to users.（负责往屏幕输出内容）
 """
 
-from rich.console import Console, Group  # rich 库的"控制台"对象；Group 把几块内容竖着拼起来
+from rich.console import Console  # rich 库的"控制台"对象，是打印的入口
 from rich.markdown import Markdown  # 把 markdown 文本变成带格式的漂亮输出
 from rich.live import Live  # "实时刷新"组件，流式输出的核心
 from rich.padding import Padding  # 给内容加内边距（这里用来做左缩进）
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
 from rich.table import Table  # 【第 7 轮】用来做「圆点 + 正文」的两列布局
 from typing import Optional  # 类型标注：表示"可能是这个，也可能是 None"
+import sys  # 【第 10 轮】等待动画直接往 stdout 写，需要它
+import threading  # 【第 10 轮】单行 spinner 跑在后台线程里
 import time  # 【第 7 轮】计算"已经等了多久"给 spinner 用
 
 from . import theme  # 本项目统一的配色和符号（见 theme.py）
@@ -48,6 +50,11 @@ class DisplayManager:
         self._stream_has_content: bool = False  # 【第 10 轮】本轮是否已出现过真文字（防橙绿交替闪）
         self._thought_seconds: float = 0.0  # 【第 10 轮】"想"到第一个字花了多久，用于 Thought for Ns 行
         self._stream_start: float = 0.0  # 【第 7 轮】这一轮开始等待的时间点，用来算 spinner 上的秒数
+        self._refresh_rate: int = 10  # 【第 10 轮】正文 Live 的刷新率，由 start_stream_display 传入
+        self._spinner_stop = None  # 【第 10 轮】等停 spinner 线程的信号（threading.Event）
+        self._spinner_thread = None  # 【第 10 轮】spinner 线程
+        self._body_cache_key = None  # 【第 10 轮】正文渲染缓存：上次渲染时的 buffer 内容
+        self._body_cache_value = None  # 【第 10 轮】正文渲染缓存：对应的 renderable
 
     # -------------------------------------------------------------------------
     # 一、消息类
@@ -223,51 +230,120 @@ class DisplayManager:
     # 三、流式显示
     # -------------------------------------------------------------------------
     def start_stream_display(self, refresh_rate: int = 10) -> None:
-        """
-        Start streaming display mode.（开启流式显示模式）
+        """开启流式显示（2026-11-07 第 10 轮重写）
 
-        【2026-11-06 第 4 轮】圆点 ⏺ 现在画在"流式区域"内部，
-        而不是事先单独打一行。好处是：模型只调工具、不说话时，
-        屏幕上不会多出一个空圆点。
+        改前：一上来就开一个 rich Live，让它在 spinner 和正文之间来回切。
+        改后分成两段：
+          1. **等待段**：一根单行 spinner，跑在后台线程里，用 `\\r` + 清行覆盖自己；
+          2. **正文段**：第一个真字到达时才创建 Live，之后内容只增不减。
+
+        为什么等待段不用 Live？
+          `rich.Live` 的重绘方式是"光标上移 N 行，然后重写覆盖"，它**不发清行指令**
+          （实测捕获的输出里 `\\x1b[2K` 出现 0 次）。等待态是 1 行、正文态是 2 行以上，
+          高度一变，上移的行数就对不上，旧帧擦不干净，和新帧叠在一起——
+          屏幕上就是橙色的 ✻ 和绿色的 ● 交替闪。
+          单行场景根本不需要 Live：`\\r\\x1b[2K` + 重写，一行永远只有一行。
         """
         self._stream_buffer = ""  # 清空缓冲区，准备接收新内容
-        self._stream_has_content = False  # 【第 10 轮】本轮是否已经出现过"真正的文字"
-        self._thought_seconds = 0.0  # 【第 10 轮】思考耗时先归零
-        self._stream_start = time.time()  # 【第 7 轮】记下开始等待的时刻
+        self._stream_has_content = False  # 本轮是否已经出现过"真正的文字"
+        self._thought_seconds = 0.0  # 思考耗时先归零
+        self._stream_start = time.time()  # 记下开始等待的时刻
+        self._live = None  # 正文段的 Live，等真有内容了再建
+        self._refresh_rate = refresh_rate
+        self._spinner_stop = threading.Event()
+        self._spinner_thread = None
+        if self._is_tty():  # 被重定向到文件/管道时没有光标可以移动，不该启动 spinner
+            self._spinner_thread = threading.Thread(target=self._spin_loop, daemon=True)
+            self._spinner_thread.start()
+
+    @staticmethod
+    def _is_tty() -> bool:
+        """当前输出是不是真终端（2026-11-07 第 10 轮新增）
+
+        非 tty 时写转义码只会污染输出文件，所以 spinner 直接不启动。
+        用 isatty 而不是 rich 的 console.is_terminal，是为了不受 rich 缓冲影响。
+        """
+        try:
+            return bool(sys.stdout.isatty())
+        except Exception:
+            return False
+
+    def _spin_loop(self) -> None:
+        """等待动画：一根原地转的橙色星芒（2026-11-07 第 10 轮新增）
+
+        每 120ms 重画一次同一行，写法是 `\\r`（回到行首）+ 新内容 + 几个空格。
+
+        为什么末尾要补空格、而不是发 `\\x1b[2K` 清行？
+          2K 是标准 CSI，Windows Terminal 支持，但不是所有终端实现都老实执行
+          （实测在伪终端里抓取时，清行之后上一帧的尾巴还留在右边，
+          屏幕上就是"✻ 正在思考… (1s)  Thought for 1s … (1s)"这种粘连）。
+          用空格把旧内容覆盖掉，不依赖终端对清行指令的支持，最稳。
+          秒数只会变长（0s → 10s 多一位），补 4 个空格足够吃掉上一帧多出来的部分。
+
+        线程是 daemon：万一主流程异常退出，它不会拖住进程。
+        """
+        try:
+            while not self._spinner_stop.is_set():
+                elapsed = time.time() - self._stream_start
+                frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]
+                line = (
+                    f"{theme.ACCENT_ANSI}{frame}{theme.RESET_ANSI} "
+                    f"{theme.DIM_ANSI}正在思考… ({int(elapsed)}s){theme.RESET_ANSI}"
+                )
+                sys.stdout.write("\r" + line + " " * 4)
+                sys.stdout.flush()
+                self._spinner_stop.wait(0.12)  # 用 Event.wait 代替 sleep：能立刻响应停止
+        except Exception:  # spinner 出问题绝不能影响主流程
+            pass
+
+    def _stop_spinner(self) -> None:
+        """停掉等待动画，并把那一行擦干净（2026-11-07 第 10 轮新增）
+
+        必须 join：否则线程可能在正文已经开始输出之后，还在往同一行写东西，
+        造成"正文第一行被 spinner 覆盖"这种更诡异的画面。
+
+        清行同样用空格覆盖（不用 2K），并把光标送回行首，
+        让接下来的 `console.print(Thought)` 从第 0 列开始写。
+
+        只有"确实停掉了一个在跑的 spinner"才擦。否则在从未启动过 spinner 的场景
+        （非 tty、纯工具轮次）也会擦一次，把用户刚敲的那一行抹掉。
+        """
+        stopped = False
+        if self._spinner_thread is not None:
+            self._spinner_stop.set()
+            self._spinner_thread.join(timeout=1.0)
+            self._spinner_thread = None
+            stopped = True
+        if stopped and self._is_tty():
+            sys.stdout.write("\r" + " " * 60 + "\r")
+            sys.stdout.flush()
+
+    def _start_body_live(self) -> None:
+        """正文段：第一个真字到达后才启动 Live（2026-11-07 第 10 轮新增）
+
+        这一段用 Live 是合理的：内容只增不减，重绘区域高度单调变高，
+        不会出现"这一帧比上一帧短"的擦除问题。
+
+        renderable 做了缓存：Live 每秒取 10 次，如果每次都重新解析 Markdown，
+        长回复时每帧都要把整段重新排版一遍，CPU 一忙刷新就不均匀——
+        视觉上就是"一顿一顿地闪"。只有 buffer 真的变了才重新构建。
+        """
+        self._body_cache_key = None
+        self._body_cache_value = None
         self._live = Live(
             console=self._console,
-            refresh_per_second=refresh_rate,
-            vertical_overflow="visible",  # 内容超过一屏时保留滚动，不要裁掉
-            get_renderable=self._stream_renderable,  # 每次刷新都调用这个函数拿最新画面
+            refresh_per_second=self._refresh_rate,
+            vertical_overflow="visible",
+            get_renderable=self._body_renderable,
         )
-        self._live.start()  # 开始刷新
+        self._live.start()
 
-    def _stream_renderable(self):
-        """根据当前缓冲区生成"这一帧"要显示的内容（2026-11-06 第 4 轮新增）
-
-        【第 7 轮】缓冲区为空时不再显示空白，而是显示 Claude Code 那种等待动画：
-            ✻ 正在思考… (3s)
-        因为 Live 每秒钟会刷新十几次，这个函数会被反复调用，
-        每次都用"当前时间 - 开始时间"算秒数，秒数就会自己往上走。
-
-        【2026-11-07 第 10 轮】修掉"橙绿交替闪"：
-          原来判断的是 `if not self._stream_buffer` —— 缓冲区是"当前这一帧有没有字"。
-          但流式接口会先发几个空 delta（""、"\n"），缓冲区的真假状态就跟着抖，
-          于是这一帧画 spinner（橙 ✻）、下一帧画正文（绿 ●）、再下一帧又回到 spinner，
-          屏幕上就是两个标志交替闪。
-          现在改用"一次性开关" _stream_has_content：只要出现过一次真文字，
-          后面哪怕收到空 delta，也永远停在正文态，不再退回 spinner。
-        """
-        if not self._stream_has_content:  # 还没收到真正的内容，说明模型还在想
-            return self._spinner_renderable()
-
-        # 【第 10 轮】正文态。如果"想"的时间超过 1 秒，先在正文上方补一行
-        # `  Thought for 3s (ctrl+o to expand)`，对齐截图。
-        # 少于 1 秒不显示——否则每句回复上面都挂一行 "Thought for 0s"，纯噪音。
-        body = self._bullet_block(Markdown(self._stream_buffer))
-        if self._thought_seconds >= 1:
-            return Group(self._thought_line(), body)
-        return body
+    def _body_renderable(self):
+        """取正文这一帧要画的内容，带一级缓存（2026-11-07 第 10 轮新增）"""
+        if self._body_cache_key != self._stream_buffer:
+            self._body_cache_key = self._stream_buffer
+            self._body_cache_value = self._bullet_block(Markdown(self._stream_buffer))
+        return self._body_cache_value
 
     def _thought_line(self) -> Text:
         """生成 `  Thought for 3s (ctrl+o to expand)` 这一行（2026-11-07 第 10 轮新增）
@@ -285,19 +361,6 @@ class DisplayManager:
         text.append(" (ctrl+o to expand)", style="qs.dim")
         return text
 
-    def _spinner_renderable(self):
-        """生成等待动画的一帧（2026-11-06 第 7 轮新增）
-
-        星号在四个形状之间轮换，看起来像在转；后面跟着已经等了多少秒。
-        """
-        elapsed = time.time() - self._stream_start  # 已经等了多久
-        frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]  # 每秒换 8 次
-        line = Text()
-        line.append(f"{frame} ", style=f"bold {theme.ACCENT}")  # 星号用 Claude 橙
-        line.append("正在思考…", style="qs.dim")
-        line.append(f" ({elapsed:.0f}s)", style="qs.dim")  # 秒数，给自己一个"还在动"的反馈
-        return line
-
     def stop_stream_display(self, show_done: bool = True) -> None:
         """Stop streaming display mode.（结束流式显示模式）
 
@@ -309,20 +372,23 @@ class DisplayManager:
         【2026-11-07 第 10 轮】结尾补一行 `✻ Cooked for 7s · done 11:38`，
         对齐截图里 Claude Code 的收尾行。只在"这一轮模型真的说了话"时打印——
         纯工具调用的轮次不打印，否则一屏里会出现三四条 Cooked。
+
+        【第 10 轮重写】先无条件把 spinner 收掉：
+        模型只调工具、一个字都不说时，正文 Live 根本没启动过，
+        原来的写法在这种轮次里不会清掉 spinner 行，它就留在屏幕上变成一条残影。
         """
-        if self._live:  # 如果当前确实在刷新
-            had_content = self._stream_has_content  # 之前有没有真的输出过文字
-            if not had_content:  # 这一轮只有工具调用、没有文字
-                # 把这块区域标记成"临时的"：rich 在 stop() 时会自动擦掉它，
-                # 而不是把最后一帧 spinner 留在屏幕上。
-                # 不能只 update(Text(""))——那样在非交互环境（输出被重定向）里会残留一行。
-                self._live.transient = True
-            self._live.stop()  # 停掉它（不然它会一直占着屏幕）
-            self._live = None  # 清空引用
-            if had_content:  # 有文字才补换行（纯工具调用的轮次不需要）
+        self._stop_spinner()  # 不管有没有正文，先把等待动画擦干净
+
+        if self._live:  # 这一轮真的输出了正文
+            self._live.stop()
+            self._live = None
+            # 真终端里 Live.stop() 自己会补一个换行；输出被重定向到文件/管道时不会，
+            # 那样 Cooked 行就会粘在正文末尾（实测"…可以帮你？  ✻ Cooked for 1s"）。
+            # 所以只在非 tty 场景补这一行，tty 下补了会多出一个空行。
+            if not self._is_tty():
                 self._console.print()
-                if show_done:  # 收尾行
-                    self._print_done_line()
+            if show_done:
+                self._print_done_line()
 
     def _print_done_line(self) -> None:
         """打印这一轮的收尾行（2026-11-07 第 10 轮新增）
@@ -352,12 +418,16 @@ class DisplayManager:
         self._stream_buffer += chunk  # 把新来的这一小段接到后面
         # 【第 10 轮】只有"有实义的字"才算内容开始。
         #   流式接口经常先发 "\n"、"" 这种空 delta，如果拿它们当"已经有内容"，
-        #   界面就会在 spinner 和正文之间反复横跳（这正是之前橙绿交替闪的第二个成因）。
+        #   界面就会在 spinner 和正文之间反复横跳（这正是橙绿交替闪的第二个成因）。
         if chunk and chunk.strip():
-            if not self._stream_has_content:  # 第一次收到真文字：把"思考耗时"定格
+            if not self._stream_has_content:  # 第一次收到真文字：从"等待段"切到"正文段"
                 self._thought_seconds = time.time() - self._stream_start
-            self._stream_has_content = True
-        # 不用手动 update：Live 会按 refresh_per_second 自己去取 _stream_renderable()
+                self._stream_has_content = True
+                self._stop_spinner()  # 先把 spinner 那行擦掉，否则它会和正文抢同一行
+                if self._thought_seconds >= 1:  # 想得太快就别挂 Thought 行了
+                    self._console.print(self._thought_line())
+                self._start_body_live()
+            # 后续 chunk 不用手动 update：正文 Live 会按 refresh_per_second 自己重画
 
     def get_stream_buffer(self) -> str:
         """Get the current stream buffer content.（把缓冲区里的内容取出来）"""
@@ -365,8 +435,9 @@ class DisplayManager:
 
     def clear_stream_buffer(self) -> None:
         """Clear the stream buffer.（清空缓冲区）"""
+        self._stop_spinner()  # 【第 10 轮】顺手把还在转的 spinner 停掉
         self._stream_buffer = ""
-        self._stream_has_content = False  # 【第 10 轮】连同"已有内容"的标记一起复位
+        self._stream_has_content = False  # 连同"已有内容"的标记一起复位
         self._thought_seconds = 0.0
 
     # -------------------------------------------------------------------------
