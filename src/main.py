@@ -101,18 +101,35 @@ def welcome():
 
 
 
-async def main():
+async def main(resume_path=None):
     # 定义主函数。前面带 async 表示它是"异步函数"，里面有等网络的操作也不会卡住界面
     welcome()  # 先画欢迎框
     conversation = Conversation()  # 先创建对话总管，后面收尾时还要用到它
     try:
-        await conversation.start_conversation()
+        await conversation.start_conversation(resume_path)
         # start_conversation() 是启动聊天，await 的意思是"在这儿等着，但等待的时候不占着 CPU"
+        # 【第 13 轮】多了个参数：传会话文件路径表示"接着上次聊"，传 None 表示全新开始
     finally:
         # 【2026-11-06 第 2 轮新增】不管正常结束还是被 Ctrl+C 打断，都要收尾
         #   不收尾的话：MCP 那些外部服务器进程会留在后台变成孤儿进程，
         #   退出时还会打一段 "cancel scope" 的报错。
         await conversation.shutdown()
+
+
+def run_continue():
+    """找到本项目最近的一次会话，返回它的文件路径（2026-11-07 第 13 轮）
+
+    为什么限定"本项目"：在 A 项目里说 --continue，接下的是 A 上次的话题。
+    如果跨项目恢复，模型会拿着一堆另一个项目的上下文，反而更糊涂。
+    """
+    from core.session import SessionStore
+
+    path = SessionStore.latest(os.getcwd())
+    if path is None:
+        console.print(Text("  没有找到可恢复的会话，这次从头开始。", style=WARN))
+    else:
+        console.print(Text(f"  接着上次的会话：{path.name}", style=DIM))
+    return path
 
 
 def run_init(force: bool = False, scope: str = "project"):
@@ -165,8 +182,13 @@ def cli():
         console.print(f"thinker v{VERSION}")
         return
 
+    # 【第 13 轮】--continue：接着本项目最近一次会话聊
+    resume_path = None
+    if "--continue" in argv or "-c" in argv:
+        resume_path = run_continue()
+
     try:
-        asyncio.run(main())
+        asyncio.run(main(resume_path))
         # asyncio.run 是异步世界的"启动器"：它负责建立一个事件循环，把 main() 跑起来，跑完再收尾
     except KeyboardInterrupt:
         # 【2026-11-06 第 2 轮新增】用户按 Ctrl+C 时，别再打一大段红色堆栈吓人，说句话就好

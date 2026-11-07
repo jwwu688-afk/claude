@@ -22,13 +22,16 @@ Conversation management with refactored UI components and history manager integr
 
 import asyncio  # 【2026-11-06 第 2 轮新增】摘要生成要把同步的接口调用丢到线程池，需要用到它
 import json  # json 库：把模型给的"参数字符串"解析成真正的 Python 字典
+import os  # 【第 13 轮】取当前目录，写进会话文件的 header
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
 from core.api_client import APIClient  # 导入 API 客户端：真正发请求给大模型的家伙
 from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各处各写一个数
 from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
 from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器：负责生成"系统提示词"
 from core.prompt.reminder import get_reminder  # 导入函数：生成一段"提醒模型去看 todo"的文字
+from core.session import SessionStore, load_messages_for_resume  # 【第 13 轮】会话持久化
 from tools.tool_manager import ToolManager  # 导入工具管理器：负责注册工具、执行工具
+from ui.esc_watcher import EscWatcher  # 【第 13 轮】Esc 打断
 from ui.ui_manager import UIManager  # 导入界面管理器：负责显示和要输入
 from ui.theme import DOT  # 【第 4 轮】状态行里的分隔点 ·
 from .history.history_manager import HistoryManager, message_text  # 导入历史管理器；message_text 用来把消息转成纯文本
@@ -115,6 +118,9 @@ class Conversation:
             #   而不是直接把旧消息删掉（那样模型会真的忘事）。
             self._history_manager.set_summarizer(self._summarize_messages)
             self._prompt_manager = PromptManager()  # 建提示词管理器
+            # 【2026-11-07 第 13 轮】会话落盘 + Esc 打断
+            self._session = None  # 当前会话的存储句柄，start_conversation 时才创建
+            self._esc = EscWatcher()  # 监听 Esc 的后台线程（不支持的平台会自动降级）
             self._initialized = True  # 打上标记，下次不再重复创建
 
     @property
@@ -134,11 +140,27 @@ class Conversation:
         return self._task_depth > 0  # 深度大于 0 就是子 agent
 
     def add_message(self, message):
-        """Add message through history manager.（往当前对话里追加一条消息）"""
-        self._history_manager.add_message(message)  # 转手交给历史管理器
+        """Add message through history manager.（往当前对话里追加一条消息）
 
-    async def start_conversation(self):
-        """Start a new conversation.（开始一次全新的对话：这是用户按下回车后的第一步）"""
+        【第 13 轮】顺手把消息写进会话文件，这样进程被杀也不会丢上下文。
+        只在主 agent 时写：子 agent 的消息属于"临时草稿"，最后只会把结论交回来，
+        把它们也落盘会让会话文件里混进大量无关内容，恢复时反而干扰模型。
+        """
+        self._history_manager.add_message(message)  # 转手交给历史管理器
+        # 【第 13 轮】用 getattr 兜底而不是直接 self._session：
+        #   单例的 __init__ 只在第一次执行，某些测试/子 agent 场景下对象是先 __new__ 出来的，
+        #   属性可能还没被赋值。用 getattr 拿默认值，比依赖初始化顺序更稳。
+        session = getattr(self, "_session", None)
+        if session is not None and not self.is_subagent:
+            session.append_message(message)  # 追加一行到 JSONL
+
+    async def start_conversation(self, resume_path=None):
+        """Start a new conversation.（开始一次全新的对话：这是用户按下回车后的第一步）
+
+        参数 resume_path（第 13 轮新增）：
+          传了会话文件路径 → 恢复那次对话，接着聊；
+          传 None → 全新开始。
+        """
         # 【第 12 轮】先把记忆目录建出来。
         #   为什么要在这里做：模型第一次想写记忆时，如果目录不存在，
         #   file_write 可能因为"父目录不存在"失败，那次记忆就丢了。
@@ -158,7 +180,23 @@ class Conversation:
                 # 这一块是文字，内容是提示词管理器生成的"系统提示词"（人设、规则、当前环境）
             ]
         }
-        self.add_message(system_message)  # 把系统提示词放进消息列表（永远排在最前面）
+
+        # 【第 13 轮】建立会话存储。
+        #   恢复时直接续写**原来那个文件**，而不是新建一个——这样一次对话
+        #   从头到尾都在同一个 JSONL 里，翻起来是连续的，也不会重复存旧消息。
+        if resume_path:
+            self._session = SessionStore(resume_path)
+            restored = load_messages_for_resume(resume_path)
+            # 系统提示词用新生成的替换旧的：里面的日期、目录、项目记忆可能是几天前的，
+            # 照搬会让模型拿着过期信息干活。user / assistant / tool 消息原样保留。
+            self._history_manager.messages_history[-1] = [system_message] + restored
+            self._ui_manager.print_info(f"已恢复上次会话：{len(restored)} 条消息")
+        else:
+            self._session = SessionStore.create(
+                cwd=os.getcwd(),
+                model=getattr(self._api_client, "model", "") or "",
+            )
+            self.add_message(system_message)  # 把系统提示词放进消息列表（永远排在最前面）
 
         user_input = await self._ui_manager.get_user_input()  # 等用户打字，await 表示"在这儿等"
         user_message = {
@@ -301,25 +339,68 @@ class Conversation:
             # Start streaming display
             self._ui_manager.start_stream_display()  # 开启"实时刷新显示"模式（界面上会动）
 
+            # 【第 13 轮】开始监听 Esc。
+            #   放 start() 之前先 reset()：上一轮可能按过 Esc，标志不清会让这一轮
+            #   刚开始就被判成"已中断"。
+            #   try/finally 保证无论怎么退出（正常读完、中断、抛异常）都会 stop，
+            #   否则监听线程会活到下一次 start，和新线程抢键盘。
+            esc = getattr(self, "_esc", None)  # 兜底：没初始化过就当没有 Esc 打断
+            if esc is not None:
+                esc.reset()
+                esc.start()
+            interrupted = False  # 这一轮是不是被用户打断的
+
             # Process streaming response
-            for chunk in iterator:  # 一段一段收
-                if isinstance(chunk, str):  # 情况一：这是一小段文字
-                    # This is content chunk
-                    full_content += chunk  # 拼到总文字上
-                    self._ui_manager.print_streaming_content(chunk)  # 立刻显示出来
-                elif hasattr(chunk, 'role') and chunk.role == 'assistant':  # 情况二：这是最后那条完整消息
-                    # This is the final message object (ChatCompletionMessage)
-                    response_message = chunk  # 存起来
-                    # Extract usage information if present
-                    if hasattr(chunk, 'usage') and chunk.usage:  # 如果它带着用量
+            try:
+                for chunk in iterator:  # 一段一段收
+                    if esc is not None and esc.triggered:  # 用户按了 Esc
+                        interrupted = True
+                        break
+                    if isinstance(chunk, str):  # 情况一：这是一小段文字
+                        # This is content chunk
+                        full_content += chunk  # 拼到总文字上
+                        self._ui_manager.print_streaming_content(chunk)  # 立刻显示出来
+                    elif hasattr(chunk, 'role') and chunk.role == 'assistant':  # 情况二：这是最后那条完整消息
+                        # This is the final message object (ChatCompletionMessage)
+                        response_message = chunk  # 存起来
+                        # Extract usage information if present
+                        if hasattr(chunk, 'usage') and chunk.usage:  # 如果它带着用量
+                            token_usage = chunk.usage  # 记下来
+                        break  # 已经拿到完整消息了，后面的不用再读，跳出循环
+                    elif hasattr(chunk, 'usage') and chunk.usage:  # 情况三：这是个独立的用量数据
+                        # This is standalone token usage information
                         token_usage = chunk.usage  # 记下来
-                    break  # 已经拿到完整消息了，后面的不用再读，跳出循环
-                elif hasattr(chunk, 'usage') and chunk.usage:  # 情况三：这是个独立的用量数据
-                    # This is standalone token usage information
-                    token_usage = chunk.usage  # 记下来
+            finally:
+                if esc is not None:
+                    esc.stop()  # 收掉监听线程
 
             # End streaming display
-            self._ui_manager.stop_stream_display()  # 关闭实时刷新模式
+            # 中断时不打 `Cooked for Ns` 收尾行——那一轮根本没跑完，打上去是误导。
+            self._ui_manager.stop_stream_display(show_done=not interrupted)
+
+            # 【第 13 轮】被中断：保住已经说出来的部分，然后直接问用户下一步。
+            if interrupted:
+                text = full_content.strip()
+                if text:  # 已经输出过内容才存，一个字都没说就没什么好留的
+                    # 标上 [已中断]：模型下次读历史时能看出"这条是被打断的半截话"，
+                    # 不会误以为那就是它的完整回答。
+                    self.add_message({
+                        "role": "assistant",
+                        "content": [{"type": "text", "text": f"{text}\n\n[用户中断]"}],
+                    })
+                self._ui_manager.print_info("已中断（Esc）。直接说你想怎么改。")
+                if self.is_subagent:
+                    return False  # 子 agent 被打断：这一页该收尾了
+                # 主 agent：等用户下一句话。这里手动走一遍"等输入"的流程，
+                # 而不是 return True 让外层再转一圈——那样会立刻又去请求模型，
+                # 用户根本没机会改口。
+                user_input = await self._ui_manager.get_user_input()
+                user_message = {
+                    "role": "user",
+                    "content": [{"type": "text", "text": user_input}],
+                }
+                self.add_message(user_message)
+                return True
 
             # If no complete response message, create one
             if response_message is None:  # 万一没收到"完整消息"（有些接口不返回）
