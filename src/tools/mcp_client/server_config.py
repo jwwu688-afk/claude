@@ -1,6 +1,6 @@
 # =============================================================================
 # 文件：src/tools/mcp_client/server_config.py
-# 作用：读取 MCP 服务器的配置文件（~/.quickstar/mcp.json），变成程序能用的对象。
+# 作用：读取 MCP 服务器的配置文件（~/.thinker/mcp.json），变成程序能用的对象。
 #
 # 配置文件长这样：
 #   {
@@ -38,7 +38,7 @@ class MCPConfig:
     def __init__(self, config_path: str):
         self.config_path = Path(config_path).expanduser()
         # expanduser() 的作用：把路径开头的 ~ 换成你的用户目录
-        # 所以 "~/.quickstar/mcp.json" 会变成 "C:/Users/23889/.quickstar/mcp.json"
+        # 所以 "~/.thinker/mcp.json" 会变成 "C:/Users/23889/.thinker/mcp.json"
         self.servers: Dict[str, MCPServer] = {}  # 存所有服务器，键是名字
         self._load_config()  # 造对象时就顺便把配置读进来
 
@@ -46,7 +46,7 @@ class MCPConfig:
         if not self.config_path.exists():  # 如果配置文件不存在
             # 【2026-11-06 优化】原来这里是直接抛 FileNotFoundError，
             #   而这个对象在 ToolManager 创建时就会被 new 出来，
-            #   结果就是：没建 ~/.quickstar/mcp.json 的人，整个 CLI 根本起不来。
+            #   结果就是：没建 ~/.thinker/mcp.json 的人，整个 CLI 根本起不来。
             #   现在改成"打印一句提示，然后当作没有外部工具"，
             #   内置工具（cmd_runner 等）该能用还是能用。
             print(f"[MCP] 未找到配置文件 {self.config_path}，本次跳过外部工具（内置工具不受影响）")

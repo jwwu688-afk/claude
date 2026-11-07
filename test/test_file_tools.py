@@ -49,7 +49,7 @@ def setup_workspace():
     global _TMP
     if _TMP is not None:  # 先把上一个临时目录清掉
         _TMP.cleanup()
-    _TMP = tempfile.TemporaryDirectory(prefix="quickstar_filetools_")  # 新建一个
+    _TMP = tempfile.TemporaryDirectory(prefix="thinker_filetools_")  # 新建一个
     root = Path(_TMP.name).resolve()
     file_tools.WORKSPACE_ROOT = root  # 把工具认的工作区指到临时目录
     _read_files.clear()  # 清空"已读文件"记录
@@ -322,22 +322,22 @@ def test_grep_basic():
 
 
 def test_workspace_boundary_switch():
-    """测试：默认挡住工作区外；设 QUICKSTAR_ALLOW_OUTSIDE=1 后放行"""
+    """测试：默认挡住工作区外；设 THINKER_ALLOW_OUTSIDE=1 后放行"""
     print("\n测试: 工作区边界开关")
     root = setup_workspace()
-    other = tempfile.TemporaryDirectory(prefix="quickstar_outside_")  # 另一个目录，模拟工作区外
+    other = tempfile.TemporaryDirectory(prefix="thinker_outside_")  # 另一个目录，模拟工作区外
     outside_file = Path(other.name) / "outside.txt"
     outside_file.write_text("外面的内容", encoding="utf-8")
 
     out = run(FileRead().act(path=str(outside_file)))
     assert "路径超出工作区" in out, out  # 默认拒绝
 
-    os.environ["QUICKSTAR_ALLOW_OUTSIDE"] = "1"  # 打开开关
+    os.environ["THINKER_ALLOW_OUTSIDE"] = "1"  # 打开开关
     try:
         out = run(FileRead().act(path=str(outside_file)))
         assert "外面的内容" in out, out  # 放行后能读到
     finally:
-        os.environ.pop("QUICKSTAR_ALLOW_OUTSIDE", None)  # 一定要还原，别影响后面的用例
+        os.environ.pop("THINKER_ALLOW_OUTSIDE", None)  # 一定要还原，别影响后面的用例
         other.cleanup()  # 删掉临时目录
     print("✓ 通过: 默认拒绝越界，开关打开后放行")
 

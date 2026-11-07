@@ -22,6 +22,7 @@
 import asyncio  # 用来创建后台任务
 from typing import Optional  # 类型标注工具（这里其实没用到）
 from contextlib import AsyncExitStack  # "异步资源栈"：统一管理多个需要关闭的东西
+from pathlib import Path  # 路径处理，用来判断配置文件在不在
 
 from mcp import ClientSession, StdioServerParameters, LoggingLevel  # MCP 官方库的几个核心类
 from mcp.client.stdio import stdio_client  # 专门负责"用标准输入输出方式连接"的函数
@@ -40,8 +41,8 @@ class MCPClient:
         self.sessions: list[ClientSession] = []  # 存所有已经连上的会话（每个服务器一条）
         self.exit_stack = AsyncExitStack()
         # 资源栈：把所有"需要关闭的东西"（服务器进程、会话）都登记在这里，方便最后一次性全部关掉
-        self.config = MCPConfig("~/.quickstar/mcp.json")
-        # 读配置文件。~ 会被展开成你的用户目录，所以实际路径是 C:/Users/你的名字/.quickstar/mcp.json
+        self.config = MCPConfig(str(self._resolve_config_path()))
+        # 读配置文件。~ 会被展开成你的用户目录，所以实际路径是 C:/Users/你的名字/.thinker/mcp.json
         # 文件不存在会降级处理（见 server_config.py），不会抛异常
 
         # 【2026-11-06 第 2 轮优化】新增两个"信号灯"
@@ -61,6 +62,22 @@ class MCPClient:
         #   原来那行会直接抛 RuntimeError: no running event loop。
         #   现在改成"有循环就现在启动，没有就等第一次用到时再启动"。
         self._ensure_started()
+
+    @staticmethod
+    def _resolve_config_path() -> Path:
+        """决定去哪个路径读 MCP 配置（2026-11-07 改名兼容）
+
+        项目从 QuickStar 改名为 Thinker，配置目录也跟着从 ~/.quickstar 换成 ~/.thinker。
+        但老用户的配置文件还在旧目录里，直接切过去会导致"外部工具全部消失"。
+        所以：新目录优先，新目录不存在而旧目录存在时，继续用旧的。
+        """
+        new_path = Path("~/.thinker/mcp.json").expanduser()
+        if new_path.exists():
+            return new_path
+        legacy_path = Path("~/.quickstar/mcp.json").expanduser()
+        if legacy_path.exists():
+            return legacy_path
+        return new_path  # 两个都没有：返回新路径，让 server_config 打印"未找到"提示
 
     def _ensure_started(self):
         """确保后台任务已经启动（2026-11-06 第 2 轮新增，可重复调用）"""
@@ -172,7 +189,7 @@ class MCPClient:
 # 备注（这段代码的几个隐患，以及本轮处理情况）
 #
 # 1. 【2026-11-06 已修复】配置文件不存在就崩：
-#    原来 MCPConfig 找不到 ~/.quickstar/mcp.json 时会抛 FileNotFoundError，
+#    原来 MCPConfig 找不到 ~/.thinker/mcp.json 时会抛 FileNotFoundError，
 #    而这个对象在 ToolsManager 创建时就 new 出来，导致整个 CLI 起不来。
 #    现在改为"打印提示 + 跳过外部工具"，内置工具照常可用。
 #

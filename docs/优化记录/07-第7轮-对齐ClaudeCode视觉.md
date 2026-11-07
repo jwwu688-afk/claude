@@ -54,7 +54,7 @@ Claude Code 的界面其实非常克制：**绝大多数文字是默认白/灰**
             █   █ █   █  █  █     █  █  ...
             ████  ███  ███  ████ █   █  ...
   ✦ ──────────────────────────────────────── ✦
-   模型  spark-x2.6        目录  …/code/claude
+   模型  spark-x2.6        目录  …/code/thinker
 ```
 
 **改后**：
@@ -62,10 +62,10 @@ Claude Code 的界面其实非常克制：**绝大多数文字是默认白/灰**
 ```
 ╭──────────────────────────────────────────────────────────────────────╮
 │                                                                      │
-│                        ✻ Welcome to QuickStar                        │
+│                        ✻ Welcome to Thinker                        │
 │                                                                      │
 │                      spark-x2.6 · MCP 客户端版                       │
-│                            …/code/claude                             │
+│                            …/code/thinker                             │
 │                                                                      │
 ╰──────────────────────────────────────────────────────────────────────╯
   输入问题开始 · Ctrl+C 退出 · 上下文 80% 自动压缩
@@ -180,9 +180,9 @@ grid.add_row(Text("⏺"), Markdown(content))
 $ python -c "import main; main.welcome()"
 
 ╭──────────────────────────────────────────────────────────────────────╮
-│                        ✻ Welcome to QuickStar                        │
+│                        ✻ Welcome to Thinker                        │
 │                      spark-x2.6 · MCP 客户端版                       │
-│                            …/code/claude                             │
+│                            …/code/thinker                             │
 ╰──────────────────────────────────────────────────────────────────────╯
 ```
 
@@ -202,7 +202,7 @@ $ python -c "import main; main.welcome()"
 ```
 > 用 cmd_runner 执行 dir，然后用一句话告诉我目录里有什么。
 ⏺ cmd_runner(dir)
-  ⎿   驱动器 D 中的卷是 Data ⏎ 卷的序列号是 6480-B43B ⏎ D:\code\claude 的目录 ⏎ …（共 15 行）
+  ⎿   驱动器 D 中的卷是 Data ⏎ 卷的序列号是 6480-B43B ⏎ D:\code\thinker 的目录 ⏎ …（共 15 行）
   ⎿ 上下文 3.5% · 花费 $0 · 缓存命中 7040
 ⏺ 目录里有 .env、.env.example、.gitignore，以及
   .idea、docs、src、test 四个子目录。
@@ -231,7 +231,7 @@ $ python -c "import main; main.welcome()"
 ## 七、回滚
 
 ```bash
-cd D:/code/claude
+cd D:/code/thinker
 git log --oneline        # 找到「第 7 轮」提交
 git revert <commit-hash>
 ```

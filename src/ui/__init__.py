@@ -37,4 +37,4 @@ __all__ = [
 
 # Version information
 __version__ = '1.0.0'  # 版本号
-__author__ = 'Quick Star Team'  # 作者
+__author__ = 'Thinker Team'  # 作者

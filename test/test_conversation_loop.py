@@ -182,7 +182,7 @@ def test_tool_call_chain_approval():
     from tools import file_tools  # 要把工作区指到临时目录
     from tools.tool_manager import ToolManager
 
-    tmp = tempfile.TemporaryDirectory(prefix="quickstar_chain_")
+    tmp = tempfile.TemporaryDirectory(prefix="thinker_chain_")
     root = Path(tmp.name).resolve()
     file_tools.WORKSPACE_ROOT = root
     (root / "a.py").write_text("print('hi')\n", encoding="utf-8")

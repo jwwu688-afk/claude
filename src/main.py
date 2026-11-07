@@ -1,6 +1,6 @@
 # =============================================================================
 # 文件：src/main.py
-# 作用：整个程序的「大门」。你在命令行敲 quickstar 时，最先跑的就是这个文件。
+# 作用：整个程序的「大门」。你在命令行敲 thinker 时，最先跑的就是这个文件。
 #
 # 【整个程序是怎么转起来的】
 #   1. main.py 画欢迎框，然后唤醒 Conversation（对话总管）
@@ -15,7 +15,7 @@
 #   → tools/base_tool.py → 其他具体工具 → ui/
 #
 # 【2026-11-06 第 7 轮】欢迎页按 Claude Code 2.1 的实际样式重做：
-#   - 圆角细边框 + 居中标题「✻ Welcome to QuickStar」，用 Claude 品牌橙
+#   - 圆角细边框 + 居中标题「✻ Welcome to Thinker」，用 Claude 品牌橙
 #   - 框内只放三样：标题、模型+版本、当前目录
 #   - 框下是一行暗灰提示，不再是上一轮那套彩色大字和扫光动画
 #   （上一轮的做法可以从 git 历史里找回来，见第 5 轮提交）
@@ -33,7 +33,7 @@ from rich.text import Text  # 富文本：可以给一段文字的不同部分�
 def _readable_dir(path: str) -> str:
     """把路径显示得短一点
 
-    目录太长会把框撑破，只保留最后两级就够了，比如 D:\\code\\claude → …/code/claude
+    目录太长会把框撑破，只保留最后两级就够了，比如 D:\\code\\claude → …/code/thinker
     """
     parts = path.replace("\\", "/").rstrip("/").split("/")  # 统一成 / 再切开
     if len(parts) <= 2:  # 短路径就原样显示
@@ -53,7 +53,7 @@ def welcome():
     model = os.getenv("OPENAI_MODEL", "未配置")  # 当前用的模型
     body = Text(justify="center")  # 全部内容居中
     body.append(f"{STAR} ", style=f"bold {ACCENT}")  # 星号用品牌橙
-    body.append("Welcome to QuickStar", style=f"bold {ACCENT}")  # 标题也用一个颜色，不花
+    body.append("Welcome to Thinker", style=f"bold {ACCENT}")  # 标题也用一个颜色，不花
     body.append("\n\n")  # 标题和下面的信息之间留一行空白
     body.append(f"{model} · MCP 客户端版", style="")  # 第二行：模型 + 版本性质
     body.append("\n")
@@ -103,14 +103,14 @@ async def main():
 
 
 def cli():
-    # 定义命令行入口函数。pyproject.toml 里配置的 quickstar 命令，指向的就是这个函数
+    # 定义命令行入口函数。pyproject.toml 里配置的 thinker 命令，指向的就是这个函数
     try:
         asyncio.run(main())
         # asyncio.run 是异步世界的"启动器"：它负责建立一个事件循环，把 main() 跑起来，跑完再收尾
     except KeyboardInterrupt:
         # 【2026-11-06 第 2 轮新增】用户按 Ctrl+C 时，别再打一大段红色堆栈吓人，说句话就好
         console.print()
-        console.print(Text("  已退出 QuickStar。", style=DIM))
+        console.print(Text("  已退出 Thinker。", style=DIM))
 
 
 if __name__ == "__main__":

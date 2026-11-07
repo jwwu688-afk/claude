@@ -22,7 +22,7 @@
 #
 # 【两个安全设计】
 #   1. 路径边界：默认只允许访问工作区（启动时的工作目录）内的文件。
-#      真要访问外面的文件，设环境变量 QUICKSTAR_ALLOW_OUTSIDE=1。
+#      真要访问外面的文件，设环境变量 THINKER_ALLOW_OUTSIDE=1。
 #   2. 先读后写：file_write 覆盖已有文件、file_edit 修改文件之前，
 #      必须先用 file_read 读过。而且会比对内容的 SHA1——如果读过之后
 #      文件被别的程序改过，会拒绝修改，让模型重新读一遍。
@@ -79,14 +79,14 @@ _read_files = {}
 
 def _allow_outside() -> bool:
     """是否允许访问工作区外的文件（默认不允许，设环境变量才放开）"""
-    return os.getenv("QUICKSTAR_ALLOW_OUTSIDE") == "1"
+    return os.getenv("THINKER_ALLOW_OUTSIDE") == "1"
 
 
 def _within_workspace(path: Path) -> bool:
     """判断一个路径是否还在工作区里（2026-11-06 第 8 轮新增）
 
     用 relative_to 而不是字符串 startswith：
-      startswith("D:/code/claude") 会把 "D:/code/claude-other" 也当成在内部，
+      startswith("D:/code/thinker") 会把 "D:/code/thinker-other" 也当成在内部，
       relative_to 是按"路径段"比较的，不会误判。
     """
     if _allow_outside():  # 用户明确放开了边界
@@ -117,7 +117,7 @@ def _resolve_path(raw_path):
         return None, f"路径解析失败：{e}"
     if not _within_workspace(path):  # 跑到工作区外面去了
         return None, (f"路径超出工作区：{path}。当前工作区是 {WORKSPACE_ROOT}。"
-                      "如需访问工作区外的文件，请设置环境变量 QUICKSTAR_ALLOW_OUTSIDE=1。")
+                      "如需访问工作区外的文件，请设置环境变量 THINKER_ALLOW_OUTSIDE=1。")
     return path, ""
 
 
