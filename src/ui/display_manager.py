@@ -85,7 +85,11 @@ class DisplayManager:
         """
         grid = Table.grid(padding=(0, 0))  # 不留额外间距：● 本身在终端里占两格宽，天然有一个空格
         grid.add_column(width=2)  # 第一列：圆点占 2 列（符号 1 列 + 1 个空格），正文从第 3 列开始
-        grid.add_column()  # 第二列：正文，占满剩余宽度
+        # 【2026-11-07 第 11 轮】必须显式给 overflow="fold"！
+        #   rich 的 Table 列默认 overflow="ellipsis"——放在单元格里的大段 Markdown
+        #   不折行，整段被截成一行、行尾挂一个 "…"（实测复现：60 列下 6 行内容变 1 行）。
+        #   这就是"回答不换行、结尾全是省略号"的根因。fold = 强制按宽度折行。
+        grid.add_column(overflow="fold")  # 第二列：正文，占满剩余宽度
         grid.add_row(Text(theme.BULLET, style=f"bold {theme.BULLET_COLOR}"), content_renderable)
         # ↑ 圆点用加粗绿色：截图里助手回复和工具调用前面都是这个绿点
         return grid
@@ -242,7 +246,16 @@ class DisplayManager:
         改前：一上来就开一个 rich Live，让它在 spinner 和正文之间来回切。
         改后分成两段：
           1. **等待段**：一根单行 spinner，跑在后台线程里，用 `\\r` + 清行覆盖自己；
-          2. **正文段**：第一个真字到达时才创建 Live，之后内容只增不减。
+          2. **正文段**：第一个真字到达时才开始输出。
+
+        【2026-11-07 第 11 轮】正文段从 rich Live 改成"追加式打印"。
+          原因：Live 的重绘靠"光标上移 N 行 + 重写覆盖"擦掉旧帧，
+          这在 Anaconda PowerShell Prompt（conhost）里不可靠——旧帧擦不干净，
+          每 100ms 一帧全叠在屏幕上。加上省略号 bug 让每帧只有一行，
+          看起来就是"同一句话重复显示五六遍"（spinner 那轮踩过同一类坑）。
+          追加式打印内容只增不减、从不回头擦，任何终端都不会重影；
+          代价是流式过程中显示纯文本（markdown 原始记号可见），打完即定格。
+          想要旧的 Live 实时渲染：设环境变量 THINKER_STREAM=live。
 
         为什么等待段不用 Live？
           `rich.Live` 的重绘方式是"光标上移 N 行，然后重写覆盖"，它**不发清行指令**
@@ -256,10 +269,13 @@ class DisplayManager:
         self._stream_has_content = False  # 本轮是否已经出现过"真正的文字"
         self._thought_seconds = 0.0  # 思考耗时先归零
         self._stream_start = time.time()  # 记下开始等待的时刻
-        self._live = None  # 正文段的 Live，等真有内容了再建
+        self._live = None  # live 模式的正文 Live，等真有内容了再建
         self._refresh_rate = refresh_rate
         self._spinner_stop = threading.Event()
         self._spinner_thread = None
+        # 【第 11 轮】正文输出模式：plain = 追加式打印（默认，稳）；live = rich Live（要好看自行开启）
+        self._stream_mode = "live" if os.getenv("THINKER_STREAM") == "live" else "plain"
+        self._body_started = False  # 【第 11 轮】plain 模式下正文是否已经开始输出（圆点是否已打印）
         # 【第 10 轮】THINKER_NO_SPINNER=1 可以彻底关掉等待动画。
         #   留这个开关是因为不同终端的 ANSI 支持差异很大（Windows Terminal 正常，
         #   某些 IDE 内置终端对 \r 覆盖的处理不好）。真遇到问题可以一键退回"无动画"。
@@ -403,7 +419,19 @@ class DisplayManager:
         """
         self._stop_spinner()  # 不管有没有正文，先把等待动画擦干净
 
-        if self._live:  # 这一轮真的输出了正文
+        if self._stream_mode == "plain" and self._body_started:
+            # 【第 11 轮】plain 模式收尾：最后一行还没有换行符（chunk 是续着写的），
+            #   这里补一个换行把光标送回行首，后面的空行和 Cooked 行才不会粘在正文上。
+            self._console.file.write("\n")
+            self._console.file.flush()
+            self._body_started = False
+            self._console.print()  # 正文和 Cooked 之间留一个空行
+            if show_done:
+                self._print_done_line()
+                self._console.print()  # Cooked 之后也留一行，和下一轮内容分开
+            return
+
+        if self._live:  # 这一轮真的输出了正文（live 模式）
             self._live.stop()
             self._live = None
             # 【第 10 轮】正文和 Cooked 之间留一个空行，对齐 Claude Code 的呼吸感。
@@ -451,16 +479,36 @@ class DisplayManager:
         # 【第 10 轮】只有"有实义的字"才算内容开始。
         #   流式接口经常先发 "\n"、"" 这种空 delta，如果拿它们当"已经有内容"，
         #   界面就会在 spinner 和正文之间反复横跳（这正是橙绿交替闪的第二个成因）。
-        if chunk and chunk.strip():
-            if not self._stream_has_content:  # 第一次收到真文字：从"等待段"切到"正文段"
-                self._thought_seconds = time.time() - self._stream_start
-                self._stream_has_content = True
-                self._stop_spinner()  # 先把 spinner 那行擦掉，否则它会和正文抢同一行
-                self._console.print()  # 回复块和上面的输入区之间留一个空行
-                if self._thought_seconds >= 1:  # 想得太快就别挂 Thought 行了
-                    self._console.print(self._thought_line())
-                self._start_body_live()
-            # 后续 chunk 不用手动 update：正文 Live 会按 refresh_per_second 自己重画
+        # 【第 11 轮】切入正文的判定用 strip()（空白 chunk 不算"有实义的字"），
+        #   但正文开始后，空白 chunk（比如段落间的 '\n\n'）必须照写不误——
+        #   否则段落之间的空行被吞掉，两段话会粘在同一行上。
+        if chunk and chunk.strip() and not self._stream_has_content:
+            self._thought_seconds = time.time() - self._stream_start
+            self._stream_has_content = True
+            self._stop_spinner()  # 先把 spinner 那行擦掉，否则它会和正文抢同一行
+            self._console.print()  # 回复块和上面的输入区之间留一个空行
+            if self._thought_seconds >= 1:  # 想得太快就别挂 Thought 行了
+                self._console.print(self._thought_line())
+            if self._stream_mode == "plain":
+                # 【第 11 轮】plain 模式：打印绿色圆点后不再换行，
+                #   后面的 chunk 直接续写在同一行上，终端自己负责折行。
+                self._console.print(
+                    f"{theme.BULLET} ", style=f"bold {theme.BULLET_COLOR}", end=""
+                )
+                self._body_started = True
+            else:
+                self._start_body_live()  # live 模式：维持原来的 Live 实时渲染
+        if self._stream_mode == "plain" and self._body_started and chunk:
+            # 【第 11 轮】追加式输出：只往后写、从不回头擦。
+            #   写终端而不是走 rich，有两个原因：
+            #   1. rich 的每次 print 都按"整行从第 0 列开始"算折行，
+            #      不知道光标实际停在哪一列，续写长段会折错位置；
+            #   2. 终端原生折行对中文双宽字符的处理最可靠。
+            #   写 console.file 而不是直接写 sys.stdout，
+            #   是为了让测试可以注入 StringIO 假终端。
+            self._console.file.write(chunk)
+            self._console.file.flush()
+        # live 模式的后续 chunk 不用手动 update：Live 会按 refresh_per_second 自己重画
 
     def get_stream_buffer(self) -> str:
         """Get the current stream buffer content.（把缓冲区里的内容取出来）"""
@@ -472,6 +520,7 @@ class DisplayManager:
         self._stream_buffer = ""
         self._stream_has_content = False  # 连同"已有内容"的标记一起复位
         self._thought_seconds = 0.0
+        self._body_started = False  # 【第 11 轮】正文输出标记一并复位
 
     # -------------------------------------------------------------------------
     # 四、待办清单

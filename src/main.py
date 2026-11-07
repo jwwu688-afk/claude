@@ -23,8 +23,9 @@
 
 import asyncio  # 导入 asyncio 工具箱：让程序在"等网络回复"的时候还能去干别的事（异步）
 import os  # 用来读环境变量（拿模型名、压缩阈值）和当前目录
+import sys  # 【第 11 轮】读命令行参数（--init / --version）
 from core.conversation import Conversation  # 导入对话总管 Conversation 类，后面靠它启动聊天
-from ui.theme import console, ACCENT, DIM, WIDTH, STAR  # 统一的控制台、Claude 橙、暗灰、框宽、星号
+from ui.theme import console, ACCENT, DIM, WIDTH, STAR, OK, WARN  # 配色与符号
 from rich import box  # rich 的边框样式集合（这里用圆角那个）
 from rich.panel import Panel  # 面板：带边框的一块区域
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
@@ -114,8 +115,56 @@ async def main():
         await conversation.shutdown()
 
 
+def run_init(force: bool = False, scope: str = "project"):
+    """生成 THINKER.md 骨架（2026-11-07 第 11 轮新增，同日补了 --global）
+
+    用法：
+        thinker --init             项目记忆（写到当前目录）
+        thinker --init --global    全局记忆（写到 ~/.thinker/）
+
+    这是 Claude Code 里 `/init` 的等价物。Claude Code 的 `/init` 只生成项目级，
+    全局那份要用户自己在 `/memory` 里建——这里直接给个参数，省掉那一步。
+
+    挂成命令行参数而不是斜杠命令，是因为斜杠命令系统还没做，这一步不该等它。
+    """
+    from core.prompt.memory import GLOBAL_MEMORY_PATH, MEMORY_FILENAME, write_init_file
+
+    if scope == "global":
+        target = str(GLOBAL_MEMORY_PATH.expanduser())
+        what = "全局记忆"
+        next_step = "按实际习惯改「说话方式」「动手习惯」，尤其是那几条红线（不要自动提交）。"
+    else:
+        target = os.path.join(os.getcwd(), MEMORY_FILENAME)
+        what = "项目记忆"
+        next_step = "补充「代码约定」「不要做的事」两节，模型每轮都会读到。"
+
+    existed = os.path.exists(target)
+    path = write_init_file(force=force, scope=scope)
+
+    if existed and not force:
+        console.print(Text(f"  {what}已存在，没有覆盖：{path}", style=WARN))
+        console.print(Text("  想重新生成请加 --force", style=DIM))
+        return
+
+    console.print(Text(f"  已生成{what}：{path}", style=OK))
+    console.print(Text(f"  {next_step}", style=DIM))
+
+
 def cli():
     # 定义命令行入口函数。pyproject.toml 里配置的 thinker 命令，指向的就是这个函数
+    argv = sys.argv[1:]
+
+    # 【第 11 轮】先处理不进入对话的参数
+    if "--init" in argv:
+        run_init(
+            force="--force" in argv,
+            scope="global" if "--global" in argv else "project",
+        )
+        return
+    if "--version" in argv or "-v" in argv:
+        console.print(f"thinker v{VERSION}")
+        return
+
     try:
         asyncio.run(main())
         # asyncio.run 是异步世界的"启动器"：它负责建立一个事件循环，把 main() 跑起来，跑完再收尾
