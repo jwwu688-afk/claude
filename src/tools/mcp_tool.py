@@ -34,12 +34,51 @@ class McpTool(BaseTool):
         try:  # 试
             response = await self.session.call_tool(self.tool.name, kwargs)
             # call_tool 就是"远程调用"：告诉服务器"请执行你那个叫 xxx 的工具，参数是这些"
-            return response.content  # 把服务器的返回内容交回去
+            return self._content_to_text(response.content)
+            # 【2026-11-07 修复】原来直接返回 response.content，那是一个 TextContent 对象列表，
+            # 拼进对话后模型看到的是 [TextContent(type='text', text='6', annotations=None, meta=None)]
+            # ——相当于把 Python 的 repr 喂给模型，它得自己猜哪个才是结果。
+            # 现在把里面的 text 抽出来，模型直接看到 "6"。
         except Exception as e:  # 如果远程调用失败（服务器挂了、参数不对等）
             return f"调用外部 MCP 工具 {self.tool.name} 时出错：{e}"  # 返回错误信息，让模型知道
 
+    @staticmethod
+    def _content_to_text(content) -> str:
+        """把 MCP 返回的内容列表压成纯文本（2026-11-07 新增）
+
+        MCP 的返回值是一组内容块（可能有多段文字、图片、资源引用）。
+        我们这里只处理最常用的文本块；遇到别的类型就退回 str()，至少不丢信息。
+        多段之间用换行连接，保持"服务器给几段就是几段"的顺序。
+        """
+        if isinstance(content, str):  # 有些实现直接给字符串
+            return content
+        if isinstance(content, (list, tuple)):  # 标准形态：内容块列表
+            parts = []
+            for item in content:
+                text = getattr(item, "text", None)  # TextContent 的正文
+                parts.append(text if text is not None else str(item))
+            return "\n".join(parts)
+        return str(content)
+
+    def _input_schema(self) -> dict:
+        """取外部工具的参数格式，兼容 mcp 库 1.x 和 2.x（2026-11-07 新增）
+
+        为什么要兼容：两个环境装的 mcp 版本不一样——
+          mcp 1.x（claude 环境，1.14.1）字段叫 `inputSchema`（camelCase，照抄 JSON Schema 原文）
+          mcp 2.x（thinker 环境，2.3.0）改成了 `input_schema`（snake_case，符合 Python 习惯）
+        直接写死任何一个，另一个环境启动时就会抛
+        `AttributeError: 'Tool' object has no attribute 'inputSchema'`。
+
+        先取新名字，取不到再取老名字，两个都没有就当空参数（server 不接受参数的工具确实存在）。
+        """
+        schema = getattr(self.tool, "input_schema", None)  # mcp 2.x
+        if schema is None:
+            schema = getattr(self.tool, "inputSchema", None)  # mcp 1.x
+        return schema or {}
+
     def json_schema(self):
         # 直接把服务器给的说明转成我们需要的格式
+        schema = self._input_schema()
         return {
             "type": "function",
             "function": {
@@ -47,10 +86,10 @@ class McpTool(BaseTool):
                 "description": self.tool.description,  # 工具说明（服务器写的）
                 "parameters": {
                     "type": "object",
-                    "properties": self.tool.inputSchema.get("properties", {}),
+                    "properties": schema.get("properties", {}),
                     # 参数格式：直接用服务器给的（.get 表示取不到就给空字典）
-                    "required": self.tool.inputSchema.get("required", {})
-                    # 必填参数：同理（取不到给空字典，其实这里该给空列表更规范）
+                    "required": schema.get("required", [])
+                    # 必填参数：取不到给空列表（OpenAI 规范要求是数组，给 {} 会被某些服务端拒绝）
                 }
             }
         }

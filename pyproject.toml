@@ -7,6 +7,14 @@ name = "thinker"
 version = "0.2.0"
 description = "Thinker - a terminal coding agent"
 requires-python = ">=3.8"
+dependencies = [
+    "openai",
+    "python-dotenv",
+    "mcp",
+    "rich",
+    "anthropic",
+    "httpx",
+]
 
 [tool.setuptools.packages.find]
 where = ["src"]
