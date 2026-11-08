@@ -290,8 +290,10 @@ class BaseHistoryManager(ABC):
         pass
 
     @abstractmethod
-    async def _compress_current_message(self) -> None:
+    async def _compress_current_message(self, announce: bool = True) -> None:
         # 【2026-11-06 第 2 轮优化】抽象方法也改成异步，子类实现必须用它
+        # 【2026-11-08 第 14.5 轮】多了 announce 参数：/compact 手动压缩时，
+        #   由命令层自己打提示语，这里不要再说"上下文太长了"——用户明明是主动压的。
         pass
 
     @abstractmethod
@@ -503,9 +505,17 @@ class HistoryManager(BaseHistoryManager):
     # if there is more than one  session, compress the oldest chat session
     # else compress the current roll assistant output
     # tell the model we have compressed the messages
-    async def _compress_current_message(self) -> None:
-        """Compress current message history to save context window space（真正执行压缩）"""
-        self._ui_manager.print_info("上下文太长了，正在自动压缩…")  # 【第 4 轮】改成暗色提示，不再占据"模型发言"的位置
+    async def _compress_current_message(self, announce: bool = True) -> None:
+        """Compress current message history to save context window space（真正执行压缩）
+
+        参数 announce（2026-11-08 第 14.5 轮新增）：
+          True（默认）→ 自己打一句"上下文太长了，正在自动压缩…"，
+                        这是自动压缩的路径，用户没主动要求，需要知道发生了什么；
+          False       → 不打这句。/compact 是用户点名的，提示语由命令层统一说，
+                        再说一遍"太长了"既多余、又和用户的心智不符（他本来就嫌长）。
+        """
+        if announce:
+            self._ui_manager.print_info("上下文太长了，正在自动压缩…")  # 【第 4 轮】改成暗色提示，不再占据"模型发言"的位置
 
         current_messages = self.messages_history[-1]  # 拿到当前这一页
         user_indices = self._get_user_message_indices(current_messages)  # 找出所有"用户消息"的位置
@@ -515,6 +525,66 @@ class HistoryManager(BaseHistoryManager):
         elif len(user_indices) == 1:  # 如果只有一轮（用户只说过一句，后面全是来回调工具）
             # delete_message_num is hardcode to 3 right now
             await self._compress_single_session(current_messages, user_indices[0], 3)  # 就删掉紧跟在它后面的 3 条
+        # 一条用户消息都没有（页面里只有 system）时什么都不做：
+        #   没有"一轮对话"可以压，硬删只会把系统提示词也弄丢。
+
+    async def compact_now(self) -> dict:
+        """手动压缩一次，不看过没过阈值（2026-11-08 第 14.5 轮新增）
+
+        【和 auto_messages_compression() 的分工】
+          自动那条只在"超过 80%"时动手，目的是防止上下文爆掉，属于兜底；
+          这条是用户 /compact 点名的：什么时候压由人决定。
+          典型场景——刚让模型试了七八种写法，过程很长但结论只有一句，
+          这时上下文可能才 30%，压掉之后每一轮都省，却永远等不到 80%。
+          只有自动压缩的话，这种"该压但没到线"的情况用户没有手段。
+
+        【为什么先算压缩前的估算值】
+          压缩是"消息整体替换"，压完就看不出原来多大了。
+          而用户最想知道的就是"省了多少"，所以要在动手前留一份快照。
+          用 estimate_messages_tokens（第 13.1 轮加的）而不是接口返回的真实值：
+          这里没发请求，只能估；估算口径和恢复会话时一致，两个数字可比。
+
+        【三个副作用，必须让调用方知道】
+          1. 用量账本会被重算成压缩后的估算值。不重算的话 /cost 和状态行
+             会一直显示压缩前的占用，用户会以为压缩没生效——明明压了，数字没动，
+             这种"看起来没用"比真的没用更劝退。
+          2. 打上 _compressed_for_current_usage 标记，防止紧接着的自动检查
+             又压一次（第 9 轮那个"一旦过线连压三次"的坑）。
+          3. **前缀缓存失效**：消息列表整体换了，下一轮输入按原价计费。
+             这条在代码里没法消除，只能由 /compact 的提示语告诉用户，
+             否则他看到 /cost 里花费跳涨会以为出了 bug。
+
+        返回：{"before_count", "after_count", "before_tokens", "after_tokens"}
+              为什么返回字典而不是直接打印：命令层要统一措辞和缩进，
+              测试里也不想让输出混进断言。
+        """
+        before_messages = self.messages_history[-1]
+        before_count = len(before_messages)
+        before_tokens = estimate_messages_tokens(before_messages)
+
+        # announce=False：提示语交给 /compact 说，这里不要再说"上下文太长了"
+        await self._compress_current_message(announce=False)
+
+        after_messages = self.messages_history[-1]
+        after_count = len(after_messages)
+        after_tokens = estimate_messages_tokens(after_messages)
+
+        if after_count:  # 压完至少还有 system，正常不会是 0；防一手空页
+            usage = TokenUsage(input_tokens=after_tokens, output_tokens=0, total_tokens=after_tokens)
+            # output_tokens 记 0：压缩本身不产生"模型的输出"，它只是在整理输入。
+            if self.history_token_usage:
+                self.history_token_usage[-1] = usage
+            else:
+                self.history_token_usage.append(usage)
+
+        self._compressed_for_current_usage = True  # 本轮用量已处理，别让自动压缩再压一次
+
+        return {
+            "before_count": before_count,
+            "after_count": after_count,
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+        }
 
     @staticmethod
     def _role_of(message) -> Any:

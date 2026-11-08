@@ -16,6 +16,7 @@ import os
 import shutil
 import sys
 import tempfile
+import types
 from pathlib import Path
 
 sys.path.insert(0, os.path.join(os.path.dirname(__file__), "..", "src"))
@@ -31,6 +32,7 @@ import core.commands as commands  # noqa: E402
 import core.conversation as conversation_module  # noqa: E402
 import core.session as session_module  # noqa: E402
 from core.commands import is_command, parse  # noqa: E402
+from core.history.history_manager import HistoryManager  # noqa: E402
 
 passed = 0
 total = 0
@@ -290,28 +292,129 @@ def test_init_in_home_guard(tmp_root):
         asyncio.run(commands.cmd_init(FakeConv(ui2), "--here"))
         check("--here 放行", (workdir / "THINKER.md").is_file())
 
-        # 3) 命令行那条路径必须和 /init 一致：CLI 被拦、会话里能写，会更糊涂
-        (workdir / "THINKER.md").unlink()
-        from main import run_init
-
-        run_init()  # 主目录，无 --here
-        check("CLI --init 同样拒绝", not (workdir / "THINKER.md").exists())
-
-        run_init(here=True)
-        check("CLI --here 放行", (workdir / "THINKER.md").is_file())
-
-        # 4) --global 不该被拦：它写的是 ~/.thinker，本来就跟着人走、不跟项目走。
+        # 3) --global 不该被拦：它写的是 ~/.thinker，本来就跟着人走、不跟项目走。
         #    把全局路径临时改到 tmp 里，避免真的写进家目录。
         old_global = memory_module.GLOBAL_MEMORY_PATH
         memory_module.GLOBAL_MEMORY_PATH = Path(tmp_root) / "global_mem" / "THINKER.md"
         try:
-            run_init(scope="global")
+            ui3 = FakeUI()
+            asyncio.run(commands.cmd_init(FakeConv(ui3), "--global"))
             check("--global 不受主目录守卫影响", memory_module.GLOBAL_MEMORY_PATH.is_file())
         finally:
             memory_module.GLOBAL_MEMORY_PATH = old_global
     finally:
         os.chdir(old_cwd)
         memory_module.is_user_home = old_check
+
+
+def fresh_history_manager():
+    """拿一个账本干净的 HistoryManager
+
+    为什么要重置单例：HistoryManager 是共享的，上一个用例留下的消息和
+    用量会让断言失真。这是本项目所有涉及历史管理器的测试的统一写法。
+    """
+    HistoryManager._instance = None
+    HistoryManager._initialized = False
+    return HistoryManager()
+
+
+def test_compact():
+    print("测试: /compact")
+    hm = fresh_history_manager()
+    calls = []
+
+    async def fake_summary(messages):
+        calls.append(len(messages))
+        return "之前讨论了 A 方案，改了 a.py 的登录逻辑。"
+
+    hm.set_summarizer(fake_summary)
+    # 造两轮对话：压缩会把最老的一轮换成摘要公告
+    hm.messages_history[-1] = [
+        {"role": "system", "content": [{"type": "text", "text": "系统提示词"}]},
+        {"role": "user", "content": [{"type": "text", "text": "第一轮：" + "问题" * 200}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "回答" * 200}]},
+        {"role": "user", "content": [{"type": "text", "text": "第二轮：然后呢"}]},
+        {"role": "assistant", "content": [{"type": "text", "text": "然后这样"}]},
+    ]
+    before_count = len(hm.messages_history[-1])
+
+    ui = FakeUI()
+    conv = FakeConv(ui)
+    conv._history_manager = hm
+    asyncio.run(commands.cmd_compact(conv, ""))
+
+    after = hm.messages_history[-1]
+    text = ui.text()
+    check("条数变少", len(after) < before_count, f"{before_count} → {len(after)}")
+    check("系统提示词保留", after[0]["role"] == "system")
+    check("摘要被插进历史", any("已被压缩" in str(m) for m in after))
+    check("确实调用了摘要模型", len(calls) == 1, f"调用 {len(calls)} 次")
+    check("输出带前后 token 对比", "已压缩" in text and "token" in text)
+    check("提醒缓存会失效", "缓存会失效" in text)
+    check("账本被重算（不是旧数字）", hm.history_token_usage[-1].total_tokens > 0)
+    check("已压标记置位（防连环压缩）", hm._compressed_for_current_usage is True)
+
+
+def test_compact_nothing_to_do():
+    print("测试: /compact 无可压内容")
+    hm = fresh_history_manager()
+    calls = []
+
+    async def fake_summary(messages):
+        calls.append(1)
+        return "不该被调用"
+
+    hm.set_summarizer(fake_summary)
+    hm.messages_history[-1] = [{"role": "system", "content": [{"type": "text", "text": "系统"}]}]
+
+    ui = FakeUI()
+    conv = FakeConv(ui)
+    conv._history_manager = hm
+    asyncio.run(commands.cmd_compact(conv, ""))
+
+    check("提前拦下并说明原因", "没有可压缩" in ui.text())
+    check("没有白花一次摘要调用", calls == [], str(calls))
+    check("历史没被动过", len(hm.messages_history[-1]) == 1)
+
+
+def test_clear(tmp_root):
+    print("测试: /clear")
+    old_sessions_dir = session_module.SESSIONS_DIR
+    session_module.SESSIONS_DIR = Path(tmp_root) / "sessions_clear"  # 别污染真实会话目录
+    try:
+        hm = fresh_history_manager()
+        conv = conversation_module.Conversation.__new__(conversation_module.Conversation)
+        conv._history_manager = hm
+        conv._task_depth = 0
+        # cmd_clear 要用到 model（写进新会话 header）和系统提示词
+        conv._api_client = types.SimpleNamespace(model="test-model")
+        conv._prompt_manager = types.SimpleNamespace(get_system_prompt=lambda: "系统提示词")
+        conv._session = session_module.SessionStore.create(cwd=str(tmp_root), model="test-model")
+
+        old_path = conv._session.path
+        # 按真实顺序铺三条：系统提示词 + 一问一答。
+        # 为什么不省掉 system：reset_conversation 会先把整页清空、再把 system 放回，
+        # 少了它就看不出"清空后仍然保留系统提示词"这件事。
+        conv.add_message(conv.build_system_message())
+        conv.add_message({"role": "user", "content": [{"type": "text", "text": "你好"}]})
+        conv.add_message({"role": "assistant", "content": [{"type": "text", "text": "你好呀"}]})
+        before_count = len(hm.messages_history[-1])
+
+        ui = FakeUI()
+        conv._ui_manager = ui
+        asyncio.run(commands.cmd_clear(conv, ""))
+
+        after = hm.messages_history[-1]
+        check("清空前确实有多条", before_count == 3, str(before_count))
+        check("只剩系统提示词", len(after) == 1 and after[0]["role"] == "system")
+        check("换了新的会话文件", conv._session.path != old_path, conv._session.path.name)
+        check("旧文件仍保留（能 /resume 回去）", old_path.is_file())
+        check("新文件只有 header + system 两行",
+              len(conv._session.path.read_text(encoding="utf-8").strip().splitlines()) == 2)
+        check("提示旧会话还在", "旧会话仍在" in ui.text())
+        check("账本重算成新占用", hm.history_token_usage[-1].total_tokens > 0)
+    finally:
+        session_module.SESSIONS_DIR = old_sessions_dir
 
 
 def test_command_not_in_history():
@@ -369,6 +472,12 @@ if __name__ == "__main__":
         test_init(tmp_root)
         print()
         test_init_in_home_guard(tmp_root)
+        print()
+        test_compact()
+        print()
+        test_compact_nothing_to_do()
+        print()
+        test_clear(tmp_root)
         print()
         test_command_not_in_history()
         print()

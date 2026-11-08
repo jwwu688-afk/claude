@@ -291,6 +291,43 @@ class Conversation:
         self._session = SessionStore(path)  # 之后的每条新消息继续写进这个文件
         return len(restored), estimated
 
+    def reset_conversation(self):
+        """清空当前上下文，并换一个新的会话文件（2026-11-08 第 14.5 轮新增）
+
+        返回 (旧会话文件路径, 新会话文件路径)。旧的可能为 None（还没建过会话）。
+
+        【为什么"清空"必须同时换会话文件】
+          只把内存里这一页清掉的话，旧内容仍然躺在 JSONL 里。
+          用户下次 `--continue`（或用 /resume 选中它），那些"已经清掉"的对话
+          会原样回来——他会认为命令没生效，而且完全没法察觉
+          是"清了内存、文件还在"。
+          换成新文件之后两条路都不丢：新会话从零开始，旧文件完整保留，
+          想回去随时 /resume。
+
+        【为什么用 add_message 放回 system，而不是直接拼一行】
+          add_message 会同时写历史和落盘，复用它就顺带享受了 normalize_message
+          那一层处理，不必再多写一份"怎么序列化"的逻辑。
+
+        【为什么最后要重算用量】
+          清空前账本记的是"十几条消息、8000 token"，清空后如果不改，
+          /cost 和状态行会继续显示那个数字，用户会以为没清干净。
+          这里用和恢复会话同一个估算函数，保证两处口径一致。
+        """
+        old_path = getattr(getattr(self, "_session", None), "path", None)
+
+        # 用新文件接住后面的对话。cwd 和 model 沿用当前的，
+        # 这样 /resume 里它仍然归在"本项目"下面，而不是跑到别的项目去。
+        self._session = SessionStore.create(
+            cwd=os.getcwd(),
+            model=getattr(self._api_client, "model", "") or "",
+        )
+
+        self._history_manager.messages_history[-1] = []  # 清空当前这一页
+        self.add_message(self.build_system_message())  # 重新放回系统提示词（同时写进新文件）
+        self._history_manager.seed_usage_from_messages(self.messages)  # 重算占用
+
+        return old_path, self._session.path
+
     async def _read_user_input(self) -> str:
         """读一行用户输入；如果是斜杠命令，本地处理完继续等（2026-11-07 第 14 轮新增）
 

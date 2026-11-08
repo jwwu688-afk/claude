@@ -23,9 +23,10 @@
 
 import asyncio  # 导入 asyncio 工具箱：让程序在"等网络回复"的时候还能去干别的事（异步）
 import os  # 用来读环境变量（拿模型名、压缩阈值）和当前目录
-import sys  # 【第 11 轮】读命令行参数（--init / --version）
+import sys  # 【第 11 轮】读命令行参数（--version / --continue / -c）
 from core.conversation import Conversation  # 导入对话总管 Conversation 类，后面靠它启动聊天
-from ui.theme import console, ACCENT, DIM, WIDTH, STAR, OK, WARN, WARN_SIGN  # 配色与符号
+from ui.theme import console, ACCENT, DIM, WIDTH, STAR, WARN, WARN_SIGN  # 配色与符号
+# 注：OK 只在已删除的 run_init 里用过，随它一起去掉了
 from rich import box  # rich 的边框样式集合（这里用圆角那个）
 from rich.panel import Panel  # 面板：带边框的一块区域
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
@@ -34,7 +35,7 @@ from rich.text import Text  # 富文本：可以给一段文字的不同部分�
 # 为什么要放这里：改完代码后如果用户没重新启动进程，看到的还是旧界面，
 # 容易反复"改了没效果"。标题带版本号，一眼就能确认当前跑的是哪一份代码。
 # 改界面时顺手升一位（与 pyproject.toml 的 version 保持一致）。
-VERSION = "0.3.2"
+VERSION = "0.4.1"
 
 
 def _readable_dir(path: str) -> str:
@@ -162,63 +163,23 @@ def run_continue():
     return path
 
 
-def run_init(force: bool = False, scope: str = "project", here: bool = False):
-    """生成 THINKER.md 骨架（2026-11-07 第 11 轮新增，同日补了 --global）
-
-    用法：
-        thinker --init             项目记忆（写到当前目录）
-        thinker --init --global    全局记忆（写到 ~/.thinker/）
-        thinker --init --here      允许写在用户主目录（默认拒绝）
-
-    这是 Claude Code 里 `/init` 的等价物。Claude Code 的 `/init` 只生成项目级，
-    全局那份要用户自己在 `/memory` 里建——这里直接给个参数，省掉那一步。
-
-    挂成命令行参数而不是斜杠命令，是因为斜杠命令系统还没做，这一步不该等它。
-    （第 14 轮已经有了 /init，两条路径共用下面的 write_init_file 和同一套守卫。）
-    """
-    from core.prompt.memory import GLOBAL_MEMORY_PATH, MEMORY_FILENAME, is_user_home, write_init_file
-
-    # 【第 14.1 轮】和 /init 用同一个守卫：主目录里默认不生成"项目记忆"。
-    #   两边规则必须一致，否则用户在 CLI 被拦、进到会话里又能写，会更糊涂。
-    if scope == "project" and is_user_home() and not here:
-        console.print(Text(f"  {WARN_SIGN} 当前目录是用户主目录：{os.getcwd()}", style=f"bold {WARN}"))
-        console.print(Text("  在这里生成的 THINKER.md 会成为所有「从主目录启动」的会话的项目记忆。", style=DIM))
-        console.print(Text("  请先 cd 到项目目录再执行 --init；确实要写在这里请加 --here。", style=DIM))
-        return
-
-    if scope == "global":
-        target = str(GLOBAL_MEMORY_PATH.expanduser())
-        what = "全局记忆"
-        next_step = "按实际习惯改「说话方式」「动手习惯」，尤其是那几条红线（不要自动提交）。"
-    else:
-        target = os.path.join(os.getcwd(), MEMORY_FILENAME)
-        what = "项目记忆"
-        next_step = "补充「代码约定」「不要做的事」两节，模型每轮都会读到。"
-
-    existed = os.path.exists(target)
-    path = write_init_file(force=force, scope=scope)
-
-    if existed and not force:
-        console.print(Text(f"  {what}已存在，没有覆盖：{path}", style=WARN))
-        console.print(Text("  想重新生成请加 --force", style=DIM))
-        return
-
-    console.print(Text(f"  已生成{what}：{path}", style=OK))
-    console.print(Text(f"  {next_step}", style=DIM))
-
-
 def cli():
     # 定义命令行入口函数。pyproject.toml 里配置的 thinker 命令，指向的就是这个函数
     argv = sys.argv[1:]
 
     # 【第 11 轮】先处理不进入对话的参数
+    # 【2026-11-08 清理】原来这里还有 `--init` 分支，现在已经删掉：
+    #   生成项目记忆统一走会话内的 `/init`（core/commands.py）。
+    #   留两条入口只会让守卫、提示文案、测试都得维护两份，
+    #   而"必须退出对话才能建记忆"本身就是个没必要的限制。
+    #
+    #   但直接把分支删掉会带来一个副作用：`thinker --init` 变成"未知参数被忽略"，
+    #   于是它不再报错，而是直接进入对话——老用户会以为参数没生效、或者以为卡住了。
+    #   所以留一条明确的迁移提示，让旧习惯有个落点。
     if "--init" in argv:
-        run_init(
-            force="--force" in argv,
-            scope="global" if "--global" in argv else "project",
-            here="--here" in argv,  # 【第 14.1 轮】主目录里要写，得显式给这个
-        )
+        console.print(Text("  `thinker --init` 已移除，请先启动 thinker，再在会话内执行 /init。", style=WARN))
         return
+
     if "--version" in argv or "-v" in argv:
         console.print(f"thinker v{VERSION}")
         return

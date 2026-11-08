@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "thinker"
-version = "0.3.2"
+version = "0.4.1"
 description = "Thinker - a terminal coding agent"
 # 【2026-11-07 第 13.1 轮】下限从 3.8 改成 3.9。
 #   代码里已经用了 `tuple[bool, str]`、`list[ClientSession]` 这类内置泛型注解，

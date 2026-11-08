@@ -583,8 +583,9 @@ def write_init_file(cwd: Optional[Path] = None, force: bool = False, scope: str 
       想重写的人加个 --force 就行，成本很低。
 
     这个判断放在这里而不是交给调用方：
-      调用方（main.run_init）还要处理"CLI 参数解析"和"打印提示"，
+      调用方（`core/commands.py` 的 /init）还要处理"开关解析"和"打印提示"，
       再让它记住"要先检查文件存在"容易漏。收在一处，只判断一次。
+      （原来还有个 CLI 调用方 main.run_init，2026-11-08 清理后已删除。）
     """
     if scope == "global":
         target = GLOBAL_MEMORY_PATH.expanduser()

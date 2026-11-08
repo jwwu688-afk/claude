@@ -35,16 +35,13 @@ docs/优化记录/    每轮改动的详细记录
 #   （.env 不受影响：python-dotenv 跟着包所在目录向上找，换目录照样读得到。）
 thinker
 
-# 生成 / 更新项目记忆骨架
-thinker --init          # 已存在则跳过
-thinker --init --force  # 覆盖重写
-thinker --init --here   # 允许写在用户主目录（默认拒绝）
-
 # 跑测试：都是独立脚本，没有 pytest
 python test/test_memory.py
 python test/test_conversation_loop.py
 python test/test_p0_fixes.py
 ```
+
+项目记忆在会话内用 `/init` 生成（见下）。
 
 会话内可用的斜杠命令（第 14 轮，`core/commands.py`）：
 
@@ -54,6 +51,8 @@ python test/test_p0_fixes.py
 /resume                            列出本项目历史会话，输编号切过去
 /init [--global] [--force] [--here] 生成 / 更新 THINKER.md（主目录里默认拒绝）
 /cost                              本次会话的花费、token、缓存命中率、上下文占用
+/compact                           立刻压缩一次上下文（不等 80%，会调一次摘要模型）
+/clear                             清空上下文并开一个新会话（旧会话文件保留，可 /resume 回去）
 ```
 
 两个 conda 环境都装了 editable 版：`D:\Anaconda\envs\claude` 和 `D:\Anaconda\envs\thinker`。

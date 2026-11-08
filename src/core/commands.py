@@ -48,11 +48,14 @@
 #   其中两种根本没登记，模型照着示例派活，一直报"类型不存在"。
 #   那次之后，凡是"有几项、分别是什么"的东西，都改成从登记表里取。
 #
-# 【五、边界：这一轮只做"纯读"】
-#   /memory /resume /init /cost 都不改对话历史（/resume 换历史，但换的是整份，
-#   而且是用户明确要求的）。会改上下文的两条——/compact 强制压缩、/clear 清空——
-#   留到第二步：它们要动历史页，风险等级不是一个量级，
-#   混在同一批里做，回归失败时没法二分定位。
+# 【五、边界：分两批落地】
+#   第一批（第 14 轮）只做"纯读"：/memory /resume /init /cost。
+#   第二批（第 14.5 轮）加了会**改上下文**的两条：
+#     /compact 手动压缩 —— 会把旧对话换成摘要；
+#     /clear   清空上下文 —— 会换一个新的会话文件。
+#   为什么必须分两批：前四条的失败最多是"某个数字不对"，
+#   这两条的失败是"历史被改坏，后面每轮请求都 400"。
+#   风险等级不一样，混在一批里做，回归挂了没法二分定位是哪一条引起的。
 # =============================================================================
 
 import os  # /resume 按 cwd 过滤"本项目的会话"；/init 要拼 THINKER.md 的路径
@@ -508,12 +511,14 @@ def _first_user_text(messages) -> str:
 # =============================================================================
 
 async def cmd_init(conversation, args: str) -> None:
-    """生成 THINKER.md 骨架，等价于命令行的 `thinker --init`
+    """生成 THINKER.md 骨架（会话内唯一的入口）
 
-    命令行不是已经有了吗，为什么还要一条命令：
-      `--init` 必须**启动前**敲。而人往往是聊到一半才发现
-      "这个项目的约定该写进 THINKER.md"，这时候退出重开再进来，
-      上下文就断了——为了写一份记忆文件，把正在进行的对话丢掉，很不划算。
+    【为什么做成斜杠命令，而不是命令行参数】
+      原来的 `thinker --init` 必须**启动前**敲。而人往往是聊到一半才发现
+      "这个项目的约定该写进 THINKER.md"，这时候退出重开再进来，上下文就断了——
+      为了写一份记忆文件把正在进行的对话丢掉，很不划算。
+      2026-11-08 清理时把 CLI 那条路删掉了：两个入口意味着主目录守卫、提示文案、
+      测试都要维护两份，而"必须先退出"本身就是个没必要的限制。
 
     参数（按空格切成开关，顺序无关）：
       --global  写全局记忆（~/.thinker/THINKER.md），对所有项目生效
@@ -521,8 +526,8 @@ async def cmd_init(conversation, args: str) -> None:
       --here    允许在用户主目录里生成（默认拒绝，见下）
 
     为什么在主目录里默认拒绝（2026-11-08 第 14.1 轮补）：
-      有用户从 `PS C:/Users/Jarvis>` 启动了 thinker，再执行 /init，
-      于是生成了 `C:/Users/Jarvis/THINKER.md`——一份写着
+      有用户从 `PS C:\\Users\\Jarvis>` 启动了 thinker，再执行 /init，
+      于是生成了 `C:\\Users\\Jarvis\\THINKER.md`——一份写着
       "（没检测到常见的项目标志文件）"的骨架，却会成为**所有从主目录启动的
       会话**的项目记忆。它描述的不是任何项目，只是把一条错误的小知识
       反复喂给模型。
@@ -571,7 +576,7 @@ async def cmd_init(conversation, args: str) -> None:
         next_step = "补充「代码约定」「不要做的事」两节，模型每轮都会读到。"
 
     existed = os.path.exists(target)  # 先记下来：write_init_file 跳过了也不会告诉我们
-    path = write_init_file(force=force, scope=scope)  # 真正写盘就这一行，和 --init 共用
+    path = write_init_file(force=force, scope=scope)  # 真正写盘就这一行（项目/全局共用同一函数）
 
     if existed and not force:
         ui.print_warning(f"{what}已存在，没有覆盖：{path}")
@@ -638,7 +643,94 @@ async def cmd_cost(conversation, args: str) -> None:
 
 
 # =============================================================================
-# 六、注册
+# 六、/compact —— 立刻压一次，不等 80%（第 14.5 轮）
+# =============================================================================
+
+async def cmd_compact(conversation, args: str) -> None:
+    """手动压缩上下文，不看有没有过阈值
+
+    【为什么需要手动这一下】
+      自动压缩只在超过 80% 时动手，那是"防爆炸"的兜底。
+      但有一类情况永远等不到 80%：刚让模型试了七八种写法，过程很长、
+      结论只有一句。这时候上下文可能才 30%，压掉之后每一轮都省，
+      而没有 /compact 的话用户对此毫无办法。
+
+    【为什么提示里要说"会调用一次摘要模型"】
+      压缩不是本地文本处理：它会把被删的那段交给模型总结，真花钱。
+      用户按一下 /compact，账单上会多一次请求，不说清楚会以为是 bug。
+      这也是项目一贯的取舍：凡是会花钱的动作，先在界面上说一声。
+
+    参数 args：暂时不用。将来可能支持 "/compact 0.5" 指定压掉多少比例，
+      现在先只做一个"压一轮"的版本，少一条没人验证的路径。
+    """
+    ui = conversation._ui_manager
+    history = conversation._history_manager
+
+    # 只有系统提示词时没有任何"对话轮次"可压。
+    # 为什么要提前拦：压缩是按"用户消息"切段的，一段都找不到时
+    # 底层会安静地什么都不做，用户看到"已压缩、省了 0 token"只会更困惑。
+    if len(history.messages_history[-1]) <= 1:
+        ui.print_warning("当前上下文只有系统提示词，没有可压缩的内容。")
+        return
+
+    ui.print_info("正在压缩上下文…（会调用一次摘要模型，产生一次请求）")
+    stats = await history.compact_now()
+
+    # 为什么用 token 而不是"条数"判断有没有效果：
+    #   压缩不是纯删除——它会在原位置插一条"历史已压缩 + 摘要"的公告。
+    #   删掉 3 条、插入 1 条，条数可能只差 2；极端情况下摘要比被删内容还长，
+    #   条数变少了、token 反而更多。用户关心的是"省了多少上下文"，不是条数。
+    if stats["after_tokens"] >= stats["before_tokens"]:
+        ui.print_info("这次压缩没省下 token：摘要本身也要占长度，被删的内容太短时不划算。")
+        ui.print_info("可以直接继续；等对话再长一些再压更容易见效。")
+        return
+
+    saved = stats["before_tokens"] - stats["after_tokens"]
+    percent = (saved / stats["before_tokens"] * 100) if stats["before_tokens"] else 0
+    ui.print_success(
+        f"已压缩：{stats['before_count']} 条 → {stats['after_count']} 条，"
+        f"约 {stats['before_tokens']:,} → {stats['after_tokens']:,} token"
+    )
+    ui.print_info(f"省了约 {saved:,} token（{percent:.0f}%）。")
+    # 这句必须说：压缩是"整体替换消息列表"，前缀从中间断了，
+    # 下一轮请求的缓存命中会归零、按原价计费。不讲的话，
+    # 用户过一会儿看 /cost 发现花费跳涨，会以为是压缩本身的错。
+    ui.print_info("注意：消息列表变了，下一轮的提示词缓存会失效，那一次输入按原价计费。")
+
+
+# =============================================================================
+# 七、/clear —— 清空上下文并开一个新会话（第 14.5 轮）
+# =============================================================================
+
+async def cmd_clear(conversation, args: str) -> None:
+    """/clear —— 清空上下文，同时换一个新的会话文件
+
+    【为什么不是"把消息列表清空"这么简单】
+      只清内存的话，旧内容还在 JSONL 里。用户下次 `--continue`、
+      或者用 /resume 选中那个文件，刚清掉的对话会原样回来——
+      他会认为命令坏了，而且没法知道是"清了内存、文件还在"。
+      所以清空必须同时换文件：新会话从零开始，旧文件留着还能 /resume。
+      这样 /clear 才是"开新话题"的正确入口，而不是一个假动作。
+
+    【为什么不顺便重置花费】
+      花费是"这个进程到目前为止"的真实开销，清上下文不能让已经花掉的钱消失。
+      清零等于骗人。清不了，就说清楚（见下面的提示）。
+    """
+    ui = conversation._ui_manager
+    before_count = len(conversation._history_manager.messages_history[-1])
+
+    old_path, new_path = conversation.reset_conversation()
+
+    ui.print_success(f"已清空上下文（{before_count} 条 → 1 条系统提示词）。")
+    ui.print_info(f"新会话文件：{new_path.name}")
+    if old_path is not None:
+        # 明说旧文件还在：用户可能以为"清空=删除存档"，那样下次想找回就白找了。
+        ui.print_info(f"旧会话仍在：{old_path.name}（想回去用 /resume）")
+    ui.print_info("累计花费不重置：/cost 显示的是本次进程的总开销。")
+
+
+# =============================================================================
+# 八、注册
 #
 # 为什么放在文件末尾，而不是每条命令定义完就注册：
 #   读代码的人按"头部说明 → 数据结构 → 工具函数 → 各命令 → 注册表"的顺序看下来，
@@ -650,3 +742,5 @@ register(CommandSpec("memory", "/memory [文件名]", "查看模型记了什么�
 register(CommandSpec("resume", "/resume", "在历史会话里选一个接着聊", cmd_resume))
 register(CommandSpec("init", "/init [--global] [--force] [--here]", "生成 / 更新项目记忆骨架", cmd_init))
 register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cmd_cost))
+register(CommandSpec("compact", "/compact", "立刻压缩上下文（不等 80%）", cmd_compact))
+register(CommandSpec("clear", "/clear", "清空上下文并开一个新会话", cmd_clear))

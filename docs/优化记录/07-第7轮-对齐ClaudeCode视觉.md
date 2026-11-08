@@ -31,7 +31,7 @@
 
 ### 2.1 配色：从彩虹渐变改成 Claude 橙 + 黑白灰
 
-```python
+```text
 # 第 5 轮
 ACCENT = "cyan"           # 青色
 + HSV 渐变（青→蓝→紫→洋红→红橙）+ 渐变分隔线 + 星形装饰带
@@ -79,7 +79,7 @@ Claude Code 的界面其实非常克制：**绝大多数文字是默认白/灰**
 
 ### 2.3 输入提示符：`❯` → `>`
 
-```python
+```text
 # 改前
 PROMPT = "❯"  # 青色
 return f"\x1b[36m{PROMPT}\x1b[0m "
@@ -111,7 +111,7 @@ return f"\x1b[38;5;209m{PROMPT}\x1b[0m "
 
 实现方式（`_bullet_block`）：
 
-```python
+```text
 grid = Table.grid(padding=(0, 0))
 grid.add_column(width=2)   # 第一列：圆点占 2 列（符号 + 1 空格）
 grid.add_column()          # 第二列：正文
