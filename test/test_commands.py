@@ -84,7 +84,11 @@ class FakeUI:
         self.choice_items = list(items)
         return 0  # 测试里固定选第一项
 
-    async def get_user_input(self, prompt=None):
+    async def get_user_input(self, prompt=None, completer=None):
+        # 参数 completer（第 16 轮加）：真实 UI 会对它做 Tab 补全，这里只需要接住，
+        # 不能少写——少了就会 TypeError，而且报错信息在命令测试里显得莫名其妙。
+        # 顺便把它记下来，方便将来验证"哪些调用点传了补全源"。
+        self._last_completer = completer
         return self._answers.pop(0) if self._answers else ""
 
 

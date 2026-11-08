@@ -268,6 +268,9 @@ def _print_help(conversation) -> None:
     # 这句不是装饰：用户第一次看到斜杠命令，最想知道的是
     # "它会不会也被记进对话、也被计费"。直接说清楚，省得他去试探。
     ui.print_info("斜杠命令在本地处理，不会发给模型，也不占上下文。")
+    # 【第 16 轮】Tab 补全是个"隐形的功能"：不写在任何地方，用户永远不会发现。
+    # 而 help 恰好是他会主动打开的地方，放在这里最省事。
+    ui.print_info("输入 / 开头之后按 Tab，可以补全命令名（唯一匹配会直接补上）。")
 
 
 async def cmd_help(conversation, args: str) -> None:

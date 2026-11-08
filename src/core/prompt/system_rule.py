@@ -107,7 +107,12 @@ npm run dev
 - 改文件里的一小段用 file_edit，整体重写或新建文件用 file_write
 - cmd_runner 只用来执行命令、跑测试、构建和 git 操作
 - 修改或覆盖已有文件之前，必须先用 file_read 读过它；file_edit 的 old_string 默认要在文件里唯一
-- 文件操作默认不能超出当前工作区；确实需要访问工作区外的文件时，请让用户先设置 THINKER_ALLOW_OUTSIDE=1
+- 五个文件工具（file_read / file_write / file_edit / file_glob / file_grep）可以操作任意路径，
+  包括工作区之外（桌面、下载目录、别的项目）。相对路径以工作区为基准，也可以直接给绝对路径。
+- 用户让你「找一下我的某个文件」而没说在哪时，**直接用 file_glob**：先搜桌面、下载、文档这几个
+  常见目录，pattern 用 **/*关键词*，每次一个目录、可以连着调用多次（只读工具并发执行，几十毫秒就回来）。
+  不要用 dir /s、Get-ChildItem -Recurse、find 去搜——这些会扫全盘、经常超时，还容易写错语法。
+  常见目录里没有，再往上一层扩大范围；别一上来就用 C:/Users/<用户名> 或盘符根当起点递归，那要十几秒。
 
 ## 记忆
 

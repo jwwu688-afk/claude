@@ -54,9 +54,15 @@ class UIManager:
 
     # Input delegation methods
     # ↓ 下面这三个方法：全是在转手，把活交给 input_handler
-    async def get_user_input(self, prompt: str = None) -> str:
-        """Get user input with specified prompt.（等用户输入；prompt 为 None 时用统一的 ❯）"""
-        return await self.input_handler.get_user_input(prompt)
+    async def get_user_input(self, prompt: str = None, completer=None) -> str:
+        """Get user input with specified prompt.（等用户输入；prompt 为 None 时用统一的 ❯）
+
+        参数 completer（2026-11-08 第 16 轮新增）：Tab 补全的候选来源，
+        由调用方（Conversation）注入，UI 层自己不依赖 core.commands——
+        否则 ui 就反过来依赖 core 了，以后想单独测 UI 会很别扭。
+        传 None 就是原来的行为，一行都不走自管模式。
+        """
+        return await self.input_handler.get_user_input(prompt, completer)
 
     async def wait_for_user_approval(self, question: str = "是否执行？", default_yes: bool = True) -> tuple[bool, str]:
         """问一次"要不要执行"，等用户回车或给一句反馈（2026-11-06 第 8.2 轮重写）

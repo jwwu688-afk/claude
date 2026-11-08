@@ -25,7 +25,7 @@ import json  # json 库：把模型给的"参数字符串"解析成真正的 Pyt
 import os  # 【第 13 轮】取当前目录，写进会话文件的 header
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
 from core.api_client import APIClient  # 导入 API 客户端：真正发请求给大模型的家伙
-from core.commands import handle_command, is_command  # 【第 14 轮】斜杠命令：在消息进历史之前截下来
+from core.commands import REGISTRY, handle_command, is_command  # 【第 14 轮】斜杠命令：在消息进历史之前截下来；【第 16 轮】REGISTRY 供 Tab 补全
 from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各处各写一个数
 from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
 from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器：负责生成"系统提示词"
@@ -345,10 +345,36 @@ class Conversation:
         这里保留一个兜底判断，是为了将来万一有别的地方调用。
         """
         while True:
-            text = await self._ui_manager.get_user_input()
+            # 【第 16 轮】把补全源传进去：用户敲 "/" 之后按 Tab，就能把命令名补全。
+            #   传 None 的调用点（授权提问、选会话编号）不受影响，仍然走老路。
+            text = await self._ui_manager.get_user_input(completer=self._complete_command)
             if not is_command(text) or self._task_depth > 0:
                 return text
             await handle_command(text, self)  # 处理完继续循环，等用户真正想说的话
+
+    @staticmethod
+    def _complete_command(text: str) -> list:
+        """给 Tab 补全提供候选（2026-11-08 第 16 轮新增）
+
+        只补**命令名**，不补参数。三个判断：
+
+          1. 不是 "/" 开头 → 没有候选。正常对话按 Tab 不该有任何反应。
+          2. 已经有空格 → 没有候选。说明用户已经在写参数了
+             （比如 `/memory 笔记.md`），这时候还弹出命令名列表只会碍事。
+          3. 其余 → 把注册表里所有命令名列出来。
+
+        为什么直接用 REGISTRY 而不另外维护一份清单：
+          第 14 轮起命令都登记在 REGISTRY 里，`/help` 也是遍历它生成的。
+          另写一份"补全用的命令名清单"，等于同一件事维护两处——
+          新增命令时一定会漏更新，然后在补全里消失，而且没人会想到是这里的问题。
+
+        为什么返回"完整候选"而不是"前缀匹配的结果"：
+          过滤和补全的逻辑统一交给 LineEditor.resolve_completion，
+          这里只回答"有哪些可能"。职责分开，测试也好写（纯函数，不用碰键盘）。
+        """
+        if not text.startswith("/") or " " in text:
+            return []
+        return ["/" + name for name in sorted(REGISTRY)]
 
     async def start_conversation(self, resume_path=None):
         """Start a new conversation.（开始一次全新的对话：这是用户按下回车后的第一步）
@@ -854,36 +880,70 @@ class Conversation:
         return classify(tool_name, args).need_approval
 
     async def _handle_tool_calls(self, tool_calls):
-        """Handle tool calls with user approval when needed.（逐个处理模型的工具申请）"""
-        for i, tool_call in enumerate(tool_calls):  # 一个个处理，i 是序号
-            is_last_tool = (i == len(tool_calls) - 1)  # 标记"这是不是最后一个"（最后一个后面要加提醒文字）
-            try:  # 试：解析参数
-                args = json.loads(tool_call.function.arguments)  # 把"参数字符串"变成真正的字典
-            except json.JSONDecodeError as e:  # 如果参数不是合法 JSON（模型写错了）
-                self._ui_manager.print_error(f"Tool parameter parsing failed: {e}")  # 报错
-                tool_response = {
-                    "role": "tool",  # tool 表示"这是工具返回的结果"
-                    "tool_call_id": tool_call.id,  # 对应哪一次申请（必须对上号）
-                    "name": tool_call.function.name,  # 是哪个工具
+        """处理模型这一轮申请的所有工具（第 15 轮：连续的只读调用并发执行）
+
+        【改前的情况】
+          一个 for 循环里逐个 await：模型想读 5 个文件，就是 5 次
+          "发出去 → 等结果 → 再发下一个"。其中绝大部分时间在等磁盘，纯白等。
+
+        【改后的划分】
+          连续的只读调用攒成一批并发跑；其余（写文件、跑命令、需要审批的、高危的）
+          保持串行——它们之间有先后依赖，并行会把语义搞乱。
+
+        【为什么只并"连续"的一段，而不是把整轮所有只读的都挑出来】
+          模型给出的工具顺序，就是它自己排的执行意图：
+            file_read(a.py) → file_edit(a.py) → file_read(b.py)
+          把第三个提前到第一个旁边并发，读到的就是改动前的内容。
+          只并"相邻的一串只读"，语义上最安全，而收益已经拿到了——
+          真实使用里最高频的就是"一次读好几个文件"。
+
+        参数 tool_calls：模型这一轮申请的工具（SDK 对象，带 id / function）。
+        """
+        total = len(tool_calls)
+
+        # 先把参数统一解析一遍，供"收集批次"和"单条执行"两条路复用。
+        # 为什么不在各自的分支里临时解析：批次收集需要**提前**看后面几条能不能并，
+        # 到那时候再解析就是同一份 JSON 解两次。
+        parsed_args = []
+        for call in tool_calls:
+            try:
+                parsed_args.append(json.loads(call.function.arguments))
+            except json.JSONDecodeError as e:
+                parsed_args.append(e)  # 解析失败的异常先存着，轮到它时再报错
+
+        index = 0
+        while index < total:
+            tool_call = tool_calls[index]
+            parsed = parsed_args[index]
+            is_last_tool = (index == total - 1)  # 整轮最后一条要挂 todo 提醒
+
+            if isinstance(parsed, json.JSONDecodeError):
+                # 模型把参数写成了非法 JSON。这里不抛异常，而是造一条"失败结果"塞回历史，
+                # 让它下一轮自己改对（和工具执行失败的处理一致）。
+                self._ui_manager.print_error(f"Tool parameter parsing failed: {parsed}")
+                self.add_message({
+                    "role": "tool",
+                    "tool_call_id": tool_call.id,  # 必须对上号，否则接口会拒
+                    "name": tool_call.function.name,
                     "content": [
                         {"type": "text", "text": "工具调用失败：参数不是合法的 JSON，请检查 tool 的 arguments 格式后重试。"}
-                        # 告诉模型"你参数写错了"，让它重新写一遍
-                    ]
-                }
-                self.add_message(tool_response)  # 存进历史
-                continue  # 跳过这一个，处理下一个
+                    ],
+                })
+                index += 1
+                continue
 
-            # Check if user approval is needed
-            # 【2026-11-06 第 9 轮】判定交给 core/permissions.py 的 classify()：
-            #   它不只回答"要不要问"，还告诉我们是"低危 / 普通 / 高危"。
-            #   高危（rm -rf、格式化、强制推送……）会额外做两件事：
-            #     1. 在屏幕上标出来，让用户知道自己面对的是什么
-            #     2. 把"回车即同意"翻转成"回车即拒绝"，必须明确打 y 才放行
-            decision = classify(tool_call.function.name, args)
-            need_user_approve = decision.need_approval
-            should_execute = True  # 默认"要执行"（下面如果要问用户，会根据用户的回答改写它）
-            content = ""  # 用户拒绝时说的话（没有就是空串）
+            args = parsed
+            decision = classify(tool_call.function.name, args)  # 第 9 轮：要不要问用户
 
+            # 先看看能不能攒一批并发（至少两条才值得并，一条并了反而多一层开销）
+            batch, next_index = self._collect_parallel_batch(tool_calls, parsed_args, index)
+            if len(batch) >= 2:
+                # 这批的最后一条是不是整轮的最后一个？是就把 todo 提醒挂上去
+                await self._execute_tools_parallel(batch, reminder_on_last=(next_index == total))
+                index = next_index
+                continue
+
+            # ---- 单条路径：和以前完全一样（含审批、拒绝、高危提示）----
             # 【2026-11-06 第 8.2 轮】先把"要干什么"画出来，再问"要不要干"。
             #   改前是反过来的：先弹一段 "Tool: xxx, args: {...}"，用户点完同意，
             #   下面才出现 ⏺ cmd_runner(dir) 那行。结果是同一个命令在屏幕上出现两次，
@@ -893,23 +953,152 @@ class Conversation:
             if decision.is_high_risk:  # 【第 9 轮】高危操作先亮红牌再问
                 self._ui_manager.print_warning(f"高危操作（{decision.reason}）：回车将默认拒绝，确认执行请输入 y。")
 
-            if need_user_approve:  # 如果规则判定这个操作需要用户点头
+            should_execute = True  # 默认执行；下面要问用户时再按回答改写
+            content = ""  # 用户拒绝时说的话
+
+            if decision.need_approval:
                 # 【第 8.2 轮】问题只问"是否执行"，参数已经在上面那行里了。
-                #   回车即同意；输入别的内容 = 拒绝 + 那句内容作为说明（见 interpret_approval）。
                 # 【第 9 轮】高危操作传 default_yes=False：不填就打回，必须显式确认。
-                #   这个参数第 8.2 轮就在接口里留好了，本轮终于用上。
                 should_execute, content = await self._ui_manager.wait_for_user_approval(
                     default_yes=not decision.is_high_risk
                 )
 
-            if should_execute:  # 用户同意（或本来就不需要问）
+            if should_execute:
                 # show_header=False：头部上面已经画过了，别再画一遍
                 await self._execute_tool(tool_call, args, is_last_tool, show_header=False)
             else:  # 用户拒绝了
-                # 【第 8.2 轮】补一行"已拒绝"，否则用户不知道自己那一下有没有生效
                 self._ui_manager.show_tool_denied(content)
                 self._add_tool_response(tool_call, f"用户拒绝执行这个工具。用户的说明：{content}", is_last_tool)
                 # 把"用户拒绝了，理由是..."当作工具结果告诉模型，让它换个做法
+
+            index += 1
+
+    @staticmethod
+    def _can_run_in_parallel(tool_name: str, decision) -> bool:
+        """这次调用能不能并进批次（2026-11-08 第 15 轮新增）
+
+        三个条件缺一不可：
+          1. 在只读工具清单里——只有只读才没有先后依赖；
+          2. 判定结果不需要审批——要停下来问人，并行就没意义（人只有一个）；
+          3. 不是高危——高危必须单独走，合批会把"回车默认拒绝"的提示挤在一起，
+             用户根本分不清那句话对应哪条命令。
+
+        只认 READ_ONLY_TOOLS 这个集合，不自己判断"这个工具看起来是只读的"：
+          判据只有一份（core/permissions.py），两处各判一次迟早不一致。
+        """
+        return (
+            tool_name in READ_ONLY_TOOLS
+            and not decision.need_approval
+            and not decision.is_high_risk
+        )
+
+    def _collect_parallel_batch(self, tool_calls, parsed_args, start):
+        """从 start 开始往后收集"连续可并发"的调用（第 15 轮新增）
+
+        返回 (batch, next_index)：
+          batch      —— [(tool_call, args), ...]。**可能是空列表**：
+                        说明 start 这一条自己就不能并发（写操作、要审批、高危），
+                        调用方据此走单条路径，把审批流程走完整。
+          next_index —— 下一条要处理的序号（遇到不可并发的就停在那里）
+
+        三种情况会停下：
+          · 参数不是合法 JSON——它需要单独回一条"参数错误"，不能并进批次；
+          · 工具不是只读的、或需要审批——见 _can_run_in_parallel；
+          · 已经到这一轮末尾。
+
+        复杂度说明：最坏情况每条只调用一次 classify，整轮 O(n)；
+        因为收集过的下标不会再被收集（index 直接跳到 next_index），不会重复判。
+        """
+        batch = []
+        index = start
+        total = len(tool_calls)
+
+        while index < total:
+            parsed = parsed_args[index]
+            if isinstance(parsed, json.JSONDecodeError):  # 留给单条路径单独报错
+                break
+            name = tool_calls[index].function.name
+            if not self._can_run_in_parallel(name, classify(name, parsed)):
+                break
+            batch.append((tool_calls[index], parsed))
+            index += 1
+
+        return batch, index
+
+    async def _execute_tools_parallel(self, batch, reminder_on_last=False):
+        """并发执行一批只读工具，结果按申请顺序写回（2026-11-08 第 15 轮新增）
+
+        两个必须守住的东西：
+
+          1. **界面先画完所有头，再统一画结果。**
+             边跑边画的话，屏幕上会变成"第二个头 → 第一个结果"的交叉顺序，
+             用户根本对不上哪条结果属于哪次调用。
+
+          2. **历史按申请顺序写回，不按完成顺序。**
+             并发完成顺序是不确定的；而历史顺序会被落盘、被下一轮请求读到。
+             真按完成顺序写，同一个会话每次重放的消息顺序都不一样，
+             排查问题时没法对照，缓存前缀也会随机失效。
+             （tool 消息之间本来靠 tool_call_id 对应，顺序不影响接口，
+               但"稳定"比"合法"更值钱。）
+
+        参数 batch：[(tool_call, args), ...]，调用方保证长度 ≥ 2 且都可并发。
+        参数 reminder_on_last：这批的最后一条是不是整轮最后一条，是就挂 todo 提醒。
+        """
+        # 1) 先把这一批的"⏺ 工具名(参数)"全部画出来
+        for call, args in batch:
+            self._ui_manager.show_preparing_tool(
+                call.function.name,
+                {k: v for k, v in args.items() if k != "need_user_approve"},
+            )
+
+        # 2) 并发执行
+        #    为什么不用 gather(return_exceptions=True)：
+        #      那样拿回来的是"结果或异常对象"混在一起，类型要再分一次。
+        #      这里让 run_one 自己兜住异常，语义更清楚：返回值正常 = 成功，是 Exception = 失败。
+        #    为什么要兜异常：第 14.2 轮起 run_tool 会把异常往上抛（不再吞成字符串），
+        #      如果不管，一条失败会把整批 gather 打断——"一个文件读不到，其他四个也不读了"，
+        #      这比串行还糟。
+        async def run_one(call, args):
+            tool_args = {k: v for k, v in args.items() if k != "need_user_approve"}
+            try:
+                return await self._tool_manager.run_tool(call.function.name, **tool_args)
+            except Exception as e:
+                return e
+
+        results = await asyncio.gather(*(run_one(call, args) for call, args in batch))
+
+        # 3) 按申请顺序写回界面和历史
+        for offset, ((call, args), result) in enumerate(zip(batch, results)):
+            tool_args = {k: v for k, v in args.items() if k != "need_user_approve"}
+            is_last = reminder_on_last and offset == len(batch) - 1
+            if isinstance(result, Exception):
+                self._finish_tool_call(call, tool_args, result, is_last, error=True)
+            else:
+                self._finish_tool_call(call, tool_args, result, is_last)
+
+    def _finish_tool_call(self, tool_call, tool_args, result, is_last_tool, error=False):
+        """把一次工具执行的结果同时写进界面和历史（2026-11-08 第 15 轮抽出）
+
+        为什么抽出来：串行路径（_execute_tool）和并发路径（_execute_tools_parallel）
+        都要做"显示结果 + 写进历史"这两步。复制两份的话，
+        以后改失败提示的措辞（比如补一句"建议先 file_read 再 file_edit"）必然只改一处。
+
+        参数 error=True 表示 result 其实是异常对象：
+          界面标红；写进历史时加上"工具调用失败，原因："前缀，
+          让模型能区分"工具返回的内容"和"工具没跑成"——这是 agent 自我纠错的入口。
+        """
+        text = str(result)
+        self._ui_manager.show_tool_execution(
+            tool_call.function.name,
+            tool_args,
+            success=not error,
+            result=text,
+        )
+        self._add_tool_response(
+            tool_call,
+            f"工具调用失败，原因：{text}" if error else text,
+            is_last_tool,
+        )
 
     async def _execute_tool(self, tool_call, args, is_last_tool=False, show_header=True):
         """Execute a tool call and handle the response.（执行一个工具，成功失败都要有回应）
@@ -918,6 +1107,9 @@ class Conversation:
           False 表示"⏺ 工具名(参数) 这一行已经画过了"。
           需要审批的调用会先画头再提问，所以进来时开关是关的；
           只读工具直接进这里，开关还是开的，自己画。
+
+        【2026-11-08 第 15 轮】成功/失败的收尾统一交给 _finish_tool_call，
+          这里只保留"执行"这一段——两条路径（串行/并发）共用同一套收尾。
         """
         tool_args = {k: v for k, v in args.items() if k != 'need_user_approve'}
         # 上面这行是"过滤字典"：把 need_user_approve 这个标记去掉，
@@ -928,24 +1120,13 @@ class Conversation:
         try:  # 试：执行工具
             tool_response = await self._tool_manager.run_tool(tool_call.function.name, **tool_args)
             # 让工具管理器去执行。**tool_args 是把字典拆成一个个参数传进去
-            self._ui_manager.show_tool_execution(
-                tool_call.function.name,  # 工具名
-                tool_args,  # 参数
-                success=True,  # 成功标记
-                result=str(tool_response)  # 结果转成字符串再显示
-            )
-            self._add_tool_response(tool_call, str(tool_response), is_last_tool)  # 把结果交给模型
-        except Exception as e:  # 如果工具执行时抛错
-            # Enhanced error handling for tool execution
-            self._ui_manager.show_tool_execution(
-                tool_call.function.name,
-                tool_args,
-                success=False,  # 这次是失败
-                result=str(e)  # 错误信息
-            )
-            self._add_tool_response(tool_call, f"工具调用失败，原因：{str(e)}", is_last_tool)
+        except Exception as e:  # 如果工具执行时抛错（第 14.2 轮起会真的抛上来）
             # 关键设计：工具失败不是"程序崩了"，而是"给模型一条失败消息"，
             # 让模型自己看到错误、自己想办法补救。这是 agent 能自我纠错的核心。
+            self._finish_tool_call(tool_call, tool_args, e, is_last_tool, error=True)
+            return
+
+        self._finish_tool_call(tool_call, tool_args, tool_response, is_last_tool)
 
     def _add_tool_response(self, tool_call, content, is_last_tool=False):
         """Add tool response to message history through history manager.（把工具结果存进历史）
@@ -1038,8 +1219,11 @@ class Conversation:
 #
 # 4. 【第 8 轮已部分处理】权限判断主要还是"模型说什么就是什么"，
 #    本轮只加了"只读工具免确认"的过渡规则（见 _needs_user_approval）。
-#    真正的权限规则（命令白名单、危险命令黑名单、工作区路径边界、
+#    真正的权限规则（命令白名单、危险命令黑名单、
 #    以及"不再询问"的记忆）放在第 9 轮做。
+#    【第 15.2 轮注】原来这里还列了"工作区路径边界"，它当时做在
+#    file_tools._resolve_path 里，后来整条删了（只拦 file_*、拦不住 cmd_runner，
+#    等于逼模型绕路）。真要重做，位置应该在 core/permissions.py 的 classify。
 #
 # 5. 【第 8 轮已完成】主循环原来是递归，已改成 while + 单层迭代
 #    （_recursive_message_handling → _run_one_iteration），栈深度不再随轮数增长。

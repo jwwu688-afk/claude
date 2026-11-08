@@ -16,21 +16,40 @@
 #   用 Python 自己实现一遍，跨平台一致、输出可控、还能做安全校验。
 #
 # 【为什么五个类写在同一个文件里】
-#   它们共用同一套东西：路径边界、编码探测、忽略目录、"先读后写"记录。
+#   它们共用同一套东西：路径解析、编码探测、忽略目录、"先读后写"记录。
 #   拆成五个文件会把这些公共逻辑抄五遍，改一处漏四处。
 #   ToolManager 登记的是类，跟放在哪个文件里没有关系。
 #
-# 【两个安全设计】
-#   1. 路径边界：默认只允许访问工作区（启动时的工作目录）内的文件。
-#      真要访问外面的文件，设环境变量 THINKER_ALLOW_OUTSIDE=1。
-#   2. 先读后写：file_write 覆盖已有文件、file_edit 修改文件之前，
-#      必须先用 file_read 读过。而且会比对内容的 SHA1——如果读过之后
-#      文件被别的程序改过，会拒绝修改，让模型重新读一遍。
-#      这样模型就不会拿"记忆里的旧内容"去覆盖磁盘上的新内容。
+# 【一个安全设计】
+#   先读后写：file_write 覆盖已有文件、file_edit 修改文件之前，
+#   必须先用 file_read 读过。而且会比对内容的 SHA1——如果读过之后
+#   文件被别的程序改过，会拒绝修改，让模型重新读一遍。
+#   这样模型就不会拿"记忆里的旧内容"去覆盖磁盘上的新内容。
+#
+# 【2026-11-08 第 15.2 轮：取消路径边界】
+#   以前这里还有一道"只能操作工作区内文件"的边界，越界就返回错误，
+#   要靠环境变量 THINKER_ALLOW_OUTSIDE=1 才能放开。现在整套机制删掉了，
+#   五个工具都可以直接操作任意路径。原因不是"边界没意义"，而是它没起到作用：
+#
+#   1. 边界只在 file_* 上有，cmd_runner 里一行检查都没有。
+#      模型遇到"路径超出工作区"，改调 cmd_runner 拼一条 Get-ChildItem 就绕过去了
+#      （第 15.1 轮的起因就是查简历时它这么干）。对愿意绕的模型，这道门是软的；
+#      对老实守规矩的模型，它只是把简单任务变复杂。
+#   2. 它挡不住真正的风险。file_write 的危险是"覆盖错文件"，
+#      而这个靠"先读后写 + SHA1 校验 + 审批"已经拦住了，跟路径在不在工作区无关。
+#   3. 它带来了实实在在的误伤：搜一份桌面上的文档、读一个兄弟项目里的配置，
+#      都得先改 .env 再重启，而这本来是 agent 最日常的动作。
+#
+#   所以现在的分工是：**路径不设限，风险由权限层管**——
+#   写文件默认要问、高危命令强制问（`core/permissions.py`）；
+#   cmd_runner 仍然能执行任意命令，这一点从第 9 轮起就没变过。
+#   如果将来要重新引入限制，正确的做法是在 classify() 里判，让权限层和工具层
+#   说同一句话，而不是让工具层单独拒绝、逼模型去找后门。
 #
 # 【2026-11-06 第 8 轮】新增本文件。
 # =============================================================================
 
+import asyncio  # 【第 15 轮】把阻塞的文件 IO 丢进线程池，多个只读工具才能真正并发
 import difflib  # 生成"改前 / 改后"的差异文本（就是 git diff 那种 +/- 格式）
 import fnmatch  # 按 *.py 这种通配符筛文件名
 import glob as globlib  # 按 **/*.py 这种模式找文件；注意别和工具名 file_glob 搞混
@@ -39,7 +58,6 @@ import locale  # 读系统默认编码（中文 Windows 上有些老文件是 GB
 import os  # 读环境变量、取工作目录、遍历文件夹
 import re  # file_grep 用的正则表达式
 from pathlib import Path  # 路径对象，处理绝对路径 / 相对路径比字符串方便
-from core.auto_memory import is_memory_path  # 【第 12 轮】识别记忆目录，给它开越界特批
 from tools.base_tool import BaseTool  # 导入父类：所有工具都得有 act / json_schema / get_status
 
 
@@ -54,7 +72,10 @@ MAX_DIFF_CHARS = 4000  # file_edit 返回的差异文本最多多长
 MAX_GREP_FILE_BYTES = 1024 * 1024  # 超过 1MB 的文件不参与内容搜索（多半是日志或数据文件）
 
 # 工作区根目录：程序启动时固定下来，整个会话都不变
-# 为什么用 resolve()？因为它会把 .. 和符号链接都展开，后面做"越界检查"才不会被绕过去
+# 【第 15.2 轮】它不再是"允许访问的范围"，只剩两个用途：
+#   1. 把相对路径补全成绝对路径（模型说 "src/main.py" 时补成 WORKSPACE_ROOT/src/main.py）；
+#   2. file_glob / file_grep 不传 path 时的默认搜索起点。
+# 为什么仍要 resolve()：把 .. 和符号链接展开，相对路径补全才不会补出个半真半假的路径。
 WORKSPACE_ROOT = Path(os.getcwd()).resolve()
 
 # 搜索时要跳过的目录。这些目录里要么是缓存、要么是依赖、要么是编辑器配置，
@@ -78,42 +99,27 @@ _read_files = {}
 # 一、五个工具共用的小函数
 # -----------------------------------------------------------------------------
 
-def _allow_outside() -> bool:
-    """是否允许访问工作区外的文件（默认不允许，设环境变量才放开）"""
-    return os.getenv("THINKER_ALLOW_OUTSIDE") == "1"
-
-
-def _within_workspace(path: Path) -> bool:
-    """判断一个路径是否还在工作区里（2026-11-06 第 8 轮新增）
-
-    用 relative_to 而不是字符串 startswith：
-      startswith("D:/code/thinker") 会把 "D:/code/thinker-other" 也当成在内部，
-      relative_to 是按"路径段"比较的，不会误判。
-
-    【2026-11-07 第 12 轮】给记忆目录开了个特批口子：
-      自动记忆存在 ~/.thinker/projects/<项目>/memory/ 下，天生在工作区之外。
-      不开这个口子，模型就永远写不进记忆——功能整个是废的。
-      这个特批是安全的：记忆目录是程序自己算出来的固定路径，
-      不是模型随便指定的，能访问的范围也只有那一个文件夹。
-    """
-    if _allow_outside():  # 用户明确放开了边界
-        return True
-    if is_memory_path(path):  # 记忆目录，只读只写它自己那一亩三分地
-        return True
-    try:
-        path.resolve().relative_to(WORKSPACE_ROOT)  # 不在里面会抛 ValueError
-        return True
-    except ValueError:
-        return False
-
-
 def _resolve_path(raw_path):
-    """把模型给的路径统一成绝对路径，并检查是否越界（2026-11-06 第 8 轮新增）
+    """把模型给的路径统一成绝对路径（2026-11-06 第 8 轮新增，第 15.2 轮去掉越界检查）
 
     返回两个值：(路径对象, 错误文字)。
       成功时错误文字是空字符串；失败时路径是 None，错误文字可以直接交给模型看。
     为什么不直接抛异常？项目里其他工具都是"返回一句中文提示让模型自己改"，
-    ToolManager.run_tool 也把异常吞成字符串，统一返回提示更可控。
+    统一返回提示比抛异常更可控。
+
+    【第 15.2 轮改动】原来这里末尾还有一道 `_within_workspace()` 检查，
+    越界就返回"路径超出工作区"。删掉之后，这个函数只做一件事：把路径规范化。
+    为什么删的是"检查"而不是把开关默认改成 True（见文件头的详细说明），
+    一句话：那道边界对 cmd_runner 完全无效，留着只能拦住守规矩的做法。
+
+    三个仍然保留的规范化动作，各自有原因：
+      · 反斜杠转正斜杠：Windows 上模型常常写成 C:\\a\\b，
+        Path 能吃，但后面和 glob 模式拼接时混用两种分隔符容易出错；
+      · 相对路径补 WORKSPACE_ROOT：模型说 "src/main.py" 时得有个基准，
+        统一补成绝对路径，后续所有判断和回执才一致；
+      · resolve()：展开 .. 和符号链接。看着麻烦，但它保证了
+        "同一个文件用不同写法指过来，拿到的是同一个字符串"，
+        而"先读后写"就是靠路径字符串做键来比对的，不做这一步会漏判。
     """
     if not raw_path or not isinstance(raw_path, str):  # 没给路径，或者给的不是字符串
         return None, "路径参数无效：请提供文件路径字符串。"
@@ -123,10 +129,9 @@ def _resolve_path(raw_path):
             path = WORKSPACE_ROOT / path
         path = path.resolve()  # 展开 .. 和符号链接，得到真实位置
     except Exception as e:
+        # 走到这儿通常是路径里有非法字符，或者盘符不存在。
+        # 与其让异常蹦到界面上，不如回一句话让模型换个写法重试。
         return None, f"路径解析失败：{e}"
-    if not _within_workspace(path):  # 跑到工作区外面去了
-        return None, (f"路径超出工作区：{path}。当前工作区是 {WORKSPACE_ROOT}。"
-                      "如需访问工作区外的文件，请设置环境变量 THINKER_ALLOW_OUTSIDE=1。")
     return path, ""
 
 
@@ -196,10 +201,15 @@ def _shorten(text: str, limit: int) -> str:
 
 
 def _relative(path: Path) -> str:
-    """把绝对路径显示成相对工作区的短路径，读起来清爽"""
+    """把绝对路径显示成相对工作区的短路径，读起来清爽
+
+    只在"文件确实在工作区里"时才会变短。工作区外的路径原样返回绝对路径——
+    这一点在第 15.2 轮取消边界后变得更常见：模型搜桌面、搜兄弟项目时，
+    回执里就是完整路径，正好方便它下一次直接拿这个路径去 file_read。
+    """
     try:
         return str(path.resolve().relative_to(WORKSPACE_ROOT)).replace("\\", "/")
-    except ValueError:  # 不在工作区里（用户放开了边界）就显示绝对路径
+    except ValueError:  # 不在工作区里，显示绝对路径（不是出错，是正常分支）
         return str(path).replace("\\", "/")
 
 
@@ -232,10 +242,28 @@ class FileRead(BaseTool):
         return "file_read"  # 在模型眼里的名字
 
     async def act(self, path="", offset=0, limit=MAX_READ_LINES, need_user_approve=False):
+        """读文件（第 15 轮：整体丢到线程池里执行）
+
+        【为什么要绕这一层 to_thread】
+          这个方法的函数体全是同步 IO（read_text、splitlines），一个 await 都没有。
+          单条调用时无所谓；但第 15 轮会把多个只读工具并发执行，
+          而"async 外壳 + 同步内核"的协程之间没有让出点，
+          asyncio.gather 会退化成串行——看起来改了并发，实际一点没快，
+          而且这种"没生效的优化"极难发现（结果正确、只是没变快）。
+          to_thread 把阻塞段放进线程池：磁盘 IO 期间 GIL 会释放，多个读取才真的重叠。
+
+        【为什么参数要一个个显式摆好】
+          to_thread 只接受位置参数。关键字参数得自己按顺序传，
+          传乱了不会报错、只会静默错位（比如把 limit 当 offset 用），
+          所以这里宁可写长一点。
+        """
+        return await asyncio.to_thread(self._act, path, offset, limit)
+
+    def _act(self, path, offset, limit):
         # path：文件路径（相对工作区或绝对路径都行）
         # offset：从第几行开始读（0 表示从头），limit：最多读多少行
-        # need_user_approve：给对话层看的标记，工具本身用不到，见 _approval_param 的说明
-        resolved, error = _resolve_path(path)  # 统一成绝对路径并做越界检查
+        # need_user_approve 只留在 act 的签名里（工具清单要它），函数体用不到
+        resolved, error = _resolve_path(path)  # 统一成绝对路径（第 15.2 轮起不再检查越界）
         if error:  # 路径有问题，直接把中文提示交回给模型
             return error
 
@@ -321,7 +349,7 @@ class FileRead(BaseTool):
 - 第一次读某个文件时直接传 path，会看到带行号的内容；修改文件前必须先读。
 - 文件很长时不要一次全读，用 offset / limit 分段看，省上下文。
 - 输出超过 2000 行会被自动截断，长行也会被截断并标明截了多少字符。
-- 默认只能读工作区内的文件；路径越界会给出明确提示。
+- 路径可以是相对工作区的写法，也可以直接给绝对路径（如 C:/Users/me/Desktop/a.txt）。
 - 想按文件名找文件用 file_glob，想按内容搜索用 file_grep，不要用这个工具逐个试。
         """.strip()
 
@@ -417,7 +445,7 @@ class FileWrite(BaseTool):
 - 覆盖已有文件之前必须先用 file_read 读过它，否则会拒绝。
 - 如果读完之后文件被别的程序改过，也会拒绝写入，需要重新读一遍。
 - 内容统一按 UTF-8 写入。
-- 默认只能写工作区内的文件。
+- 路径可以是相对工作区的写法，也可以直接给绝对路径。
         """.strip()
 
 
@@ -576,6 +604,15 @@ class FileGlob(BaseTool):
         return "file_glob"  # 在模型眼里的名字
 
     async def act(self, pattern="", path="", need_user_approve=False):
+        """按通配符找文件（第 15 轮：整体丢到线程池里执行）
+
+        为什么要绕 to_thread：glob 扫目录是同步阻塞的，
+        和 file_read / file_grep 一起并发时，没有让出点就会退化成串行。
+        详见 FileRead.act 的注释。
+        """
+        return await asyncio.to_thread(self._act, pattern, path)
+
+    def _act(self, pattern, path):
         if not pattern or not isinstance(pattern, str):  # 没给模式就没法找
             return "请提供文件名模式（pattern），例如 **/*.py 或 src/**/*.md。"
 
@@ -602,8 +639,10 @@ class FileGlob(BaseTool):
             candidate = Path(item)
             if not candidate.is_file():  # 只要文件，不要目录
                 continue
-            if not _within_workspace(candidate):  # 通配符可能匹配到工作区外
-                continue
+            # 【第 15.2 轮】这里原来还有一道 `_within_workspace(candidate)` 过滤，
+            # 因为通配符（尤其是 **）可能一路匹配到工作区外面去。边界取消后一并删掉。
+            # 注意别把它"简化"成一行空判断：现在这个循环里剩下的两步
+            # （只要文件、跳过忽略目录）是在筛**结果质量**，跟权限无关，必须留着。
             parts = set(candidate.parts)  # 路径的每一段
             if parts & _IGNORE_DIRS:  # 命中忽略目录（.git、__pycache__ 等）就跳过
                 continue
@@ -651,14 +690,30 @@ class FileGlob(BaseTool):
         return ""
 
     def _tool_description(self):
+        # 【第 15.3 轮】这段说明重写过。改之前它只有 4 行，且第一句是
+        # "**/*.py 会找出**工作区**里所有 Python 文件"——边界虽然已经删了，
+        # "工作区"这三个字还留在说明书里，等于继续暗示"它只能搜项目目录"。
+        # 同时它没回答模型最常见的那个问题：**不知道文件在哪时该填什么**。
+        # 于是模型转身去用 dir /s —— 它更熟，而且一条命令能同时扫好几个目录。
+        # 新版按"什么时候用 / 怎么用"组织，专门补上这两个缺口。
         return """
-按文件名通配符查找文件，结果按修改时间从新到旧排序。
+按文件名通配符查找文件，支持 ** 递归，结果按修改时间从新到旧排序。
 
-使用要点：
-- ** 表示"任意层子目录"，例如 **/*.py 会找出工作区里所有 Python 文件。
-- 自动跳过 .git、__pycache__、node_modules 等缓存和依赖目录。
-- 最多返回 100 个结果；太多时把模式写具体一点。
-- 找的是"文件名"，搜"文件内容"请用 file_grep。
+什么时候用它：
+- 用户说"找一下我的某某文件"但没说在哪个目录时，这就是本工具的典型场景。
+- 不要用 dir /s、Get-ChildItem -Recurse、find 去拼 shell：前两个会扫全盘、经常超时，
+  在 Windows 的 cmd.exe 里还容易写成两条不同语法的混合体导致报错。
+
+用法：
+- pattern 里 ** 表示"任意层子目录"，例如 **/*简历* 会一路往下找出所有名字带"简历"的文件。
+- path 是搜索起点，可以给任意绝对路径（如 C:/Users/用户名/Desktop、D:/项目）；留空从当前目录开始。
+- 不确定在哪儿时，先挨个搜几个常见目录（桌面、下载、文档），每次 pattern 用 **/*关键词*：
+  这三个目录都是毫秒级返回，而且能分几次调用、并发执行，加起来比一条 shell 命令还快。
+- 不要一上来就拿 C:/Users/用户名 或盘符根（D:/）当 path 递归：那要十几秒，还可能超时。
+  常见目录里没找到，再往上一层扩大范围。
+- 自动跳过 .git、__pycache__、node_modules 等缓存和依赖目录；最多返回 100 个结果，
+  太多时把模式写具体一点。
+- 找的是"文件名"；搜"文件内容"请用 file_grep，读某个具体文件用 file_read。
         """.strip()
 
 
@@ -678,6 +733,15 @@ class FileGrep(BaseTool):
 
     async def act(self, pattern="", path="", include="", case_sensitive=False,
                   need_user_approve=False):
+        """按内容搜索（第 15 轮：整体丢到线程池里执行）
+
+        为什么要绕 to_thread：这个工具最重——要递归遍历目录、逐个读文件、
+        再逐行跑正则。它和 file_read 并发时如果不同步让出，等于白并发。
+        详见 FileRead.act 的注释。
+        """
+        return await asyncio.to_thread(self._act, pattern, path, include, case_sensitive)
+
+    def _act(self, pattern, path, include, case_sensitive):
         if not pattern or not isinstance(pattern, str):
             return "请提供要搜索的内容（pattern），支持正则表达式。"
 
@@ -711,8 +775,9 @@ class FileGrep(BaseTool):
                         continue
                 except OSError:
                     continue  # 文件可能刚好被删了，跳过就行
-                if not _within_workspace(file_path):  # 允许绝对路径时也要守住边界
-                    continue
+                # 【第 15.2 轮】这里原来还有一道 `_within_workspace(file_path)` 过滤，
+                # 防止"传了绝对路径的 include"把工作区外的文件也扫进来。边界取消后删掉。
+                # 上面的两处跳过（超大文件、stat 失败）是在保结果质量和防崩，别一起删了。
 
                 raw, text, error = _read_text(file_path)  # 读文件并解码
                 if error or _is_binary(raw):  # 读不了或二进制文件，跳过

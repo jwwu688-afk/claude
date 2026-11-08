@@ -23,6 +23,10 @@ from typing import Optional  # 类型标注工具（表示"可能是这个值，
 from rich.text import Text  # 富文本：给横线染色
 
 from . import theme  # 【2026-11-06 第 4 轮】输入提示符的样式从这里取
+from .line_editor import LineEditor  # 【第 16 轮】Tab 补全用的自管行编辑
+# 注：EXTENDED_PREFIX / KEY_CTRL_C 原本在这里被用来做"首字符分流"，
+# 16.2 轮把分流整个删掉（改成整行自管）后，按键常量只在 line_editor 内部使用，
+# 这里不再需要导入。
 
 
 class InputHandler:
@@ -32,6 +36,10 @@ class InputHandler:
         """Initialize the input handler.（初始化，这里没什么要做的）"""
         self._console = theme.console  # 【第 10 轮】画输入框横线要用
         self._status_shown = False  # 【第 10 轮】底部状态栏只画一次
+        # 【第 16 轮】Tab 补全用的行编辑器。
+        #   在这里就建好而不是用到时再建：它的 available 判断要看 msvcrt 和 isatty，
+        #   启动时算一次就够了，不用每次输入都重新 import 一遍。
+        self._editor = LineEditor()
 
     def _draw_rule(self) -> None:
         """画输入框下方那条横线（2026-11-07 第 10 轮新增）
@@ -41,6 +49,13 @@ class InputHandler:
         很难一眼看出"我上一次说的是哪句"。
 
         宽度取终端当前宽度；取不到就退化成 60 列，绝不因为宽度异常抛错。
+
+        【16.1 轮补了 flush】这条横线和下面的状态栏画完必须立刻冲出缓冲区。
+          原因：紧接着就是下一次 input()，而 input() 是直接往 sys.stdout 写的。
+          如果 rich 的内容还压在缓冲里，用户看到的顺序会变成
+          "输入行 → 横线 → 状态栏"，看起来就像状态栏（那个橙色 ▸▸）不见了
+          或者跑到了输入框上面。这类错乱只在特定时序下出现，极难复现，
+          所以不靠"rich 大概会自己 flush"，直接显式刷。
         """
         try:
             width = max(20, self._console.width - 1)
@@ -50,6 +65,13 @@ class InputHandler:
         if not self._status_shown:  # 第一次输入完成才画状态栏，位置正好在横线下面
             self._status_shown = True
             self._draw_status_bar()
+        # 显式刷出缓冲区，理由见本方法文档字符串里【16.1 轮补了 flush】那段。
+        # 用 _console.file 而不是 sys.stdout：rich 可能把输出接到别处（比如测试里
+        # 换成 StringIO），刷错对象等于没刷。拿不到 file 也不报错。
+        try:
+            self._console.file.flush()
+        except Exception:
+            pass
 
     def _draw_status_bar(self) -> None:
         """画输入框下面那行黄色状态提示（2026-11-07 第 10 轮新增）
@@ -76,12 +98,14 @@ class InputHandler:
         line.append(f"上下文 {threshold_pct} 自动压缩", style="qs.dim")
         self._console.print(line)
 
-    async def get_user_input(self, prompt: str = None) -> str:
+    async def get_user_input(self, prompt: str = None, completer=None) -> str:
         """
         Get user input asynchronously.（异步获取用户输入）
 
         Args:
             prompt: The prompt to display to the user（显示给用户看的提示文字）
+            completer: 候选来源，给 Tab 补全用（2026-11-08 第 16 轮新增）。
+                       None 表示不要补全，走原来的 input()，行为和以前完全一样。
 
         Returns:
             User input as string（用户输入的字符串）
@@ -94,15 +118,53 @@ class InputHandler:
         if prompt is None:  # 调用方没指定提示符
             prompt = theme.prompt_text()  # 用统一的 >
         loop = asyncio.get_event_loop()  # 拿到当前的"事件循环"（异步任务的总调度台）
-        answer = await loop.run_in_executor(None, input, prompt)
-        # 上一行是关键：把 input 函数丢到"执行器"里去跑
-        #   None 表示用默认的线程池
-        #   input 是要执行的函数，prompt 是传给它的参数
-        # await 表示"在这儿等结果，但等着的时候不占着 CPU"
-        # 这样 input() 在等键盘时，主程序还能继续处理别的事情
+        # 【第 16 轮】原来这里直接 run_in_executor(None, input, prompt)。
+        #   现在改走 _read_line：它内部会先探一个字符，只有以 "/" 开头才进自管模式，
+        #   其余情况仍然调 input()——也就是说普通对话（尤其是中文输入）
+        #   走的是完全没变的那条老路。
+        answer = await loop.run_in_executor(None, self._read_line, prompt, completer)
         if draw_rule:
             self._draw_rule()
         return answer
+
+    def _read_line(self, prompt: str, completer) -> str:
+        """在线程池里执行的"读一行"（2026-11-08 第 16 轮新增，16.2 轮重写）
+
+        为什么这个函数是同步的、且必须在线程池里跑：
+          它内部会阻塞等键盘。放在事件循环里会冻住整个程序（动画、流式输出全停），
+          这正是原来那行 run_in_executor 要解决的问题。
+
+        【16.2 轮：把"先探一个字符"整个删掉了】
+          16 轮的做法是：先读一个字符看是不是 "/"，不是就交回 input()。
+          为了让那个字符"看起来还在屏幕上"，只能拼进提示符：
+
+              input(prompt + first)      # 第一个字变成提示符的一部分
+
+          后果是删不掉（prompt 不属于可编辑区），而且丢字（返回值不含它）。
+          16.1 轮想用 msvcrt.ungetch 把字符塞回缓冲区，实测也不行：
+            · ungetch 要 bytes（b"a"），传 str 直接 TypeError；
+            · 宽字符版 ungetwch 对中文抛 OSError。
+          异常被 except 吞掉后静默退回有 bug 的老写法，所以症状一点没变。
+
+          现在改成：**只要需要补全，整行都由 LineEditor 自己读**。
+          没有"交给 input() 一部分"这回事，也就没有"字符要不要还回去"的问题。
+          提示符也由 LineEditor 自己写，屏幕上所有字符出自同一处，
+          rich 和 input() 抢输出顺序、把 `>` 盖掉的情况也不会再发生。
+        """
+        # 三种情况仍然走原来的 input()：
+        #   1. 调用方不需要补全（授权提问、选会话编号）——没必要为它担自管的风险；
+        #   2. 用户显式要求用普通输入（逃生开关，见下）；
+        #   3. 环境不支持（非 Windows / 不是终端 / 输出被重定向）。
+        if (
+            completer is None
+            or os.getenv("THINKER_PLAIN_INPUT") == "1"
+            or not self._editor.available
+        ):
+            return input(prompt)
+        # THINKER_PLAIN_INPUT=1 的用途：万一自管模式在某个终端/输入法下表现异常
+        # （比如中文打不出来），用户设这个变量就能立刻回到原生 input()，
+        # 代价只是没有 Tab 补全。留这个口子，是因为真机行为我在测试环境验证不了。
+        return self._editor.readline(prompt, completer)
 
     # 【2026-11-06 第 8.2 轮】"同意"和"拒绝"的精确词表。
     #   为什么不用原来那种 "yes" in text 的子串匹配？

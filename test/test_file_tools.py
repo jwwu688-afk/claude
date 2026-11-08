@@ -126,9 +126,15 @@ def test_read_errors():
     out = run(FileRead().act(path="blob.bin"))
     assert "二进制文件" in out, out
 
-    outside = root.parent / "outside.txt"  # 工作区外面（父目录）的一个路径
+    # 【第 15.2 轮】原来这里断言"工作区外的路径必须被拒绝（超出工作区）"。
+    # 边界取消后，工作区外一个**不存在**的路径应该一路走到"文件不存在"——
+    # 这个断言的价值反而更高了：它同时证明了两件事，
+    #   1. 路径不再被提前拦掉（否则拿到的会是"超出工作区"，第一条断言失败）；
+    #   2. 该报的错照旧报（拿不到"文件不存在"说明前面某一步吞掉了错误）。
+    outside = root.parent / "outside_does_not_exist.txt"  # 工作区外面（父目录）的路径
     out = run(FileRead().act(path=str(outside)))
-    assert "路径超出工作区" in out, out
+    assert "文件不存在" in out, out
+    assert "超出工作区" not in out, out
 
     out = run(FileRead().act(path=""))  # 参数本身为空
     assert "路径参数无效" in out, out
@@ -321,25 +327,63 @@ def test_grep_basic():
     print("✓ 通过: 搜索、过滤、大小写与错误提示")
 
 
-def test_workspace_boundary_switch():
-    """测试：默认挡住工作区外；设 THINKER_ALLOW_OUTSIDE=1 后放行"""
-    print("\n测试: 工作区边界开关")
+def test_outside_path_allowed():
+    """测试：工作区外的路径可以直接读写，不再有"越界"这回事
+
+    【第 15.2 轮】本用例的前身是 test_workspace_boundary_switch，
+    当时验证的是"默认拒绝、设 THINKER_ALLOW_OUTSIDE=1 才放行"。
+    整套边界机制删掉之后，用例反过来用：验证**没有任何开关也能读写工作区外**，
+    并且顺手证明旧开关确实失效了。
+
+    为什么不直接把这个用例删掉：
+      只删不补的话，"路径不再被拦"这个新行为就没有任何测试守着。
+      将来若有人（哪怕是我自己）顺手把越界检查加回去，测试会一声不吭地全绿，
+      而用户又在"搜个桌面文件被拒"上踩第二次。断言方向反过来，覆盖就还在。
+    """
+    print("\n测试: 工作区外路径可直接读写")
     root = setup_workspace()
     other = tempfile.TemporaryDirectory(prefix="thinker_outside_")  # 另一个目录，模拟工作区外
     outside_file = Path(other.name) / "outside.txt"
     outside_file.write_text("外面的内容", encoding="utf-8")
 
-    out = run(FileRead().act(path=str(outside_file)))
-    assert "路径超出工作区" in out, out  # 默认拒绝
-
-    os.environ["THINKER_ALLOW_OUTSIDE"] = "1"  # 打开开关
     try:
+        # 1) 读：工作区外的绝对路径
         out = run(FileRead().act(path=str(outside_file)))
-        assert "外面的内容" in out, out  # 放行后能读到
+        assert "外面的内容" in out, out
+
+        # 2) 把旧开关显式设成 0，仍然要能读。
+        #    这一条是"真的删干净了"的反证：如果只是把默认值改成"允许"、
+        #    而 _allow_outside() 那套判断还在，这里就会挂。
+        os.environ["THINKER_ALLOW_OUTSIDE"] = "0"
+        try:
+            out = run(FileRead().act(path=str(outside_file)))
+            assert "外面的内容" in out, out
+        finally:
+            os.environ.pop("THINKER_ALLOW_OUTSIDE", None)
+
+        # 3) 写：在工作区外新建一个文件（写路径和读路径走的是同一个 _resolve_path）
+        new_outside = Path(other.name) / "written.txt"
+        out = run(FileWrite().act(path=str(new_outside), content="写进去了\n"))
+        assert new_outside.is_file(), out
+        assert new_outside.read_text(encoding="utf-8") == "写进去了\n", out
+
+        # 4) 相对路径仍然以工作区为基准——取消边界不等于取消基准。
+        #    否则模型说 "src/main.py" 就不知道该往哪儿补了。
+        (root / "inside.txt").write_text("工作区内容", encoding="utf-8")
+        out = run(FileRead().act(path="inside.txt"))
+        assert "工作区内容" in out, out
+
+        # 5) 工作区外不存在的文件：要报"文件不存在"，而不是被边界提前拦成"超出工作区"
+        out = run(FileRead().act(path=str(Path(other.name) / "nope.txt")))
+        assert "文件不存在" in out, out
+        assert "超出工作区" not in out, out
+
+        # 6) file_glob 用工作区外的目录当起点，也要能正常出结果
+        out = run(FileGlob().act(pattern="*.txt", path=other.name))
+        assert "outside.txt" in out or "written.txt" in out, out
     finally:
-        os.environ.pop("THINKER_ALLOW_OUTSIDE", None)  # 一定要还原，别影响后面的用例
         other.cleanup()  # 删掉临时目录
-    print("✓ 通过: 默认拒绝越界，开关打开后放行")
+    print("✓ 通过: 工作区外可读写，旧开关已失效，相对路径仍以工作区为基准")
 
 
 def test_schemas_and_prompt_consistency():
@@ -400,6 +444,12 @@ def run_all_tests():
     """运行所有测试（把上面 16 个用例挨个跑一遍）"""
     print("开始运行文件工具测试...\n")
 
+    # 【第 15.2 轮】这里原来有一段"进门先把 THINKER_ALLOW_OUTSIDE 清掉"的处理。
+    # 它存在的理由是：上面的用例都断言"工作区外必须被拒绝"，而那个断言
+    # 只有在开关不存在时才成立，所以要主动把环境钉成"未放行"。
+    # 边界整条删掉之后，这个前提没了，清理也就没意义了——留着反而会让人以为
+    # 这个环境变量还有作用。一起删掉。
+
     tests = [
         test_read_basic,
         test_read_offset_limit,
@@ -414,7 +464,7 @@ def run_all_tests():
         test_edit_crlf_and_multiline,
         test_glob_basic,
         test_grep_basic,
-        test_workspace_boundary_switch,
+        test_outside_path_allowed,
         test_schemas_and_prompt_consistency,
         test_tool_manager_registration,
     ]

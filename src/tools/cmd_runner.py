@@ -17,6 +17,7 @@
 
 import asyncio  # asyncio 库：用来"异步"执行命令（不阻塞界面）
 import locale  # locale 库：用来猜当前系统的默认文字编码（中文 Windows 是 GBK）
+import re  # 【第 15.3 轮】识别"用 shell 做文件查找"的命令，见 _FILE_SEARCH_PATTERNS
 import sys  # sys 库：这里只用来判断"当前是不是 Windows"（决定用哪种方式杀进程）
 from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各写一个数
 from tools.base_tool import BaseTool  # 导入父类
@@ -31,6 +32,41 @@ MAX_TIMEOUT = 600  # 上限 10 分钟（防止模型传个几小时把程序挂�
 MAX_OUTPUT_CHARS = MAX_TOOL_OUTPUT_CHARS
 
 
+# 【第 15.3 轮】识别"这条命令其实是在按文件名找文件"。
+#
+# 为什么需要这层：第 15.1 轮改了提示词、第 15.2 轮直接删了路径限制，
+# 但实测（会话 20261108-154549）模型仍然连发 6 条 dir / Get-ChildItem 去找一份简历，
+# 其中一条全盘递归超时被杀，还有两条 PowerShell 语法写错。它加载的是**新**提示词，
+# 说明事前约束（提示词 + 工具说明书）它不一定读进去。
+#
+# 而工具结果是它每一轮都必读的。所以把引导放在结果末尾：不阻断、不改变行为，
+# 只是让它下一次能看见"这件事有专用工具"。
+# 这比在工具层直接拒绝温和：拒绝会让模型以为环境坏了，转而用更奇怪的方式绕。
+_FILE_SEARCH_PATTERNS = (
+    # dir /s ...：递归列目录，是这次实际用到的写法
+    re.compile(r"\bdir\b[^|&;]*\s/s\b", re.I),
+    # dir ... *关键词*：带通配符的列目录，等价于"按名字找"
+    re.compile(r"\bdir\b[^|&;]*\*", re.I),
+    # PowerShell 的递归遍历
+    re.compile(r"Get-ChildItem[^|&;]*-Recurse", re.I),
+    # find . -name / -iname
+    re.compile(r"\bfind\b[^|&;]*-(?:i?name)\b", re.I),
+    # where /r：Windows 上的递归查找
+    re.compile(r"\bwhere\b\s+/r\b", re.I),
+)
+
+# 命中时追加到结果末尾的建议。措辞要点：
+#   · 给出可直接照抄的调用示例，模型最缺的是"path 该填什么"；
+#   · 说清"已经执行过了"，否则它会以为命令没跑；
+#   · 提到并发，打消"多调用几次会更慢"的顾虑（这是它选 shell 的真实理由之一）。
+_FILE_SEARCH_HINT = """
+---
+[thinker 提示] 上面这条命令做的是"按文件名查找"，这类事情有专用工具，不必拼 shell：
+  file_glob(pattern="**/*关键词*", path="C:/Users/用户名/Desktop")
+它支持任意路径和 ** 递归，只读工具还会并发执行（几个目录可以同时搜），
+比递归扫盘快，也不会因为超时被杀掉。下次遇到"找某个文件"请直接用它。"""
+
+
 class CmdRunner(BaseTool):
     def __init__(self):
         super().__init__()  # 调用父类的初始化（这里其实什么都没做）
@@ -40,6 +76,35 @@ class CmdRunner(BaseTool):
         return "cmd_runner"  # 这是它在模型眼里的名字
 
     async def act(self, command="", timeout=DEFAULT_TIMEOUT):
+        """执行命令；如果这条命令其实是在找文件，就在结果末尾补一句引导（第 15.3 轮新增）
+
+        为什么要把原来的函数体挪到 _execute、这里只留一层薄壳：
+          原来的 act 里有 5 个 return 分支（成功 / 成功但无输出 / 失败有 stderr /
+          失败无 stderr / 抛异常）。要在每个分支后面都补提示，等于把同一段逻辑
+          抄五遍，将来改一句措辞必然漏一处。包一层壳就变成"算完结果、再决定要不要加尾巴"。
+
+        为什么是"追加提示"而不是"拒绝执行"：
+          拒绝会让模型以为工具坏了，然后换更奇怪的方式绕——第 15.1 轮的
+          cmd_runner 绕过工作区边界就是这么来的。追加提示不改变它拿到的结果，
+          只是让它在下一轮看见"这件事有专用工具"。
+        """
+        result = await self._execute(command, timeout)
+        if command and self._looks_like_file_search(command):
+            return result + _FILE_SEARCH_HINT
+        return result
+
+    @staticmethod
+    def _looks_like_file_search(command: str) -> bool:
+        """这条命令看起来是不是在按文件名查找（第 15.3 轮新增）
+
+        判据故意写得窄：只认"递归"或"带通配符"的列目录，以及 find / where 的查找写法。
+        为什么要窄：普通的 `dir`（不带 /s、不带 *）是正当需求——用户会说
+        "看看这个目录里有什么"，那种情况加提示只是噪音。提示一多，
+        模型和用户都会开始忽略它，等于白加。
+        """
+        return any(p.search(command) for p in _FILE_SEARCH_PATTERNS)
+
+    async def _execute(self, command="", timeout=DEFAULT_TIMEOUT):
         # 真正的执行入口。command 是要跑的命令，timeout 是最多等几秒
         if not command:  # 如果命令是空的
             return "没有提供任何命令。请把要执行的命令放进 command 参数。"  # 直接告诉他"你没给命令"
@@ -245,8 +310,14 @@ class CmdRunner(BaseTool):
    - 如果命令危险，或者可能造成系统损坏、数据丢失，必须把 need_user_approve 设为 true
 
 2. 目录检查：
-   - 如果命令会新建目录，先确认父目录存在且位置正确（可用 file_glob，或用 `dir` 查看）
+   - 如果命令会新建目录，先确认父目录存在且位置正确（**用 file_glob 查看**）
    - 例如：执行 "mkdir foo/bar" 之前，先确认 "foo" 存在且就是想要的父目录
+   - 【第 15.3 轮】这里原来写的是"可用 file_glob，或用 `dir` 查看"。
+     那半句被删掉了，因为它是一份**授权**：模型读到"dir 可以查看目录"，
+     遇到"帮我找一下文件"就直接 `dir /s /b`，而不是用 file_glob。
+     实测确实如此——用户问简历在哪，模型连发 6 条 dir / Get-ChildItem，
+     还有一条全盘递归超时 30 秒。工具说明书不该同时给出两条去做同一件事的路，
+     模型只会记住更熟的那条（shell）。
 
 使用说明：
   - command 和 need_user_approve 两个参数是必填的。

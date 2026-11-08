@@ -234,6 +234,20 @@ def test_tool_call_chain_approval():
         conv._history_manager = history  # 替换成假历史
         ToolManager._instance = None  # 清单例，保证工具表是干净的
         ToolManager._initialized = False
+        # 【第 15 轮】造工具表时不要连 MCP。
+        #   这个用例验的是"授权分流"，跟 MCP 无关；而连 MCP 会起子进程，
+        #   并且要在事件循环结束前收尾（生产代码靠 conversation.shutdown() 做）。
+        #   改前 file_read 全程是同步的、一个 await 都不让出，MCP 那个后台任务
+        #   根本来不及启动，于是"没连上也就没东西要收"；第 15 轮把文件 IO 改成
+        #   await asyncio.to_thread 之后，任务真的被调度起来了，
+        #   用例就会卡在 asyncio.run 的收尾阶段（一直等 MCP 的连接完成）。
+        #   所以这里直接把注册任务掐掉——确定性比"碰巧能过"重要。
+        ToolManager._ensure_mcp_registration = lambda self: None
+        # 还要掐掉 MCPClient 自己的后台任务：ToolManager.__new__ 里会 new 一个
+        # MCPClient，而它 __init__ 就会 create_task(_run) 去连服务器。
+        # 只掐上面那一处是不够的——真正赖在 _ready.wait() 上的正是它。
+        from tools.mcp_client.client import MCPClient
+        MCPClient._ensure_started = lambda self: None
         conv._tool_manager = ToolManager()  # 真工具表（同步环境，不会连 MCP）
         # 第一次：只读的 file_read，不该弹确认
         await conv._handle_tool_calls([FakeToolCall("file_read", {"path": "a.py"})])
