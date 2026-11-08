@@ -25,6 +25,7 @@ import json  # json 库：把模型给的"参数字符串"解析成真正的 Pyt
 import os  # 【第 13 轮】取当前目录，写进会话文件的 header
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
 from core.api_client import APIClient  # 导入 API 客户端：真正发请求给大模型的家伙
+from core.commands import handle_command, is_command  # 【第 14 轮】斜杠命令：在消息进历史之前截下来
 from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各处各写一个数
 from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
 from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器：负责生成"系统提示词"
@@ -59,6 +60,98 @@ __all__ = ["Conversation", "READ_ONLY_TOOLS"]
 #   但它是"对外导出的名字"——test/test_conversation_loop.py 就是从这个模块 import 它的。
 #   不声明 __all__ 的话，PyCharm / flake8 会把它标成"导入后未使用"（黄色波浪线）。
 #   写进 __all__ 等于告诉静态检查：这是我故意留着给外面用的，别报。
+
+# =============================================================================
+# 【2026-11-08 第 14.2 轮】把 SDK 的 tool_calls 对象转成普通字典
+#
+# 【为什么必须转，两个原因一个比一个硬】
+#   1. 会崩。assistant 消息里的 tool_calls 来自 openai SDK，是 pydantic 对象
+#      （ChatCompletionMessageFunctionToolCall）。第 13 轮加了"每条消息即时落盘"之后，
+#      SessionStore 会拿 json.dumps 写文件，而它不认识 pydantic 对象：
+#        TypeError: Object of type ChatCompletionMessageFunctionToolCall is not JSON serializable
+#      于是**这个会话第一次真正用上工具就会中断**，而且断在"模型已经答完、
+#      正要去执行工具"的那一刻——用户看到的是半截回答加一段红色堆栈。
+#   2. 前后不一致。内存里是对象、从 JSONL 读回来是字典，同一份历史有两种形态。
+#      第 9 轮修压缩裁剪时就为此写了一堆"字典和对象都支持"的兜底
+#      （见 history_manager 的 _role / _tool_calls），每处都要两条分支。
+#      在入口统一成字典，后面所有代码就只需要认一种形态。
+#
+# 【为什么放在 add_message 而不是 _run_one_iteration】
+#   add_message 是**所有**消息进入历史的唯一入口（user / assistant / tool / system）。
+#   在入口处规范化，等于给整条链路加了一道闸；在某一类消息上单独处理，
+#   下次换个地方塞进对象又会漏。
+# =============================================================================
+
+def normalize_message(message):
+    """把消息里的 tool_calls 对象转成字典，不需要转换时原样返回（2026-11-08 第 14.2 轮）
+
+    参数 message：一条消息。正常是 dict；测试里也可能传别的形态，那就原样返回
+                  （这个函数只负责"能转就转"，不负责类型校验）。
+
+    返回：转换过就是**新字典**，没转换就是传入的那个对象。
+
+    边界与取舍：
+      · tool_calls 为 None 或空列表 → 原样返回，不制造一个空列表塞进去。
+        为什么在意这个：空列表和 None 在 OpenAI 接口里语义不同，
+        None 表示"这条消息没申请工具"，空列表则可能被当成"申请了零个"。
+      · 已经是字典（从 JSONL 读回来的）→ 原样返回，不做无意义的复制。
+      · **不原地修改传入的字典**。调用方（_run_one_iteration）构造完
+        assistant_message 还会用它，原地改会让"存进历史的那份"和
+        "调用方手里那份"悄悄变成两个版本，排查起来极难。
+    """
+    if not isinstance(message, dict):  # 不是字典（测试里的自定义对象）就不管
+        return message
+
+    tool_calls = message.get("tool_calls")
+    if not tool_calls:  # None 或空列表：没什么可转的
+        return message
+
+    if all(isinstance(call, dict) for call in tool_calls):
+        return message  # 已经是干净数据（恢复会话时就是这种），省一次复制
+
+    normalized = dict(message)  # 浅拷贝：只替换 tool_calls 这一个字段
+    normalized["tool_calls"] = [_tool_call_to_dict(call) for call in tool_calls]
+    return normalized
+
+
+def _tool_call_to_dict(call) -> dict:
+    """把单个 tool_call 转成 OpenAI 标准字典（2026-11-08 第 14.2 轮）
+
+    优先用 pydantic 自己的 model_dump()：它知道哪些字段该带、哪些是内部字段，
+    比手写字段映射可靠（SDK 以后加字段也不会漏）。
+    v2 叫 model_dump()，v1 叫 dict()，两个都试。
+    都拿不到才退回手写——那时候宁可少几个字段，也不能让整条消息存不进去：
+    消息存不进去等于这段对话在恢复时会缺一环，比字段不全严重得多。
+
+    边界：model_dump() 也可能抛异常（自定义对象、字段里有不可序列化的东西），
+    所以调用外面套了 try；异常一律当作"这条路走不通"，换下一种方式。
+    """
+    if isinstance(call, dict):  # 已经是字典，直接返回
+        return call
+
+    for method_name in ("model_dump", "dict"):  # pydantic v2 / v1
+        method = getattr(call, method_name, None)
+        if not callable(method):
+            continue
+        try:
+            dumped = method()
+        except Exception:
+            continue  # 这条转换路径不可用，试下一条
+        if isinstance(dumped, dict):
+            return dumped
+
+    # 兜底：手写三个 OpenAI 规定必有的字段。
+    # 这里用 getattr 带默认值，因为 call 可能是个残缺对象（测试造的假数据）。
+    function = getattr(call, "function", None)
+    return {
+        "id": getattr(call, "id", None),
+        "type": getattr(call, "type", "function"),
+        "function": {
+            "name": getattr(function, "name", None),
+            "arguments": getattr(function, "arguments", "") or "",
+        },
+    }
+
 
 SUMMARY_SYSTEM_PROMPT = """你是一个对话压缩器。
 
@@ -145,7 +238,14 @@ class Conversation:
         【第 13 轮】顺手把消息写进会话文件，这样进程被杀也不会丢上下文。
         只在主 agent 时写：子 agent 的消息属于"临时草稿"，最后只会把结论交回来，
         把它们也落盘会让会话文件里混进大量无关内容，恢复时反而干扰模型。
+
+        【2026-11-08 第 14.2 轮】进历史前先调用 normalize_message()：
+          模型的回复带着 SDK 的 tool_calls **对象**，直接落盘会抛
+          TypeError: ... is not JSON serializable，把整轮对话打断（详见该函数注释）。
+          这一步必须在 add_message 里做、而不是在 _run_one_iteration 里做：
+          这里是所有消息进历史的唯一入口，闸口只有一道才不会漏。
         """
+        message = normalize_message(message)  # 转成可序列化的纯数据
         self._history_manager.add_message(message)  # 转手交给历史管理器
         # 【第 13 轮】用 getattr 兜底而不是直接 self._session：
         #   单例的 __init__ 只在第一次执行，某些测试/子 agent 场景下对象是先 __new__ 出来的，
@@ -153,6 +253,65 @@ class Conversation:
         session = getattr(self, "_session", None)
         if session is not None and not self.is_subagent:
             session.append_message(message)  # 追加一行到 JSONL
+
+    def build_system_message(self) -> dict:
+        """造一条系统消息（2026-11-07 第 14 轮抽出）
+
+        为什么抽出来：新建会话、`--continue` 恢复、`/resume` 切会话，三处都要造它。
+        原来只有第一处有，另外两处得各自复制一遍字典字面量——
+        系统提示词的包装结构一旦变（比如以后要加图片块），复制的那两处必然漏改。
+        """
+        return {
+            "role": "system",  # system 表示"系统设定"，是给模型看的规则，用户一般看不到
+            "content": [
+                # content 用列表而不是字符串：以后可以塞图片、文件等不同类型的内容块
+                {"type": "text", "text": self._prompt_manager.get_system_prompt()}
+            ],
+        }
+
+    def _load_session_into_history(self, path):
+        """把某个会话文件的内容装进当前历史（2026-11-07 第 14 轮抽出）
+
+        返回 (恢复的消息条数, 估算 token 数)。
+
+        启动时的 `--continue` 和运行中的 `/resume` 走的是同一段逻辑：
+          读文件 → 换消息列表 → 补用量账本 → 换会话句柄。
+        四步缺一不可，尤其是"补用量账本"——第 13.1 轮就是漏了它，
+        恢复长会话后第一次请求会绕过压缩直接 400。
+
+        为什么不用「清空再逐条 append」：
+          append 会走 add_message，进而触发会话落盘。
+          恢复时把从文件读出来的消息再写回同一个文件，等于每条都存两遍，
+          文件会越滚越大。直接替换列表就绕过了这条路径。
+        """
+        restored = load_messages_for_resume(path)  # 丢掉旧 system，只取对话本身
+        system_message = self.build_system_message()  # 用今天的日期/目录/记忆重新生成
+        self._history_manager.messages_history[-1] = [system_message] + restored
+        estimated = self._history_manager.seed_usage_from_messages([system_message] + restored)
+        self._session = SessionStore(path)  # 之后的每条新消息继续写进这个文件
+        return len(restored), estimated
+
+    async def _read_user_input(self) -> str:
+        """读一行用户输入；如果是斜杠命令，本地处理完继续等（2026-11-07 第 14 轮新增）
+
+        为什么要收成一个方法，而不是三个调用点各写一遍：
+          主 agent 有三处会等输入——开场、Esc 中断之后、一轮说完之后。
+          三处各写一遍判断，将来加第四处必然漏；收在这里，
+          "命令对所有用户输入都生效"就是结构上保证的，不靠人记得。
+
+        为什么命令处理完要接着 while，而不是直接返回一个空串：
+          `/cost` 打完用户当然还要继续说下一句。返回空串当用户消息的话，
+          模型会收到一条空消息，还要为它付一次输入费用——而这条命令
+          问的偏偏是"我花了多少钱"。
+
+        子 agent 不走这里：它们不读用户输入（`_task_depth > 0` 时主循环直接返回）。
+        这里保留一个兜底判断，是为了将来万一有别的地方调用。
+        """
+        while True:
+            text = await self._ui_manager.get_user_input()
+            if not is_command(text) or self._task_depth > 0:
+                return text
+            await handle_command(text, self)  # 处理完继续循环，等用户真正想说的话
 
     async def start_conversation(self, resume_path=None):
         """Start a new conversation.（开始一次全新的对话：这是用户按下回车后的第一步）
@@ -170,38 +329,20 @@ class Conversation:
         ensure_memory_dir()
 
         # Initialize with system message
-        system_message = {
-            # 一条消息就是一个字典，必须有两样东西：role（谁说的）和 content（说了什么）
-            "role": "system",  # system 表示"系统设定"，是给模型看的规则，用户一般看不到
-            "content": [
-                # content 是一个列表，里面可以放多个"内容块"
-                # 之所以用列表而不是直接写字符串，是因为以后可以塞图片、文件等不同类型的内容
-                {"type": "text", "text": self._prompt_manager.get_system_prompt()}
-                # 这一块是文字，内容是提示词管理器生成的"系统提示词"（人设、规则、当前环境）
-            ]
-        }
+        # 【第 14 轮】改成调用 build_system_message()：恢复会话、/resume 切会话也要造它，
+        #   三处共用一份，包装结构变了才不用改三遍。
+        system_message = self.build_system_message()
 
         # 【第 13 轮】建立会话存储。
         #   恢复时直接续写**原来那个文件**，而不是新建一个——这样一次对话
         #   从头到尾都在同一个 JSONL 里，翻起来是连续的，也不会重复存旧消息。
         if resume_path:
-            self._session = SessionStore(resume_path)
-            restored = load_messages_for_resume(resume_path)
-            # 系统提示词用新生成的替换旧的：里面的日期、目录、项目记忆可能是几天前的，
-            # 照搬会让模型拿着过期信息干活。user / assistant / tool 消息原样保留。
-            self._history_manager.messages_history[-1] = [system_message] + restored
-
-            # 【2026-11-07 第 13.1 轮】恢复完必须补一次用量估算。
-            #   改前这里只换了消息列表，没碰 history_token_usage——
-            #   它还是空的，而 _requires_compression() 看到空账本就返回 False，
-            #   于是恢复一个已经用到 80% 的长会话时，第一次请求会把整份历史原样发出去，
-            #   大概率 400（context_length_exceeded）。
-            #   注意 system_message 也要算进去：它是最大的一块固定开销。
-            estimated_tokens = self._history_manager.seed_usage_from_messages(
-                [system_message] + restored
-            )
+            # 【第 14 轮】整段抽进 _load_session_into_history()：
+            #   运行中的 /resume 用的是同一份逻辑。两处各写一遍的话，
+            #   第 13.1 轮补的那个"用量估算"迟早只补在一处。
+            count, estimated_tokens = self._load_session_into_history(resume_path)
             self._ui_manager.print_info(
-                f"已恢复上次会话：{len(restored)} 条消息"
+                f"已恢复上次会话：{count} 条消息"
                 f"（按字符估算上下文约 {estimated_tokens:,} token）"
             )
         else:
@@ -211,7 +352,8 @@ class Conversation:
             )
             self.add_message(system_message)  # 把系统提示词放进消息列表（永远排在最前面）
 
-        user_input = await self._ui_manager.get_user_input()  # 等用户打字，await 表示"在这儿等"
+        # 【第 14 轮】走 _read_user_input：斜杠命令在这里被截下，不进历史、不发模型
+        user_input = await self._read_user_input()
         user_message = {
             "role": "user",  # user 表示"用户说的"
             "content": [
@@ -407,7 +549,7 @@ class Conversation:
                 # 主 agent：等用户下一句话。这里手动走一遍"等输入"的流程，
                 # 而不是 return True 让外层再转一圈——那样会立刻又去请求模型，
                 # 用户根本没机会改口。
-                user_input = await self._ui_manager.get_user_input()
+                user_input = await self._read_user_input()  # 【第 14 轮】命令也在这里截
                 user_message = {
                     "role": "user",
                     "content": [{"type": "text", "text": user_input}],
@@ -475,7 +617,7 @@ class Conversation:
             # No tool calls, wait for user input
             if self._task_depth > 0:  # 如果我是子 agent
                 return False  # 【第 8 轮】活干完了，让外层 while 停下，把结论交给主 agent——不要再去问用户要输入
-            user_input = await self._ui_manager.get_user_input()  # 主 agent 就等用户说下一句
+            user_input = await self._read_user_input()  # 主 agent 就等用户说下一句（【第 14 轮】命令已在此截下）
             user_message = {
                 "role": "user",  # 用户说的
                 "content": [

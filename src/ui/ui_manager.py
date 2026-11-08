@@ -90,6 +90,15 @@ class UIManager:
         """Get user input with predefined choices.（让用户从固定选项里选）"""
         return await self.input_handler.get_choice_input(prompt, choices, case_sensitive)
 
+    async def get_numbered_choice(self, title: str, items: list) -> Optional[int]:
+        """列编号清单，返回用户选中的下标（2026-11-07 第 14 轮新增）
+
+        /resume 用它选会话。只在 UIManager 这里转一手、不直接调 InputHandler，
+        是为了维持"其他模块只跟门面打交道"这条约定——
+        不然每个想画清单的地方都要自己 import InputHandler。
+        """
+        return await self.input_handler.get_numbered_choice(title, items)
+
     # Display delegation methods
     # ↓ 下面这一批：全是在转手，把活交给 display_manager
     def print_assistant_message(self, content: str, emoji: str = "", header: bool = True) -> None:

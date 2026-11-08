@@ -104,6 +104,39 @@ def _cwd(start: Optional[Path] = None) -> Path:
     return (start or Path(os.getcwd())).resolve()
 
 
+def is_user_home(start: Optional[Path] = None) -> bool:
+    """当前目录是不是用户主目录（2026-11-08 第 14.1 轮新增）
+
+    【为什么需要判断这个】
+      整个项目把"启动时的 cwd"当成项目根：项目记忆按 cwd 向上找、
+      自动记忆按 cwd 算目录名、会话 header 记的是 cwd、文件工具的工作区也是 cwd。
+      这套设计本身没错——但它在主目录里启动时，全都会指向一个"不是项目"的地方。
+
+      实际踩到的例子：
+        用户在 `PS C:/Users/Jarvis>` 下敲 thinker，再执行 /init，
+        于是生成了 `C:/Users/Jarvis/THINKER.md`。这份文件会成为
+        **所有从主目录启动的会话**的项目记忆，里面还写着
+        "（没检测到常见的项目标志文件）"——它描述的不是任何项目。
+      同一个原因下，那次会话的文件工具工作区是 C:/Users/Jarvis，
+      也就改不到 D:/code/thinker 里的任何文件。
+
+    【为什么只判主目录，不判"看起来不像项目"】
+      后者会误伤：新建的空目录、只有一个脚本的目录、刻意在某个子目录里
+      局部工作的场景，都"不像项目"但完全合理。
+      主目录是唯一一个"在这儿建 THINKER.md 几乎肯定错了"的地方，
+      误报率最低。宁可少提醒，也不要让用户学会无视警告。
+
+    start 参数是给测试用的（同 _cwd），生产代码一律走默认值。
+    异常一律返回 False：路径算不出来时不该拦着用户干活。
+    """
+    try:
+        return _cwd(start) == Path.home().resolve()
+    except (OSError, RuntimeError):
+        # Path.home() 在极端环境下会抛（没有 HOME 变量、家目录不存在）。
+        # 判断不出来就当"不是"，让程序继续跑——这只是一条提示，不值得为它失败。
+        return False
+
+
 def _iter_upward(start: Path) -> List[Path]:
     """从 start 一路往上收集目录，最多 MAX_UPWARD_LEVELS 层（2026-11-07 第 11 轮）
 

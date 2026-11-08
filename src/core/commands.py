@@ -1,0 +1,652 @@
+# =============================================================================
+# 文件：src/core/commands.py
+# 作用：斜杠命令的注册表与处理函数（2026-11-07 第 14 轮新增）
+#
+# 【一、为什么需要这一层：有些事根本不该问模型】
+#   下面这几句话，发给模型是纯浪费：
+#     "/cost"        → 模型不知道你花了多少钱，说了也是编
+#     "/resume"      → 要切会话，那是本地文件操作
+#     "/memory"      → 问"你记了我什么"，答案在磁盘上的几个 .md 里
+#     "/init"        → 生成骨架文件，是写盘，不是对话
+#   把它们当普通消息发出去，会连付三次代价：
+#     1. 多一次输入 token；
+#     2. 换来一个编造的答案；
+#     3. 这条命令本身留在上下文里，以后每一轮都在为它付费。
+#   所以必须在"消息进历史之前"截下来，本地处理完直接回到输入提示。
+#
+#   反过来说，只有"本地百分之百能答"的才配当命令。
+#   "帮我重构这一段"这类必须交给模型——命令系统不该变成第二套意图路由，
+#   那等于用 if/elif 重新实现一遍模型的判断，而且一定更差。
+#
+# 【二、一次 /cost 的完整时间线（这就是整个机制）】
+#   23:41:02  用户敲 "/cost"
+#   23:41:02  Conversation._read_user_input() 拿到字符串 "/cost"
+#   23:41:02  is_command() → True（行首是 /）
+#   23:41:02  handle_command() 被调用：
+#               parse("/cost") → ("cost", "")
+#               REGISTRY["cost"] → CommandSpec
+#   23:41:02  cmd_cost() 读 APIClient / HistoryManager，打印五行
+#   23:41:02  回到 _read_user_input 的 while 顶部，**继续等下一句**
+#   23:41:30  用户敲 "这个函数什么意思"
+#   23:41:30  不是命令 → 原样返回
+#   23:41:30  start_conversation 才把这句话 add_message 并发给模型
+#
+#   注意 23:41:02 那一步"继续等"，而不是"返回空串"：
+#   如果返回空串当用户消息，模型会收到一条空消息，还要为它付一次输入费用——
+#   而这条命令问的偏偏是"我花了多少钱"。
+#
+# 【三、改前 vs 改后（为什么要新加一个 _read_user_input）】
+#   改前：主 agent 有三处各自 await ui.get_user_input()——
+#         开场、Esc 中断之后、一轮说完之后。三处各写一遍判断，加第四处必然漏。
+#   改后：三处都调 _read_user_input()，命令的拦截点只有一个。
+#         "命令对所有用户输入都生效"变成结构上保证的，不靠人记得。
+#
+# 【四、为什么用一张表，而不是 if / elif 链】
+#   和 ToolManager 登记工具是同一个理由：加命令时只加一条 register()，
+#   分发、/help 列表、未知命令提示三处会自动跟着变。
+#   第 8.1 轮踩过一个反向的坑：task 工具的说明书里手写了三种 agent 类型，
+#   其中两种根本没登记，模型照着示例派活，一直报"类型不存在"。
+#   那次之后，凡是"有几项、分别是什么"的东西，都改成从登记表里取。
+#
+# 【五、边界：这一轮只做"纯读"】
+#   /memory /resume /init /cost 都不改对话历史（/resume 换历史，但换的是整份，
+#   而且是用户明确要求的）。会改上下文的两条——/compact 强制压缩、/clear 清空——
+#   留到第二步：它们要动历史页，风险等级不是一个量级，
+#   混在同一批里做，回归失败时没法二分定位。
+# =============================================================================
+
+import os  # /resume 按 cwd 过滤"本项目的会话"；/init 要拼 THINKER.md 的路径
+from dataclasses import dataclass  # 用一个"只装字段"的小类描述命令，省掉手写 __init__
+from typing import Awaitable, Callable, Dict  # handler 是"异步函数"，注册表是字典
+
+from core.session import SessionStore  # /resume 要列会话、读会话
+
+
+@dataclass(frozen=True)
+class CommandSpec:
+    """一条斜杠命令的说明书（一条命令 = 一个实例）
+
+    frozen=True 的理由：
+      注册表是全模块共享的，一旦某处手滑改掉 usage 或 summary，
+      /help 的显示就会在运行中悄悄变样，而且极难查。
+      冻结之后，改它的唯一方式就是重新 register 一条，意图明确。
+
+    字段含义：
+      name    ：不带斜杠的命令名，比如 "memory"。它是注册表的键，也是分发依据。
+                必须是纯 ASCII 小写——用户可能开着中文输入法敲 / ，
+                全角斜杠会被 is_command 与 parse 一致地挡在命令系统之外
+                （宁可当成普通消息，也不要把 "/cost" 认成命令）。
+      usage   ：给人看的用法，比如 "/memory [文件名]"。方括号表示可选，
+                和 man page、git 的写法一致，不用另发明一套约定。
+      summary ：一句话说明。/help 直接拿它拼列表，所以它必须能独立成句，
+                不能写"见上文"这种依赖上下文的表述。
+      handler ：真正干活的异步函数，签名 (conversation, args) -> None。
+                为什么把 conversation 传进去、而不是让 handler 自己去 Conversation()：
+                  命令要在测试里跑（test_commands.py 用的是 FakeConv），
+                  写死单例就没法替身；参数传进来，测试才能塞假对象。
+    """
+
+    name: str
+    usage: str
+    summary: str
+    handler: Callable[["object", str], Awaitable[None]]
+
+
+# 注册表：键是命令名（小写），值是说明书。
+# 用模块级字典而不是类，是因为它完全无状态——
+# 不像 ToolManager 要持有工具实例，这里只有"名字 → 函数"，没有实例可管。
+# 也正因为是模块级，import 一次就全局可用，不需要谁去初始化。
+REGISTRY: Dict[str, CommandSpec] = {}
+
+
+def register(spec: CommandSpec) -> None:
+    """把一条命令登记进表里
+
+    重复登记会直接覆盖，不做冲突检查。理由：
+      调试时经常要临时替换某个命令（比如把 /resume 换成只打印、不真切会话），
+      每次先 unregister 再 register 太啰嗦。
+      真出问题时，"后注册的赢"也是最好理解的规则。
+    """
+    REGISTRY[spec.name] = spec
+
+
+def is_command(text: str) -> bool:
+    """判断这一行是不是命令（True = 该由本地处理，别发给模型）
+
+    参数 text：用户刚敲的那一行，可能带前导空格（从别处复制粘贴过来时很常见）。
+
+    为什么要求"第一个非空白字符就是 /"：
+      正文里出现 / 太多了——
+        · Windows 路径：D:/code/thinker
+        · 除法：3/4
+        · 日期：2026/11/08
+        · 网址：https://example.com
+      如果按"含 /"判断，上面这些会被误当成命令吞掉，
+      用户会觉得"我打个路径它就没反应"。
+      只认行首，和 shell、Claude Code 的习惯一致：命令必须在开头。
+
+    边界：
+      · 空串 → False（用户直接回车）
+      · "/" → True（交给 handle_command，它会打印帮助）
+        为什么不让它判 False：那样用户打一个斜杠回车，这行会被当成普通消息
+        发给模型，模型只能回"我不明白"。打印帮助更有用。
+    """
+    return bool(text) and text.lstrip().startswith("/")
+
+
+def parse(text: str):
+    """把 "/memory  foo.md" 拆成 ("memory", "foo.md")
+
+    返回 (命令名, 参数串)；拆不出命令名时返回 (None, "")。
+
+    三个细节：
+      1. 命令名转小写：/COST 和 /cost 应该等价，用户不会记得大小写。
+         参数**不动**：/memory 后面可能是 README.md，转小写就找不到文件了。
+      2. split(None, 1) 只切一刀：命令名之后再出现的空格，全部算参数。
+         这样 /init --global --force 的 args 是 "--global --force" 一整串，
+         由 handler 自己按空格再切——不同命令的开关规则不一样，
+         在这里统一切成列表只会限制它们。
+      3. 只有一个 "/" 时返回 (None, "")：让上层走"打印帮助"那条路，
+         而不是报"未知命令 /"，那样没有任何信息量。
+
+    边界：
+      · "/ "（斜杠加空格）→ body 是 " "，strip 后为空 → (None, "")
+      · "/cost "（尾部空格）→ args 是 ""，不是 " "
+    """
+    body = text.lstrip()[1:]  # 去掉行首空白，再砍掉那个斜杠
+    if not body.strip():  # 只有斜杠，或者斜杠加空白
+        return None, ""
+
+    parts = body.strip().split(None, 1)  # 最多切一刀：命令名 + 其余全部
+    name = parts[0].lower()  # 只有命令名转小写，参数保持原样（见上面第 1 点）
+    args = parts[1].strip() if len(parts) > 1 else ""
+    return name, args
+
+
+async def handle_command(text: str, conversation) -> None:
+    """执行一条命令；调用方负责保证 text 确实以 / 开头
+
+    为什么返回 None 而不是 bool：
+      不管成功、失败、未知命令，对调用方来说结果都一样——
+      "这一行已经被消费掉了，不要发给模型"。
+      返回 True/False 反而会诱惑调用方在 False 时把命令发给模型，
+      那就绕回了我们想避免的路径。
+
+    未知命令为什么不往模型发，而是就地给清单：
+      用户打错一个字母（/memroy），发给模型只会得到"我无法执行斜杠命令"，
+      然后他还要自己猜正确拼写。直接列出可用命令，一次就能改对。
+      这个教训来自第 8.1 轮：task 工具当时抛异常，异常被上层吞成
+      "运行工具时出错"，模型看不到"正确的有哪些"，于是再猜一个继续撞。
+
+    参数：
+      text         ：用户输入的整行，形如 "/cost" 或 "/memory foo.md"
+      conversation ：对话总管。命令要读它的 api_client / history_manager /
+                     _session 等实时状态，所以必须传进来，不能自己去 new 单例。
+    """
+    name, args = parse(text)
+    ui = conversation._ui_manager  # 所有输出都走这个门面，不直接 print
+
+    if not name:  # 用户只打了一个 "/"
+        _print_help(conversation)
+        return
+
+    spec = REGISTRY.get(name)
+    if spec is None:  # 打错了，或者这条命令还没实现
+        ui.print_error(f"未知命令：/{name}")
+        # sorted 是为了让每次提示的顺序一致：注册顺序取决于 import 次序，
+        # 用户看到的清单不该因为改代码而重排。
+        names = "、".join("/" + n for n in sorted(REGISTRY))
+        ui.print_info(f"可用命令：{names}（/help 看详细说明）")
+        return
+
+    try:
+        await spec.handler(conversation, args)
+    except Exception as e:
+        # 命令出错绝不能把整个对话带崩。
+        # 注意它和工具执行是两种处理：工具失败要变成一条消息交给模型自我纠正，
+        # 命令失败只影响用户自己这一下，跟模型无关，所以就地报错即可。
+        # 带上异常类型：只打 {e} 的话，遇到消息为空的异常（比如被取消）
+        # 会打印成"执行失败：:"，什么线索都没有。
+        ui.print_error(f"/{name} 执行失败：{type(e).__name__}: {e}")
+
+
+# =============================================================================
+# 一、/help
+# =============================================================================
+
+def _display_width(text: str) -> int:
+    """算一段文字在等宽终端里占几列（中文按 2 列算）
+
+    为什么不能直接用 len()：
+      终端里中文是双宽字符。"/memory [文件名]" 是 15 个字符，但显示占 18 列。
+      按 len() 补空格的话，含中文的那几行会明显比别的行短一截，
+      看起来像"漏了个空格"——明明是对齐代码，却让人以为坏了。
+
+    三个区间分别是：
+      0x4E00-0x9FFF  CJK 统一表意文字（汉字主体）
+      0x3000-0x303F  中文标点（、。「」之类）
+      0xFF00-0xFFEF  全角符号（，：（））
+    这三段覆盖了中文正文的绝大部分。用区间判断比引入 unicodedata 快得多，
+    也不需要额外依赖——项目明确不加新依赖。
+    """
+    width = 0
+    for ch in text:
+        code = ord(ch)
+        if 0x4E00 <= code <= 0x9FFF or 0x3000 <= code <= 0x303F or 0xFF00 <= code <= 0xFFEF:
+            width += 2  # 双宽
+        else:
+            width += 1  # 半宽（ASCII、数字、符号）
+    return width
+
+
+def _print_help(conversation) -> None:
+    """列出所有命令
+
+    列宽按最长的那条 usage 动态算，而不是写死一个数字：
+      `/init [--global] [--force]` 比 `/cost` 长一倍多。
+      写死小值，长命令会把摘要顶到紧贴，看起来像"少了个分隔符"；
+      写死大值，短命令后面又会拖一大段空白。
+      动态取最大值，两头都不难看。
+
+    排序：按命令名排，不按注册顺序。
+      注册顺序取决于 import 时的执行次序，是实现的偶然结果；
+      用户看到的顺序必须稳定，否则每次改代码 help 列表就重排一遍。
+    """
+    ui = conversation._ui_manager
+    specs = sorted(REGISTRY.values(), key=lambda s: s.name)
+    width = max(_display_width(spec.usage) for spec in specs)
+
+    ui.print_info("可用命令：")
+    for spec in specs:
+        padding = " " * (width - _display_width(spec.usage))  # 按显示宽度补，不按字符数补
+        ui.print_info(f"  {spec.usage}{padding}  {spec.summary}")
+
+    ui.print_info("")
+    # 这句不是装饰：用户第一次看到斜杠命令，最想知道的是
+    # "它会不会也被记进对话、也被计费"。直接说清楚，省得他去试探。
+    ui.print_info("斜杠命令在本地处理，不会发给模型，也不占上下文。")
+
+
+async def cmd_help(conversation, args: str) -> None:
+    """/help —— 列出所有命令（忽略参数）
+
+    为什么不支持 "/help memory" 看单条详细说明：
+      单条的"详细说明"目前只有一行摘要，拆开也没有更多内容可看。
+      等哪条命令的参数复杂到一行写不下（比如以后的 /compact [比例]）再加。
+      现在做，只会多一个没人用的分支。
+    """
+    _print_help(conversation)
+
+
+# =============================================================================
+# 二、/memory —— 我现在记了你什么（兑现 ROADMAP 的 A1）
+# =============================================================================
+
+async def cmd_memory(conversation, args: str) -> None:
+    """查看自动记忆：目录、条目、索引；带参数可看某条的正文
+
+    为什么这条最该先做：
+      第 12 轮上了自动记忆之后，模型一直在往
+      ~/.thinker/projects/<项目>/memory/ 里写文件，但用户**完全看不到**。
+      记错了、记重复了、记了不该记的，只能自己开资源管理器一层层翻。
+      一个"只写不读"的记忆系统，用户没法信任它——
+      他不知道自己上次纠正过的事有没有被记住，也就不会再认真纠正。
+
+    两种模式：
+      不带参数：目录 + 条目数 + 条目清单 + 索引全文（回答"你记了什么"）
+      带参数  ：某一条的正文（回答"那一条具体写了啥"）
+
+    参数 args：记忆文件名，扩展名可省。
+      为什么允许省：目录里全是 .md，让用户每次多打四个字符没有信息量。
+      但如果他真打了（/memory a.md），也不能变成 a.md.md——所以先判断再拼。
+
+    边界：
+      · 记忆目录不存在 → 提示"还没有"，不报错。全新项目本来就没有，这是正常状态。
+      · 文件不存在 → 报错 + 列出已有条目，让用户直接照着打。
+      · 路径越界 → 拒绝。理由见下面那段。
+    """
+    # 放在函数内 import 而不是文件头：auto_memory 会读路径、建目录，
+    # 和本模块的"纯注册"职责无关；而且这样导入失败只影响这一条命令，
+    # 不会让整个命令系统在启动时就连不上。
+    from core.auto_memory import is_memory_path, list_entries, load_index, memory_root
+
+    ui = conversation._ui_manager
+    root = memory_root()  # ~/.thinker/projects/<cwd 转成的 slug>/memory
+
+    if not root.is_dir():
+        # 目录不存在不是错误：第一次用的人本来就没有记忆。
+        # 但要说清"它什么时候会出现"，否则用户会以为功能没做。
+        ui.print_warning(f"还没有记忆目录：{root}")
+        ui.print_info("等模型第一次记东西时会自动创建。")
+        return
+
+    if args:  # 带参数：看某一条的正文
+        name = args if args.endswith(".md") else args + ".md"
+        target = root / name
+
+        # 越界检查。为什么命令也要查一遍：
+        #   命令是用户手打的，理论上他不会害自己；但这条路径最终会喂给 open()，
+        #   "/memory ../../.ssh/id_rsa" 是一秒钟就能打出来的。
+        #   记忆目录在 ~/.thinker 下，和项目目录完全无关；
+        #   混进一个能读任意文件的入口，以后想收紧都没机会。
+        #   is_memory_path() 会先 resolve 再按路径段比较，.. 和软链接都绕不过。
+        if not is_memory_path(target):
+            ui.print_error(f"拒绝访问：{args} 不在记忆目录里。")
+            return
+
+        if not target.is_file():
+            ui.print_error(f"没有这条记忆：{target.name}")
+            available = list_entries()
+            if available:  # 空的时候不打"现有条目："，那行会孤零零挂着
+                ui.print_info("现有条目：" + "、".join(available))
+            return
+
+        # errors="replace"：文件被别的程序写坏、或者不是 UTF-8 时，
+        # 用 � 代替非法字节，而不是抛 UnicodeDecodeError 让整条命令失败。
+        # 查看记忆是只读操作，读不全比读不出来强。
+        text = target.read_text(encoding="utf-8", errors="replace")
+        ui.print_info(f"— {target.name} —")
+        # 单条记忆正常只有一两百字。超过 4000 基本是把整份文档贴进来了，
+        # 截断并明说，免得刷满一屏让人以为程序卡住。
+        if len(text) > 4000:
+            text = text[:4000] + f"\n…（已截断，完整内容 {len(text)} 字符）"
+        ui.print_info(text.rstrip())  # rstrip：文件末尾的换行会多留一个空白行
+        return
+
+    entries = list_entries()  # 只数 .md，且排除索引自己，见 auto_memory.list_entries
+    index = load_index()  # 超长会被截断并注明，这里不用再处理
+
+    ui.print_info(f"记忆目录：{root}")
+    ui.print_info(f"条目数量：{len(entries)}")
+    if entries:
+        ui.print_info("")
+        ui.print_info("条目：")
+        for name in entries:  # list_entries 已经排好序，不用再 sort
+            ui.print_info(f"  · {name}")
+    ui.print_info("")
+    ui.print_info("索引（MEMORY.md）：")
+    # 没有索引时不显示"（空）"就结束，而是明确说"还没有任何记忆"——
+    # 前者像出错了，后者是正常状态。
+    ui.print_info(index if index else "  （空。还没有任何记忆。）")
+    ui.print_info("")
+    ui.print_info("看某一条的正文：/memory <文件名>（扩展名可省）")
+
+
+# =============================================================================
+# 三、/resume —— 在多个历史会话里选一个（兑现 ROADMAP 的 I3）
+# =============================================================================
+
+async def cmd_resume(conversation, args: str) -> None:
+    """列出本项目的会话，选一个接着聊
+
+    和第 13 轮的 `--continue` 什么关系：
+      `--continue` 只能接"最近一次"，而且只能在启动时用。
+      这条命令补两个场景：
+        1. 这个项目有好几个会话，我想挑其中一个（不是最近那个）；
+        2. 聊到一半发现聊岔了，想回到上午那次重新开始。
+
+    为什么只列本项目（按 cwd 过滤）：
+      在 A 项目里 /resume 却接上 B 项目的话题，模型会拿着一堆无关上下文，
+      反而更糊涂。这个判断和 --continue 一致，两处行为不该有分歧。
+
+    参数 args：暂时不使用。留着是因为以后可能要 "/resume 3" 直接选第三项；
+      现在只做交互式选择，少一条没人验证的代码路径。
+    """
+    ui = conversation._ui_manager
+
+    # 子 agent 也可能被误调到这里（虽然主循环不会给它们读输入的机会）。
+    # 明确拒绝，比让它去改主对话的历史安全——那会把主 agent 的上下文搞乱。
+    if getattr(conversation, "is_subagent", False):
+        ui.print_error("子 agent 里不能用 /resume。")
+        return
+
+    sessions = SessionStore.list_sessions(_cwd())  # 新的在前（文件名以时间开头）
+    if not sessions:
+        ui.print_warning("这个目录下还没有任何历史会话。")
+        return
+
+    current_path = getattr(getattr(conversation, "_session", None), "path", None)
+    # 为什么是两层 getattr：Conversation.__new__ 出来的对象（测试、子 agent）
+    # 可能没有 _session，直接 .path 会 AttributeError。
+
+    # 只列最近 10 个。为什么是 10：
+    #   终端一屏大约 20~30 行，10 行会话 + 标题 + 提示符刚好不滚动。
+    #   要列更多就得翻页，而翻页需要接管键盘——那是 prompt_toolkit 的活，
+    #   项目明确不加依赖（见 THINKER.md「不要做的事」）。
+    picked = sessions[:10]
+
+    labels = []
+    for path in picked:
+        # 每个文件都要读一遍才能拿到 header 和消息数。
+        # 为什么敢这么干：会话一般几十个、每个几十 KB，实测无感。
+        # 真要优化就把 cwd 编进文件名，但那样名字会变得很难看，不值得。
+        messages, header = SessionStore.load(path)  # 坏行会被跳过，不会抛
+
+        started = header.get("started_at", "")[:16].replace("T", " ")
+        # "2026-11-07T23:47:12" → "2026-11-07 23:47"。
+        # 去掉秒和 T：列表里不需要精确到秒，短一点更好扫。
+
+        preview = _first_user_text(messages)
+        mark = "  ← 当前" if current_path and path == current_path else ""
+        # 标出"当前"是必要的：用户很可能不知道自己正在哪个会话里，
+        # 选了当前这个会看起来"什么都没发生"，然后以为命令坏了。
+        labels.append(f"{started}  {len(messages):>3} 条  {preview}{mark}")
+        # {len(messages):>3} 右对齐到 3 位：条数会从个位变到三位，
+        # 不补齐的话后面的预览会参差不齐。
+
+    idx = await ui.get_numbered_choice("选择要恢复的会话：", labels)
+    if idx is None:  # 回车 / 非数字 / 越界，统一当取消
+        ui.print_info("已取消。")
+        return
+
+    target = picked[idx]
+
+    # 换历史走的是和 --continue 完全相同的那个方法。
+    # 为什么不在这里自己写一遍：那段逻辑有四个步骤（读文件、换历史、
+    # 补用量账本、换会话句柄），第 13.1 轮就是漏了第三步导致恢复长会话必 400。
+    # 两处各写一遍，下次改动只会补在一处。
+    count, estimated = conversation._load_session_into_history(target)
+
+    ui.print_success(f"已切换到：{target.name}")
+    ui.print_info(f"共 {count} 条消息，按字符估算上下文约 {estimated:,} token")
+    # 只报数量，不把历史内容打出来：接上一个 100 条的会话，
+    # 全打出来会刷掉整屏，而用户想要的只是"我回来了"。
+    ui.print_info("直接说下一句，就接着这个会话聊。")
+
+
+def _cwd():
+    """当前工作目录
+
+    为什么单独包一层函数，而不是各处直接 os.getcwd()：
+      /resume 要按 cwd 过滤会话，而测试需要在临时目录里造几个假会话，
+      又不能真的 chdir（会污染同一进程里的其他测试）。
+      留一个可替换的接缝，测试把它换成固定路径就行。
+      生产代码里它就是个转发，没有额外逻辑，多这一层几乎零成本。
+    """
+    return os.getcwd()
+
+
+def _first_user_text(messages) -> str:
+    """从一段消息里找第一句用户说的话，压成一行当预览
+
+    为什么用"第一句"而不是"最后一句"：
+      会话列表按时间倒序，第一句最能说明"这次聊的是什么"。
+      最后一句往往是"嗯"、"继续"、"好的"，看不出任何主题。
+
+    为什么要兼容 str 和 list 两种 content：
+      历史里 content 是"内容块列表"（[{"type":"text","text":...}]），
+      但测试里、以及早期版本写下的会话文件里可能是纯字符串。
+      两种都读，不至于因为一条老数据就让整份列表显示不出来。
+
+    截断到 36 个字符：
+      一行要塞下"时间 + 条数 + 预览"，终端宽度减去前面那些只剩这么多。
+      中文 36 字已经足够表达一个主题了。
+    """
+    for message in messages:
+        if not isinstance(message, dict) or message.get("role") != "user":
+            continue  # 只看用户说的；system 是提示词，assistant 是模型的回答
+
+        content = message.get("content")
+        if isinstance(content, str):  # 老格式 / 测试数据
+            text = content
+        elif isinstance(content, list):  # 标准格式：内容块列表
+            text = " ".join(
+                block.get("text", "") for block in content
+                if isinstance(block, dict) and block.get("type") == "text"
+            )
+        else:
+            continue  # None 或其他奇怪结构，跳过这一条继续找
+
+        text = " ".join(text.split())  # 换行、连续空格压成单个空格，否则列表会错行
+        if text:
+            return text[:36] + ("…" if len(text) > 36 else "")
+    return "（没有用户消息）"  # 只说了一句 /cost 就退出的会话会是这种
+
+
+# =============================================================================
+# 四、/init —— 生成项目记忆骨架（兑现 ROADMAP 的 M2）
+# =============================================================================
+
+async def cmd_init(conversation, args: str) -> None:
+    """生成 THINKER.md 骨架，等价于命令行的 `thinker --init`
+
+    命令行不是已经有了吗，为什么还要一条命令：
+      `--init` 必须**启动前**敲。而人往往是聊到一半才发现
+      "这个项目的约定该写进 THINKER.md"，这时候退出重开再进来，
+      上下文就断了——为了写一份记忆文件，把正在进行的对话丢掉，很不划算。
+
+    参数（按空格切成开关，顺序无关）：
+      --global  写全局记忆（~/.thinker/THINKER.md），对所有项目生效
+      --force   覆盖已存在的文件
+      --here    允许在用户主目录里生成（默认拒绝，见下）
+
+    为什么在主目录里默认拒绝（2026-11-08 第 14.1 轮补）：
+      有用户从 `PS C:/Users/Jarvis>` 启动了 thinker，再执行 /init，
+      于是生成了 `C:/Users/Jarvis/THINKER.md`——一份写着
+      "（没检测到常见的项目标志文件）"的骨架，却会成为**所有从主目录启动的
+      会话**的项目记忆。它描述的不是任何项目，只是把一条错误的小知识
+      反复喂给模型。
+      这类错误在终端里看不出来：命令回的是"已生成项目记忆"，看着完全正常。
+      所以默认拒绝 + 明确告诉用户"请先 cd 到项目目录"；
+      真要写在这儿（少数人确实拿主目录当工作区），加 --here 就行。
+
+    为什么默认不覆盖：
+      用户可能已经在里面手写了几百字的项目约定，一条命令全毁掉的代价
+      远大于"多打一次 --force"的便利。
+      这类"不可逆 + 高价值"的默认值，一律选保守的那边。
+
+    边界：
+      文件已存在且没给 --force → 提示"没有覆盖"并返回，不改动任何内容。
+    """
+    # 同样放函数内 import：只有真的执行 /init 时才需要写盘相关的东西。
+    from core.prompt.memory import (
+        GLOBAL_MEMORY_PATH,
+        MEMORY_FILENAME,
+        is_user_home,
+        write_init_file,
+    )
+
+    ui = conversation._ui_manager
+    flags = args.split()  # 开关按空格切；和 parse() 保留整串不同，这里就是要逐项判断
+    scope = "global" if "--global" in flags else "project"
+    force = "--force" in flags
+
+    # 主目录守卫：只拦"项目"这一档。
+    #   --global 写的是 ~/.thinker/THINKER.md，那本来就是跟人走、不跟项目走的，
+    #   在主目录里执行它完全正当，不该拦。
+    if scope == "project" and is_user_home() and "--here" not in flags:
+        ui.print_error(f"当前目录是用户主目录：{os.getcwd()}")
+        ui.print_info("在这里生成的 THINKER.md 会成为所有「从主目录启动」的会话的项目记忆，")
+        ui.print_info("而它描述的不是任何具体项目。请先 cd 到项目目录再执行 /init。")
+        ui.print_info("确实要写在这里，请加 --here。")
+        return
+
+    if scope == "global":
+        target = GLOBAL_MEMORY_PATH.expanduser()  # ~ 不展开的话 exists() 永远是 False
+        what = "全局记忆"
+        next_step = "按实际习惯改「说话方式」「动手习惯」，尤其是那几条红线（不要自动提交）。"
+    else:
+        target = os.path.join(os.getcwd(), MEMORY_FILENAME)
+        what = "项目记忆"
+        next_step = "补充「代码约定」「不要做的事」两节，模型每轮都会读到。"
+
+    existed = os.path.exists(target)  # 先记下来：write_init_file 跳过了也不会告诉我们
+    path = write_init_file(force=force, scope=scope)  # 真正写盘就这一行，和 --init 共用
+
+    if existed and not force:
+        ui.print_warning(f"{what}已存在，没有覆盖：{path}")
+        ui.print_info("想重新生成请加 --force（会覆盖你现在的内容）")
+        return
+
+    ui.print_success(f"已生成{what}：{path}")
+    ui.print_info(next_step)
+    # 这句必须说：记忆是在 start_conversation 里拼进系统提示词的，
+    # 也就是"启动时读一次"。改完不重启，模型这一轮还是按老规矩来，
+    # 用户会以为命令没生效。
+    ui.print_info("注意：记忆是启动时读进系统提示词的，改完要重启 thinker 才生效。")
+
+
+# =============================================================================
+# 五、/cost —— 这次会话花了多少、缓存有没有帮上忙
+# =============================================================================
+
+async def cmd_cost(conversation, args: str) -> None:
+    """打印成本与上下文占用
+
+    为什么这条必须有：
+      第 6 轮加了缓存命中率，但它只出现在每轮结束的状态行里，滚两屏就看不见了。
+      而且那是"这一轮"的视角，回答不了"我这个下午一共花了多少"。
+      没有这个数字，用户没法判断"要不要换个便宜模型"、
+      "缓存到底有没有省到钱"——省钱的机制看不见，就等于不存在。
+
+    口径说明（这几个数字都是累计的，不是这一轮的）：
+      prompt_tokens / cached_tokens 由 APIClient._record_usage 每次请求累加；
+      total_cost 只在接口返回 usage.model_extra.cost 时才累加。
+    """
+    ui = conversation._ui_manager
+    api = conversation._api_client
+    history = conversation._history_manager
+
+    cost = api.total_cost
+    # 关键取舍：0 到底是什么意思？
+    #   有两种可能——真的一分钱没花，或者接口根本不返回 cost 字段。
+    #   从数字上分不清，所以绝不能显示 "$0.00"：那会让人以为免费，然后放开了用。
+    #   显示"未提供"才是诚实的。（spark-x2.6 这类中转站大概率不返回 cost。）
+    cost_text = f"${cost:.2f}" if cost else "未提供（接口没返回 cost 字段）"
+
+    lines = [
+        f"花费：{cost_text}",
+        # 千分位：48213 和 48,213 的可读性差得远，而 token 数动辄五位数。
+        f"输入 token：{api.prompt_tokens:,}",
+        f"命中缓存：{api.cached_tokens:,}（{api.cache_hit_rate:.1f}%）",
+        # current_context_window 本身是字符串（"11.8"），因为状态行要直接拼进 f-string。
+        f"上下文占用：{history.current_context_window}%",
+        # 条数能解释"为什么上下文这么大"：压缩过之后会突然掉一截，
+        # 看到条数变少就知道是压缩生效了，而不是哪里出错了。
+        f"当前消息数：{len(history.messages_history[-1])}",
+    ]
+
+    # 命中率为 0 时补一句解释。为什么值得单独说：
+    #   0% 有两个完全不同的原因——接口不支持提示词缓存（换供应商才能解决），
+    #   或者消息前缀一直在变（比如系统提示词里带了时间戳，每次请求都不一样）。
+    #   不点出来，用户只会觉得"缓存这东西没用"。
+    if api.cache_hit_rate == 0 and api.prompt_tokens > 0:
+        lines.append("缓存命中为 0：要么接口不支持提示词缓存，要么消息前缀一直在变。")
+
+    for line in lines:
+        ui.print_info(line)
+
+
+# =============================================================================
+# 六、注册
+#
+# 为什么放在文件末尾，而不是每条命令定义完就注册：
+#   读代码的人按"头部说明 → 数据结构 → 工具函数 → 各命令 → 注册表"的顺序看下来，
+#   最后一屏就能看到"到底有哪些命令"。散落在中间的话，得来回翻。
+# =============================================================================
+
+register(CommandSpec("help", "/help", "列出所有命令", cmd_help))
+register(CommandSpec("memory", "/memory [文件名]", "查看模型记了什么（索引与正文）", cmd_memory))
+register(CommandSpec("resume", "/resume", "在历史会话里选一个接着聊", cmd_resume))
+register(CommandSpec("init", "/init [--global] [--force] [--here]", "生成 / 更新项目记忆骨架", cmd_init))
+register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cmd_cost))

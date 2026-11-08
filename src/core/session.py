@@ -47,6 +47,7 @@
 import json  # 读写 JSONL：每行是一个 JSON 对象
 import os  # 取当前工作目录，写进 header
 import secrets  # 生成会话 id 的随机后缀，避免同一秒内开两个会话撞名
+import sys  # 【第 14.2 轮】序列化失败时把警告写到 stderr，不打断正文显示
 import time  # 记录每条消息的写入时刻（浮点秒，比字符串省事）
 from datetime import datetime  # 生成可读的会话 id（年月日-时分秒）
 from pathlib import Path  # 路径操作
@@ -227,6 +228,27 @@ class SessionStore:
             # 存档失败往往是因为磁盘满，此时屏幕上再刷一行错误，
             # 用户既没法处理，又会被打断注意力。
             pass
+        except TypeError as e:
+            # 【2026-11-08 第 14.2 轮新增】消息里有 json 不认识的类型。
+            #   真实踩到的例子：assistant 消息的 tool_calls 是 openai SDK 的
+            #   pydantic 对象，json.dumps 直接抛 TypeError，而当时这里只捕 OSError，
+            #   于是异常一路冒到 _run_one_iteration，把**整轮对话打断**——
+            #   模型已经答完、工具还没执行，用户看到的是半截回答加一段红字。
+            #   根因已经在 Conversation.add_message 里用 normalize_message 修掉了，
+            #   这里加一道兜底：万一将来又有什么字段没规范化，宁可丢这一条存档，
+            #   也不能让正在进行的对话崩掉。
+            #
+            #   为什么只跳过、不写个"残缺版"：
+            #     assistant(tool_calls) 和后面的 tool 结果是成对的，写一半出去
+            #     会让恢复时 400（role=tool 找不到对应的 tool_calls）。
+            #     少一条消息只是"恢复时少一件事"，写坏配对是"恢复后直接不能用"。
+            #
+            #   为什么这条**要**打印而 OSError 不打印：
+            #     OSError 是环境问题（磁盘满），用户自己知道该怎么办；
+            #     这条是代码缺陷，不说出来就永远没人修。写 stderr 是为了不打断
+            #     rich 正在画的正文区域。
+            print(f"[会话存档] 这条消息没能写入（{type(e).__name__}: {e}）。"
+                  f"当前对话继续，但 --continue 会缺少这一条。", file=sys.stderr)
 
     # -------------------------------------------------------------------------
     # 3.2 读取

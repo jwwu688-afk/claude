@@ -176,3 +176,28 @@ class InputHandler:
         if user_input in choices:  # 如果输入在选项里
             return user_input  # 返回这个选项
         return None  # 不在就返回 None
+
+    async def get_numbered_choice(self, title: str, items: list, hint: str = "输入编号，直接回车取消") -> Optional[int]:
+        """列一个带编号的清单，让用户输数字选一项（2026-11-07 第 14 轮新增）
+
+        为什么不复用上面的 get_choice_input：
+          那个的语义是"选项本身就是答案"（a / b / c），要求输入必须命中选项；
+          而 /resume 的选项是"一整行会话摘要"，不可能让人照着敲一遍。
+          这里只负责把行号翻译成下标，调用方自己知道下标对应哪个对象。
+
+        返回 0 开始的下标；回车、非数字、超出范围一律返回 None（当作取消）。
+        为什么不抛异常：取消是完全正常的操作，不该逼调用方写 try/except。
+        """
+        print(title)  # 标题
+        for i, item in enumerate(items, 1):  # 从 1 开始编号，更符合人的习惯
+            print(f"  {i}. {item}")
+
+        raw = await self.get_user_input(hint)  # 等一行输入（提示文字走统一的 ❯）
+        text = (raw or "").strip()
+        if not text.isdigit():  # 回车、字母、带空格的数字都算取消
+            return None
+
+        index = int(text) - 1  # 界面上是 1 开始，内部下标是 0 开始
+        if 0 <= index < len(items):  # 越界也当取消，不报错
+            return index
+        return None

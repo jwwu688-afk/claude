@@ -25,7 +25,7 @@ import asyncio  # 导入 asyncio 工具箱：让程序在"等网络回复"的时
 import os  # 用来读环境变量（拿模型名、压缩阈值）和当前目录
 import sys  # 【第 11 轮】读命令行参数（--init / --version）
 from core.conversation import Conversation  # 导入对话总管 Conversation 类，后面靠它启动聊天
-from ui.theme import console, ACCENT, DIM, WIDTH, STAR, OK, WARN  # 配色与符号
+from ui.theme import console, ACCENT, DIM, WIDTH, STAR, OK, WARN, WARN_SIGN  # 配色与符号
 from rich import box  # rich 的边框样式集合（这里用圆角那个）
 from rich.panel import Panel  # 面板：带边框的一块区域
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
@@ -34,7 +34,7 @@ from rich.text import Text  # 富文本：可以给一段文字的不同部分�
 # 为什么要放这里：改完代码后如果用户没重新启动进程，看到的还是旧界面，
 # 容易反复"改了没效果"。标题带版本号，一眼就能确认当前跑的是哪一份代码。
 # 改界面时顺手升一位（与 pyproject.toml 的 version 保持一致）。
-VERSION = "0.2.1"
+VERSION = "0.3.2"
 
 
 def _readable_dir(path: str) -> str:
@@ -97,7 +97,37 @@ def welcome():
     hint.append(" · ", style=DIM)
     hint.append(f"上下文 {threshold_pct} 自动压缩", style=DIM)
     console.print(hint)
+    _warn_if_home()
     console.print()  # 最后空一行，让输入提示符不贴着提示文字
+
+
+def _warn_if_home():
+    """在主目录启动时给一句提醒（2026-11-08 第 14.1 轮新增）
+
+    【为什么要在启动时提醒，而不是等用户执行 /init 才说】
+      这个错误一旦发生，代价不止一个文件：项目记忆、会话归属、
+      文件工具的工作区全都会以主目录为根。用户往往要到
+      "为什么它改不了我的项目文件"、"为什么记忆里没有我写的约定"时才发现，
+      而那时候已经白聊了好几轮。
+      在门口说一句，比在出事后解释便宜得多。
+
+    【为什么放在框下面，而不是塞进欢迎框】
+      框里固定三行（标题、模型、目录），加一行会把它撑高，
+      标题就不再垂直居中了——第 10 轮调这个框调了很久，不破坏它。
+
+    【为什么判据是"主目录"而不是"看起来不像项目"】
+      后者会误伤空目录、单脚本目录、只在某个子目录里局部工作的场景。
+      主目录是唯一一个"在这儿生成 THINKER.md 几乎肯定错了"的位置（见
+      core/prompt/memory.py 的 is_user_home 注释）。
+    """
+    from core.prompt.memory import is_user_home  # 放函数内：只有需要时才导入
+
+    if not is_user_home():
+        return
+
+    console.print(Text(f"  {WARN_SIGN} 当前在用户主目录启动。", style=f"bold {WARN}"))
+    console.print(Text("    项目记忆、会话归属、文件工具的工作区都会以这里为根，", style=DIM))
+    console.print(Text("    它改不到别的盘里的项目文件。要处理某个项目，先 cd 过去再启动。", style=DIM))
 
 
 
@@ -132,19 +162,29 @@ def run_continue():
     return path
 
 
-def run_init(force: bool = False, scope: str = "project"):
+def run_init(force: bool = False, scope: str = "project", here: bool = False):
     """生成 THINKER.md 骨架（2026-11-07 第 11 轮新增，同日补了 --global）
 
     用法：
         thinker --init             项目记忆（写到当前目录）
         thinker --init --global    全局记忆（写到 ~/.thinker/）
+        thinker --init --here      允许写在用户主目录（默认拒绝）
 
     这是 Claude Code 里 `/init` 的等价物。Claude Code 的 `/init` 只生成项目级，
     全局那份要用户自己在 `/memory` 里建——这里直接给个参数，省掉那一步。
 
     挂成命令行参数而不是斜杠命令，是因为斜杠命令系统还没做，这一步不该等它。
+    （第 14 轮已经有了 /init，两条路径共用下面的 write_init_file 和同一套守卫。）
     """
-    from core.prompt.memory import GLOBAL_MEMORY_PATH, MEMORY_FILENAME, write_init_file
+    from core.prompt.memory import GLOBAL_MEMORY_PATH, MEMORY_FILENAME, is_user_home, write_init_file
+
+    # 【第 14.1 轮】和 /init 用同一个守卫：主目录里默认不生成"项目记忆"。
+    #   两边规则必须一致，否则用户在 CLI 被拦、进到会话里又能写，会更糊涂。
+    if scope == "project" and is_user_home() and not here:
+        console.print(Text(f"  {WARN_SIGN} 当前目录是用户主目录：{os.getcwd()}", style=f"bold {WARN}"))
+        console.print(Text("  在这里生成的 THINKER.md 会成为所有「从主目录启动」的会话的项目记忆。", style=DIM))
+        console.print(Text("  请先 cd 到项目目录再执行 --init；确实要写在这里请加 --here。", style=DIM))
+        return
 
     if scope == "global":
         target = str(GLOBAL_MEMORY_PATH.expanduser())
@@ -176,6 +216,7 @@ def cli():
         run_init(
             force="--force" in argv,
             scope="global" if "--global" in argv else "project",
+            here="--here" in argv,  # 【第 14.1 轮】主目录里要写，得显式给这个
         )
         return
     if "--version" in argv or "-v" in argv:

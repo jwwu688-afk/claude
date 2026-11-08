@@ -18,7 +18,7 @@ Thinker 是一个用 Python 复刻 Claude Code 的终端编程助手：单层主
 
 ```
 src/
-  core/          对话总管、API 客户端、历史/压缩、权限、提示词（含 memory.py）
+  core/          对话总管、API 客户端、历史/压缩、权限、提示词（含 memory.py）、斜杠命令（commands.py）
   tools/         内置工具 + MCP 适配 + 子 agent
   ui/            显示与输入（theme 管配色符号）
   mcp_servers/   示例 MCP 服务器（weather / calculator）
@@ -29,17 +29,31 @@ docs/优化记录/    每轮改动的详细记录
 ## 常用命令
 
 ```bash
-# 启动（必须在项目根目录，.env 是相对 cwd 读的）
+# 启动（必须在项目根目录）
+#   项目记忆、自动记忆目录、会话归属、文件工具的工作区，全都按"启动时的 cwd"算。
+#   从 C:\Users\<你> 启动会把"家"当成项目：记忆写到家目录、改不到 D 盘的项目文件。
+#   （.env 不受影响：python-dotenv 跟着包所在目录向上找，换目录照样读得到。）
 thinker
 
 # 生成 / 更新项目记忆骨架
 thinker --init          # 已存在则跳过
 thinker --init --force  # 覆盖重写
+thinker --init --here   # 允许写在用户主目录（默认拒绝）
 
 # 跑测试：都是独立脚本，没有 pytest
 python test/test_memory.py
 python test/test_conversation_loop.py
 python test/test_p0_fixes.py
+```
+
+会话内可用的斜杠命令（第 14 轮，`core/commands.py`）：
+
+```
+/help                              列出全部命令
+/memory [文件名]                    看模型记了什么（不带参数看索引，带参数看正文）
+/resume                            列出本项目历史会话，输编号切过去
+/init [--global] [--force] [--here] 生成 / 更新 THINKER.md（主目录里默认拒绝）
+/cost                              本次会话的花费、token、缓存命中率、上下文占用
 ```
 
 两个 conda 环境都装了 editable 版：`D:\Anaconda\envs\claude` 和 `D:\Anaconda\envs\thinker`。
@@ -93,3 +107,8 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 - `mcp` 库 1.x 用 `inputSchema`、2.x 用 `input_schema`，`McpTool` 里做了双向回退，改这块要同时考虑两个版本。
 - `ToolManager` / `Conversation` / `HistoryManager` 全是单例 + 类属性，一次只能跑一个子 agent。做并行之前必须先去掉单例。
 - 上下文压缩会整体替换消息列表，导致前缀缓存失效；压缩动作应尽量落在缓存断点之后。
+- 斜杠命令只在 `Conversation._read_user_input()` 里拦一次，别在三个调用点各写一遍；拦截必须发生在 `add_message` 之前，否则命令自己会进历史、还会计费。
+- **进历史的每条消息必须能被 `json.dumps` 序列化**。SDK 返回的 `tool_calls` 是 pydantic 对象，直接放进去会让落盘抛 `TypeError`（第 14.2 轮踩过：第一次用工具就中断）。统一在 `Conversation.add_message` 里过一遍 `normalize_message()`，不要在调用处各自转换。
+- **重装前必须先退出 thinker**。`pip install -e .` 要替换 `Scripts\thinker.exe`，Windows 下正在运行的这个文件是被锁住的 → pip 会「先卸旧的、再装新的」，卡在替换那一步，结果是包被卸掉、`thinker` 变成 `ModuleNotFoundError: No module named 'main'`。真的踩了就先写一个 `site-packages\__editable__.thinker.pth`（内容就是 `src` 目录的绝对路径）把导入接回去，关掉会话后再重装。
+- PyCharm 里 `from core...` 全红，通常不是代码问题：项目是 src 布局，`src` 必须被标记为 Sources Root（`.idea/thinker.iml` 里的 `sourceFolder`）。之前 editable 安装会顺手把这个洞盖住，包一旦卸掉就全红了。
+- **别在用户主目录启动**（`C:\Users\<你>`）。项目记忆、自动记忆目录、会话归属、文件工具工作区四处都按 cwd 算，从家里启动等于把家当项目：`/init` 会生成家目录的 THINKER.md，文件工具也改不到别的盘。第 14.1 轮加了启动提醒和 `/init` 守卫，但根治办法只有一条——先 `cd` 到项目目录再启动。
