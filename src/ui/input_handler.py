@@ -93,6 +93,13 @@ class InputHandler:
         line.append(f"{theme.ARROWS} ", style=f"bold {theme.WARN}")
         line.append("默认模式", style=theme.WARN)
         line.append(f" {theme.DOT} ", style="qs.dim")
+        # 【第 18.3 轮】补上输入层的真实能力提示：↑↓ 翻历史、←→ 改句子中间，
+        #   这些是第 18 / 18.1 轮加的功能，不写出来用户根本不知道能用。
+        #   只写真实存在的，不照抄截图里"auto mode / for agents"那些没实现的假按钮。
+        line.append("↑↓ 历史", style="qs.dim")
+        line.append(f" {theme.DOT} ", style="qs.dim")
+        line.append("←→ 编辑", style="qs.dim")
+        line.append(f" {theme.DOT} ", style="qs.dim")
         line.append("ctrl+c 退出", style="qs.dim")
         line.append(f" {theme.DOT} ", style="qs.dim")
         line.append(f"上下文 {threshold_pct} 自动压缩", style="qs.dim")

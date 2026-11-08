@@ -392,19 +392,18 @@ class DisplayManager:
         return self._body_cache_value
 
     def _thought_line(self) -> Text:
-        """生成 `  Thought for 3s (ctrl+o to expand)` 这一行（2026-11-07 第 10 轮新增）
+        """生成 `  Thought for 3s` 这一行（2026-11-07 第 10 轮新增，第 18.3 轮精简）
 
         和截图一致：缩进两格、整行暗灰。
-        ctrl+o 展开思考内容这个功能还没做，所以后面括号里的提示只是占位——
-        真要按了没反应，比不写更容易让人困惑，所以这里只保留耗时本身。
 
-        嗯，还是照截图带上括号提示吧：它是"这一行是什么"的解释，
-        没有 ctrl+o 也不影响理解。
+        【第 18.3 轮】删掉了原来的 "(ctrl+o to expand)"。
+          那个提示对应"展开思考内容"的功能，但从第 10 轮起就没实现过——
+          显示一个按了没反应的提示，比不显示更让人困惑：用户会以为是自己没按对。
+          功能真做出来了，再把提示加回来也不迟。
         """
         text = Text()
         text.append("  ")
         text.append(f"Thought for {int(round(self._thought_seconds))}s", style="qs.dim")
-        text.append(" (ctrl+o to expand)", style="qs.dim")
         return text
 
     def stop_stream_display(self, show_done: bool = True) -> None:

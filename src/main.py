@@ -25,7 +25,7 @@ import asyncio  # 导入 asyncio 工具箱：让程序在"等网络回复"的时
 import os  # 用来读环境变量（拿模型名、压缩阈值）和当前目录
 import sys  # 【第 11 轮】读命令行参数（--version / --continue / -c）
 from core.conversation import Conversation  # 导入对话总管 Conversation 类，后面靠它启动聊天
-from ui.theme import console, ACCENT, DIM, WIDTH, STAR, WARN, WARN_SIGN  # 配色与符号
+from ui.theme import console, ACCENT, DIM, WIDTH, STAR, WARN  # 配色与符号（WARN_SIGN 已随主目录警告一起移除）
 # 注：OK 只在已删除的 run_init 里用过，随它一起去掉了
 from rich import box  # rich 的边框样式集合（这里用圆角那个）
 from rich.panel import Panel  # 面板：带边框的一块区域
@@ -98,44 +98,7 @@ def welcome():
     hint.append(" · ", style=DIM)
     hint.append(f"上下文 {threshold_pct} 自动压缩", style=DIM)
     console.print(hint)
-    _warn_if_home()
     console.print()  # 最后空一行，让输入提示符不贴着提示文字
-
-
-def _warn_if_home():
-    """在主目录启动时给一句提醒（2026-11-08 第 14.1 轮新增）
-
-    【为什么要在启动时提醒，而不是等用户执行 /init 才说】
-      这个错误一旦发生，代价不止一个文件：项目记忆和会话归属都会以主目录为根，
-      模型说 "src/main.py" 也会被补成主目录下的路径。用户往往要到
-      "为什么记忆里没有我写的约定"、"为什么它老是找错文件"时才发现，
-      而那时候已经白聊了好几轮。
-      在门口说一句，比在出事后解释便宜得多。
-
-    【第 15.2 轮改了一句】原来的文案是"它改不到别的盘里的项目文件"。
-      那是靠路径边界实现的：file_* 工具当时只能在工作区内活动。
-      15.2 轮把边界整条删掉之后，它**确实能**改到别的盘了，
-      所以这句话不能再留着——继续显示会变成一句吓人的假话，
-      用户可能因此不敢在这儿用，而真正的风险其实只有"记忆和相对路径长错地方"。
-      警示的价值在于准确；说不准的警告，多一次就会让人开始忽略所有警告。
-
-    【为什么放在框下面，而不是塞进欢迎框】
-      框里固定三行（标题、模型、目录），加一行会把它撑高，
-      标题就不再垂直居中了——第 10 轮调这个框调了很久，不破坏它。
-
-    【为什么判据是"主目录"而不是"看起来不像项目"】
-      后者会误伤空目录、单脚本目录、只在某个子目录里局部工作的场景。
-      主目录是唯一一个"在这儿生成 THINKER.md 几乎肯定错了"的位置（见
-      core/prompt/memory.py 的 is_user_home 注释）。
-    """
-    from core.prompt.memory import is_user_home  # 放函数内：只有需要时才导入
-
-    if not is_user_home():
-        return
-
-    console.print(Text(f"  {WARN_SIGN} 当前在用户主目录启动。", style=f"bold {WARN}"))
-    console.print(Text("    项目记忆、会话归属、文件工具的默认搜索起点都会以这里为根，", style=DIM))
-    console.print(Text("    要处理某个项目，建议先 cd 过去再启动。", style=DIM))
 
 
 

@@ -19,10 +19,11 @@
 #     · 不是 "/" → 立刻把控制权交回 input()，中文输入的环境和以前一模一样
 #   这个判断的代价只有一次按键读取，而普通对话的风险是零。
 #
-# 【三、为什么不做光标移动 / 历史记录 / 中间插入】
-#   补全只需要"在行尾追加和退格"。加上左右移动就要维护光标列、处理中文双宽字符、
-#   处理终端自动换行时的视觉换行——每个都是独立的坑，而它们跟补全没有关系。
-#   先把"能补全"这件事做对；真需要行编辑能力时（比如插话队列那一轮）再一起做。
+# 【三、历史翻页（第 18 轮新增）】
+#   ↑ / ↓ 在行首按，可以翻回之前提交过的输入，再按回车就能把上一句"复制"下来改。
+#   这是 Claude Code 里最常用的输入习惯之一，所以补上。
+#   只做"整行替换"这一种操作：光标移动、中间插入这些仍然不做——它们要维护光标列、
+#   处理中文双宽、终端折行，是独立的坑，而且和"复制上一句"这件事没关系。
 #
 # 【四、环境不支持的降级】
 #   非 Windows（没有 msvcrt）、stdin 不是终端（管道 / CI / 重定向）时，
@@ -46,6 +47,20 @@ KEY_ESC = "\x1b"
 # 方向键、F1-F12、Insert 这些是"两字节键"：先来一个前导字节，再来真正的键码。
 # 不认这两个前导字节的话，后面那个键码会被当成普通字符插进输入里，屏幕上就出现乱码。
 EXTENDED_PREFIX = ("\x00", "\xe0")
+
+# 两字节键的第二个字节（Windows 控制台的实测值）。
+# 注意：这些字母看起来像普通字符，但它们只出现在 EXTENDED_PREFIX 之后，
+# 所以不会和"用户真的打了一个 H"混淆。这是第 18 轮为方向键历史补的。
+EXT_UP = "H"  # ↑ 上一条历史
+EXT_DOWN = "P"  # ↓ 下一条历史
+EXT_LEFT = "K"  # ← 光标左移一个字符（第 18.1 轮）
+EXT_RIGHT = "M"  # → 光标右移一个字符（第 18.1 轮）
+EXT_HOME = "G"  # Home 跳到行首（第 18.1 轮）
+EXT_END = "O"  # End 跳到行尾（第 18.1 轮）
+EXT_DELETE = "S"  # Delete 删光标处的字符（第 18.1 轮）
+
+# 历史最多留多少条。500 条足够翻回很久之前的输入，又不会吃内存。
+HISTORY_LIMIT = 500
 
 
 def display_width(text: str) -> int:
@@ -100,6 +115,13 @@ class LineEditor:
                 self._msvcrt = msvcrt
             except ImportError:
                 self._msvcrt = None
+
+        # --- 历史状态（第 18 轮新增）---
+        # 这些要跨"行"保留：一个 LineEditor 实例活多久，历史就记多久。
+        # 因为 InputHandler 只在启动时建一个实例，所以效果是"本次运行内的输入都能翻回来"。
+        self._history = []  # 本次运行内提交过的输入，最新的在末尾
+        self._history_index = None  # 当前翻到第几条；None = 正在编辑自己的草稿
+        self._draft = ""  # 翻历史之前手里那半句，按 ↓ 回到这里
 
     @property
     def available(self) -> bool:
@@ -203,7 +225,10 @@ class LineEditor:
           不存在"已经被别人读走"的情况，这个参数就没意义了。
           留着会让后来人以为还有"预填充"这回事，反而误导。
         """
-        buffer = []  # 用 list 而不是 str：删末尾字符方便，也不用反复拼字符串
+        buffer = []  # 用 list 而不是 str：中间插入 / 删除都不用反复拼字符串
+        cursor = 0  # 光标在 buffer 里的下标，0=行首，len(buffer)=行尾（第 18.1 轮）
+        self._history_index = None  # 每次开始新的一行，历史位置归零
+        self._draft = ""  # 草稿也清掉，避免把上一行的半句话带进来
         self._write(prompt)
 
         while True:
@@ -211,28 +236,56 @@ class LineEditor:
 
             if ch in KEY_ENTER:
                 self._write("\n")  # 自己换行：逐字符模式下回车不会自动换行
-                return "".join(buffer)
+                text = "".join(buffer)
+                self._remember(text)  # 先记历史再返回（顺序反了会漏记刚提交的这句）
+                return text
 
             if ch == KEY_CTRL_C:
                 # 保持 input() 的语义。这里不吞掉，交给上层决定（退出还是取消）
                 raise KeyboardInterrupt
 
             if ch in EXTENDED_PREFIX:
-                # 两字节键：把后面那个真正的键码吃掉，否则会变成乱码插进输入里
-                self.read_key()
+                # 两字节键：把后面那个真正的键码读到，按方向键/Home/End/Delete 处理。
+                code = self.read_key()
+                old_cursor = cursor
+                if code == EXT_UP:
+                    self._history_up(buffer, prompt)
+                    cursor = len(buffer)  # 翻历史后光标落到行尾
+                elif code == EXT_DOWN:
+                    self._history_down(buffer, prompt)
+                    cursor = len(buffer)
+                elif code == EXT_LEFT:
+                    cursor = max(0, cursor - 1)
+                elif code == EXT_RIGHT:
+                    cursor = min(len(buffer), cursor + 1)
+                elif code == EXT_HOME:
+                    cursor = 0
+                elif code == EXT_END:
+                    cursor = len(buffer)
+                elif code == EXT_DELETE:
+                    if cursor < len(buffer):
+                        old_text = "".join(buffer)
+                        buffer.pop(cursor)
+                        self._paint(prompt, old_text, "".join(buffer), cursor)
+                # 光标动了就重定位（历史翻页/Delete 已自己重画，跳过）
+                if code in (EXT_LEFT, EXT_RIGHT, EXT_HOME, EXT_END):
+                    self._move_cursor("".join(buffer), old_cursor, cursor)
+                # 其余两字节键（F1-F12、Insert 等）不处理，键码已吃掉
                 continue
 
             if ch == KEY_BACKSPACE:
-                if buffer:
-                    removed = buffer.pop()
-                    # 按"这个字符占几列"来擦，不能固定擦一格。
-                    # 中文是双宽字符占两列，只擦一格会留下半个字的残影——
-                    # 用户主要输入中文，退格时屏幕上会花成一片。
-                    self._erase_text(removed)
+                if cursor == 0:
+                    # 行首退格：没东西可删，什么都不做（和大多数编辑器一致）
+                    continue
+                old_text = "".join(buffer)
+                removed = buffer.pop(cursor - 1)  # 删的是光标**前面**那个字符
+                cursor -= 1
+                self._paint(prompt, old_text, "".join(buffer), cursor)
                 continue
 
             if ch == KEY_TAB:
                 self._handle_tab(buffer, prompt, completer)
+                cursor = len(buffer)  # 补全后光标统一落到行尾
                 continue
 
             if ch == KEY_ESC:
@@ -242,11 +295,14 @@ class LineEditor:
                 if buffer:
                     self._erase_text("".join(buffer))
                     buffer.clear()
+                    cursor = 0
                 continue
 
-            # 其余一律当普通字符（包括中文、空格、数字、符号）
-            buffer.append(ch)
-            self._write(ch)
+            # 其余一律当普通字符（中文、空格、数字、符号）：在光标处插入
+            old_text = "".join(buffer)
+            buffer.insert(cursor, ch)
+            cursor += 1
+            self._paint(prompt, old_text, "".join(buffer), cursor)
 
     # ------------------------------------------------------------------
     # Tab 的具体处理
@@ -299,6 +355,72 @@ class LineEditor:
         self._bell()
 
     # ------------------------------------------------------------------
+    # 历史翻页（第 18 轮新增）
+    # ------------------------------------------------------------------
+
+    def _remember(self, text: str) -> None:
+        """把刚提交的一行记进历史（第 18 轮新增）
+
+        三条规则都是有原因的：
+          · 空行不记——按了一堆回车再来翻历史，翻到的全是空行，等于没有历史。
+          · 和上一条相同不记——连着问两遍同一句话很常见，
+            重复记录会让 ↑ 按两次才动一格，手感很差。
+          · 历史满了从头部删——要淘汰的是最久远的，而 list.append 在尾部。
+        """
+        if not text.strip():
+            return
+        if self._history and self._history[-1] == text:
+            return
+        self._history.append(text)
+        if len(self._history) > HISTORY_LIMIT:
+            del self._history[0]
+
+    def _history_up(self, buffer: list, prompt: str) -> None:
+        """↑：往上翻一条历史（第 18 轮新增）
+
+        第一次按 ↑ 时先把"手里正在打的半句话"存进 _draft，之后按 ↓ 能原样还回来。
+        没有这一步的话，用户打了一半想看看上次问了什么，一按 ↑ 半句话就没了——
+        这是所有行编辑器的经典坑，也是最招人烦的一个。
+        """
+        if not self._history:
+            self._bell()  # 没有历史：响一声，别静默什么都不做
+            return
+
+        if self._history_index is None:
+            self._draft = "".join(buffer)  # 存草稿
+            self._history_index = len(self._history) - 1
+        elif self._history_index > 0:
+            self._history_index -= 1
+        else:
+            self._bell()  # 已经是最老的一条
+            return
+
+        self._replace_line(buffer, prompt, self._history[self._history_index])
+
+    def _history_down(self, buffer: list, prompt: str) -> None:
+        """↓：往下翻一条历史，翻到底就还回草稿（第 18 轮新增）"""
+        if self._history_index is None:
+            self._bell()  # 本来就在草稿上，下面没有东西了
+            return
+
+        if self._history_index < len(self._history) - 1:
+            self._history_index += 1
+            text = self._history[self._history_index]
+        else:
+            self._history_index = None
+            text = self._draft  # 回到用户原本打的那半句
+
+        self._replace_line(buffer, prompt, text)
+
+    def _replace_line(self, buffer: list, prompt: str, new_text: str) -> None:
+        """整行换成 new_text（第 18 轮新增，供历史翻页用）
+
+        复用 _redraw 的"擦旧写新"逻辑，语义就是"整行替换"。
+        单独包一层是为了让历史翻页的意图更清楚，而不是散在 _history_up/down 里各写一遍。
+        """
+        self._redraw(buffer, prompt, new_text)
+
+    # ------------------------------------------------------------------
     # 显示相关的小工具
     # ------------------------------------------------------------------
 
@@ -347,10 +469,71 @@ class LineEditor:
         是因为当时擦除只能按字符数算、遇到中文会残留半截。
         有了 display_width 之后这个区别没必要了，而"换行重画"其实更差：
         它会在屏幕上留一行旧的，用户往上翻会看到一串中间状态。
+
+        【第 18.1 轮】改成调 _paint，光标落到行尾。历史翻页 / Tab 补全还在用它。
         """
-        old = "".join(buffer)
+        self._paint(prompt, "".join(buffer), new_text, len(new_text))
         buffer.clear()
         buffer.extend(new_text)
 
-        self._erase_text(old)
-        self._write(new_text)
+    def _paint(self, prompt: str, old_text: str, new_text: str, cursor: int) -> None:
+        """把屏幕上这一行从 old_text 改成 new_text，光标落在第 cursor 个字符后（第 18.1 轮新增）
+
+        为什么要分快慢三路，而不是一律擦掉重画：
+          一律重画 = 每敲一个字符都要"擦 40 列 + 重写 40 列"，中文长句下
+          屏幕上会出现明显抖动。而绝大多数按键是"在末尾追加一个字符"，
+          这种情况直接写那一个字符就够了，零重画。
+
+        三条路按代价从低到高：
+          1. 纯追加（光标在末尾、旧内容是新内容的前缀）→ 只写增量
+          2. 末尾退格删一个字符 → 只擦那一个字符（按列宽）
+          3. 其他（中间插入 / 中间删除 / 整行替换）→ 回到行首、空格覆盖、重写
+
+        【擦除宽度取 max(删前, 删后)】——中间删除时删后更短，重写后行尾会残留
+        "被删掉的那几列"空格，所以必须擦到删前和删后两者中更宽的那个。
+        """
+        if old_text == new_text:
+            return  # 内容没变（光标移动由 _move_cursor 负责），别白画一遍
+
+        # 路 1：纯追加
+        if cursor == len(new_text) and new_text.startswith(old_text):
+            self._write(new_text[len(old_text):])
+            return
+
+        # 路 2：末尾退格删一个字符
+        if (
+            cursor == len(new_text)
+            and old_text.startswith(new_text)
+            and len(old_text) - len(new_text) == 1
+        ):
+            self._erase_text(old_text[-1])
+            return
+
+        # 路 3：整行重画。total 取删前/删后的较大可见宽度（含提示符），
+        # 少算会留上一行的尾巴，多算会把左边的输出擦掉。
+        old_width = display_width(prompt) + display_width(old_text)
+        new_width = display_width(prompt) + display_width(new_text)
+        total = max(old_width, new_width)
+        self._write("\r" + " " * total + "\r")
+        self._write(prompt + new_text)
+        # 写完后光标在行尾，退回目标位置：数一下光标右边还有多少列
+        back = display_width(new_text[cursor:])
+        if back > 0:
+            self._write("\b" * back)
+
+    def _move_cursor(self, text: str, old: int, new: int) -> None:
+        """只移动光标，不改内容（第 18.1 轮新增）
+
+        为什么不复用 _paint 的"整行重画"：按一下 ← 就重画整行，屏幕会闪一下，
+        连按几下特别明显。而移动光标有更便宜的做法：
+          · 往左：按"被跨过的字符的列宽"退格（中文退两格）
+          · 往右：把跨过的那段**重写一遍**，光标自然落到目标位置
+                  看起来像重画，但只写一个字符，且写的是同一内容，看不出变化。
+
+        边界：往左退格到列 0 就停（\b 不会换行），所以这一行如果折行了，
+        Home 只会退到"当前这一屏行"的行首。这是不用 ANSI 的代价，折行是少数情况。
+        """
+        if new < old:
+            self._write("\b" * display_width(text[new:old]))
+        elif new > old:
+            self._write(text[old:new])
