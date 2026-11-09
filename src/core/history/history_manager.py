@@ -290,7 +290,9 @@ class BaseHistoryManager(ABC):
         #     占用 >= 0.95           → 只做 L5（调模型全量摘要，兜底）
         #   关键：「落点直做」——落在哪档就只做那一档，不从低层往上爬、也不叠加。
         #   这是"区间映射"的字面语义：压力多大，就上对应重量的那一种手段。
-        #   本批次只实现 L2 和 L5；L3/L4 留待后续批次，届时在下面的预留位接入。
+        #   四档均已接入：L3 第 3 批、L4 第 2 批（2026-11-09）。其中 L4 的"落点"在
+        #   压缩链里故意留空——它不改存储，实际生效点在发请求路径
+        #   （conversation._get_messages_with_cache_mark 里按 should_use_projection 取投影）。
         if self._compressed_for_current_usage:  # 这份用量已经压过了
             return
         if not self._requires_compression():  # 低于 0.8 总闸，不用压
@@ -613,7 +615,16 @@ class HistoryManager(BaseHistoryManager):
         recent = current_messages[recent_start:]  # 最近 recent_rounds 轮（完整保留）
 
         # system 消息全保留（它们可能在 early 里，也可能单独）。
-        system_messages = [msg for msg in early if _role(msg) == Role.SYSTEM]
+        # 【2026-11-09 补测修复】这里必须 deepcopy，不能只做列表推导。
+        #   原来的写法 `[msg for msg in early ...]` 只复制了"列表"，元素还是底层存储
+        #   里那几个字典对象。后果：发请求前给投影打 cache_control 断点时
+        #   （_get_messages_with_cache_mark 会直接改 message 字典），
+        #   改的其实是 messages_history 里的原始 system 消息——L4 就从
+        #   "只换视图、不动数据"变成了"偷偷写存储"，而函数自己的文档写着完全解耦。
+        #   症状极隐蔽：本轮看不出问题，等到要 rewind 或者比对历史全文时才发现
+        #   system 里多了一个不该存在的 cache_control。补测时用
+        #   "改投影后比对底层存储"的断言抓到的。
+        system_messages = [copy.deepcopy(msg) for msg in early if _role(msg) == Role.SYSTEM]
 
         # 早期部分里，只抽取 user 消息的文字，作为"历史任务线索"。
         early_user_texts = []

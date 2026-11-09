@@ -109,7 +109,7 @@ def test_compression_runs_only_once_per_usage():
 
     manager = fresh_manager()
     manager._model_max_tokens = 1000  # 上限调小，方便触发
-    manager._compress_threshold = 0.8  # 900 > 800 就该压
+    manager._compress_threshold = 0.8  # 960 > 800 就该进压缩链
 
     calls = []  # 记录摘要器被调用了几次
 
@@ -125,7 +125,13 @@ def test_compression_runs_only_once_per_usage():
     manager.add_message(msg(Role.USER, "第二轮问题"))
     manager.add_message(msg(Role.ASSISTANT, "第二轮回答"))
 
-    manager.update_token_usage(usage(900, 0))  # 超阈值
+    # 【2026-11-09 五层压缩后调整】这里原来写的是 900（占用 0.90），
+    #   那时候"过了 80% 就直接调摘要模型"，所以 900 必然触发一次摘要。
+    #   现在压缩按占用分档：0.90 正好落在 L4（只读投影）档，而 L4 是"只换视图、
+    #   不调模型"的，摘要器一次都不会被调用——用例本身没坏，是触发档位变了。
+    #   本用例要验证的是"同一份用量不会重复调摘要"，所以必须把占用推到 L5（>= 0.95）：
+    #   960 / 1000 = 0.96，稳定落在最贵的那一档，摘要器一定会被调。
+    manager.update_token_usage(usage(960, 0))  # 0.96 → L5 档
 
     async def scenario():
         for _ in range(4):  # 模拟：请求前一次 + 收到回复后一次 + 后续迭代再来
@@ -136,8 +142,10 @@ def test_compression_runs_only_once_per_usage():
     assert len(calls) == 1, f"同一份用量应该只压 1 次，实际压了 {len(calls)} 次（每次都在扣费）"
     print(f"  · 连续调用 4 次 auto_messages_compression，摘要器只被调用 {len(calls)} 次")
 
-    # 下一次真实请求带来新用量后，才允许再判断一次
-    manager.update_token_usage(usage(950, 0))
+    # 下一次真实请求带来新用量后，才允许再判断一次。
+    # 980 仍是 L5 档（0.98），确保这次"允许再压"是因为标记被清掉，
+    # 而不是因为档位换了别的不花钱的层。
+    manager.update_token_usage(usage(980, 0))
     asyncio.run(manager.auto_messages_compression())
     assert len(calls) == 2, f"新用量到来后应允许再压 1 次，实际累计 {len(calls)} 次"
     print("  · 新用量到来后允许再压一次，行为正确")

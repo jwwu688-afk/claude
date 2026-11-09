@@ -115,8 +115,15 @@ def test_auto_compression_multiple_sessions():
             self.completion_tokens = completion
             self.total_tokens = total
 
-    manager.update_token_usage(MockTokenUsage(100000, 70000, 170000))  # 170000 > 80% of 200*1024 (163840)
-    # 为什么是 200 而不是构造时传的 10？因为 .env 里的 MODEL_MAX_TOKENS=200 覆盖了参数
+    # 【2026-11-09 五层压缩后调整】原来硬写 170000（占用 0.83）。
+    #   旧逻辑"过 80% 就调摘要模型删一轮"，所以 0.83 必然走摘要；
+    #   现在 0.83 落在 L2（Snip 剪中间）档，而 L2 要求"至少 50 条消息"才有得剪——
+    #   本用例只有 7 条，剪不动，于是什么都不发生，断言自然失败。
+    #   用例要验证的是 L5「删最老一轮 + 摘要」的语义，所以把占用推到 0.96 档。
+    #   用 _model_max_tokens 现算而不是写死数字：MODEL_MAX_TOKENS 从 .env 读，
+    #   写死会让这个用例在别人机器上莫名其妙地挂。
+    heavy_total = int(manager._model_max_tokens * 0.96)  # 0.96 → L5 档
+    manager.update_token_usage(MockTokenUsage(heavy_total - 60000, 60000, heavy_total))
 
     # Check if compression is required
     print(f"Requires compression: {manager._requires_compression()}")  # 打印：需不需要压缩
@@ -173,7 +180,9 @@ def test_auto_compression_single_session():
             self.completion_tokens = completion
             self.total_tokens = total
 
-    manager.update_token_usage(MockTokenUsage(100000, 70000, 170000))  # 超出阈值
+    # 同用例 2：0.96 才落在 L5 档（会调摘要、删紧跟在用户后面的几条）。
+    heavy_total = int(manager._model_max_tokens * 0.96)
+    manager.update_token_usage(MockTokenUsage(heavy_total - 60000, 60000, heavy_total))  # 超阈值
 
     original_length = len(manager.get_current_messages())  # 记下原条数
 
@@ -263,6 +272,12 @@ def run_all_tests():
     except Exception as e:  # 任何一个挂了
         print(f"\n❌ 测试失败: {e}")
         traceback.print_exc()  # 打印现场
+        # 【2026-11-09 补测时新增】必须用非 0 退出码结束。
+        #   原来这里只打印就结束了，进程退出码仍然是 0——批量跑测试的脚本
+        #   （以及 CI）根本看不出这个文件挂了。五层压缩改行为之后，
+        #   本文件的两个用例其实一直在失败，却因为退出码是 0 被当成"全绿"，
+        #   直到按输出内容逐行检查才发现。失败必须让调用方感知到。
+        sys.exit(1)
 
 
 if __name__ == "__main__":
