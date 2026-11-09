@@ -20,6 +20,8 @@ from tools.base_tool import BaseTool  # 导入父类
 
 
 class SmartContextCropper(BaseTool):
+    is_repeatable = True  # 只裁剪上下文、不产生外部副作用，结果可安全折叠
+
     def __init__(self):
         super().__init__()  # 父类初始化
         self._history_manager = HistoryManager()  # 拿到历史管理器（单例，跟对话用的是同一个）

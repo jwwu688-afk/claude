@@ -149,6 +149,21 @@ class ToolManager:
             return tool.get_status()  # 让它自己汇报
         return "找不到这个工具。"  # 没找到
 
+    def is_tool_repeatable(self, tool_name):
+        """判断一个工具的结果能否安全折叠成「重跑即可」（2026-11-09 五层压缩第 3 批新增）
+
+        供 HistoryManager 的 L3 Microcompact 调用：压缩时只折叠"可重复查询"工具的结果。
+        找不到工具（比如 MCP 工具还没注册完、或已经下线）时返回 False，走保守路径。
+
+        为什么放在这里而不是让 HistoryManager 直接读工具类？
+          HistoryManager 不该依赖 ToolManager（会循环依赖），所以这里提供一个
+          独立的查询入口，由 Conversation 把它"注入"给 HistoryManager（见 set_repeatable_checker）。
+        """
+        tool = self.tools.get(tool_name)  # 按名字找
+        if tool is None:  # 找不到
+            return False  # 保守：未知工具按"不可折叠"处理，宁可多保留
+        return bool(getattr(tool, "is_repeatable", False))  # 读工具的 is_repeatable 属性
+
     async def shutdown(self):
         """关闭所有外部资源（2026-11-06 第 2 轮新增）
 

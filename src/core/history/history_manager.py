@@ -22,6 +22,7 @@ from typing import Any  # 【第 9 轮】类型标注：原来自定义函数写
 from dotenv import load_dotenv  # 导入用于读取 .env 文件的函数
 from ui.ui_manager import UIManager  # 导入界面管理器：压缩时要给用户提示一句
 from enum import Enum  # Enum 用来做"枚举"：一组固定的选项，防止写错
+from core.limits import MICROCOMPACT_TOOL_OUTPUT_CHARS  # 【2026-11-09 第 3 批】L3 二次瘦身目标字符数
 
 # Load environment variables
 load_dotenv()  # 把 .env 里的配置读进环境变量
@@ -317,8 +318,11 @@ class BaseHistoryManager(ABC):
                     return
                 if not self._snip_oldest_round():  # 没得剪了，退出本层
                     break
-        # elif tier == 2:  # ③ L3 预留位：后续批次接入（旧工具结果二次瘦身）
-        #
+        # ③ L3（tier == 2，占用 0.85~0.90）：旧工具结果二次瘦身（不调模型）。
+        #   对「较早」的大工具输出（超过 8000 字符）掐头留尾压到 8000，最近 3 条保持完整。
+        #   这是「不删消息、只缩短单条体积」的手段，和 L2 的「删消息条数」互补。
+        elif tier == 2:
+            self._microcompact_tool_outputs()
         # ④ L4（tier == 3，占用 0.90~0.95）：这里「故意留空」，不做任何事。
         #   为什么留空？因为 L4 是「只读投影」，它不改 messages_history 存储，
         #   而是「发请求时换个压缩视图」。这个动作不在压缩链里做，而是由
@@ -378,6 +382,15 @@ class HistoryManager(BaseHistoryManager):
             #   为什么要留成"外部注入"而不是在这里直接调模型？
             #     1. 历史管理器不该知道 API 密钥、模型名这些事（分层清晰）
             #     2. 单元测试里不注入它，压缩就自动退回"直接删除"的老做法，不会真的去花钱调模型
+            self._repeatable_checker = None
+            # 【2026-11-09 第 3 批新增】"工具是否可重复查询"的判断函数：传入工具名，返回布尔。
+            #   为什么要注入而不是在 history_manager 里维护一份工具名白名单？
+            #     1. "哪些工具可重复查询"是工具的固有属性（已经声明在各工具类的 is_repeatable 上），
+            #        不该再在历史管理器里抄一份硬编码清单，否则加新工具时两处要同步改，容易漏。
+            #     2. 历史管理器也不该直接 import ToolManager（会引入循环依赖：
+            #        smart_context_cropper 依赖 HistoryManager，而 ToolManager 又登记了它）。
+            #     3. 不注入时（比如单元测试）返回 None，压缩层会"保守处理"——宁可多保留、
+            #        也不误折叠有副作用工具的结果。这和 set_summarizer 的注入思路一致。
             # 【2026-11-09 五层压缩】四档分层阈值：把 [0,1] 切成五段，决定「压力有多大、用哪层手段」。
             #   _compress_threshold(0.8) 是"总闸"，超过才进入压缩链；
             #   0.85/0.9/0.95 三档是"分层触发线"，对应 L2 Snip / L3 Microcompact / L4 Collapse。
@@ -394,6 +407,35 @@ class HistoryManager(BaseHistoryManager):
         由 Conversation 在启动时注入；不注入则压缩时直接丢弃旧消息。
         """
         self._summarizer = summarizer
+
+    def set_repeatable_checker(self, checker):
+        """注入「工具是否可重复查询」的判断函数（2026-11-09 第 3 批新增）
+
+        checker 的签名要求：def fn(tool_name: str) -> bool
+        由 Conversation 在启动时注入（从 ToolManager 拿到"工具名→is_repeatable"的查询）。
+        不注入时 _repeatable_checker 为 None，L3 压缩会"保守处理"（见 _microcompact_tool_outputs）：
+        宁可多保留有副作用工具的结果，也不误折叠。
+        """
+        self._repeatable_checker = checker
+
+    def _is_repeatable_tool(self, tool_name: str) -> bool:
+        """判断一个工具的结果能否安全折叠成「重跑即可」（2026-11-09 第 3 批新增）
+
+        为什么单独抽个方法而不是在 _microcompact_tool_outputs 里直接调 _repeatable_checker？
+          因为 checker 可能为 None（没注入，比如单元测试），这里统一兜底：
+          没注入就返回 False（保守），调用处不用每次判断 None。
+
+        为什么没注入就返回 False 而不是 True？
+          False 意味着"这个工具的结果不能折叠"，于是 L3 会跳过它、保留原文。
+          这是保守方向：宁可多保留一点、少压缩一点，也不能误把"有副作用的写操作结果"
+          折叠成"重跑即可"，否则模型会以为重跑能无害拿回数据，实际却重复改了文件。
+        """
+        if self._repeatable_checker is None:
+            return False
+        try:
+            return bool(self._repeatable_checker(tool_name))
+        except Exception:
+            return False  # checker 抛异常（比如遇到未知工具）也按"不可折叠"处理，保守第一
 
     def seed_usage_from_messages(self, messages: list) -> int:
         """把恢复回来的历史折算成一条用量记录（2026-11-07 第 13.1 轮新增）
@@ -611,6 +653,28 @@ class HistoryManager(BaseHistoryManager):
         """把一条消息的 content 转换成纯文本（2026-11-06 新增，第 2 轮改为复用模块级函数）"""
         return message_text(message)  # 具体实现在文件上方的 message_text() 里，这里只是保留方法入口
 
+    def _set_message_text(self, message, text: str) -> None:
+        """把一条消息的 content 整体替换成「单个文本块」（2026-11-09 五层压缩第 3 批新增）
+
+        为什么单独写这个方法，而不是在 _microcompact_tool_outputs 里直接改？
+          L3 瘦身要把折叠后的文字写回消息，而消息的 content 有两种形态：
+            - 字典（历史里存的，或从 JSONL 读回来的）→ content 是 [{"type":"text","text":...}]
+            - 对象（运行时直接来自 SDK）→ content 是对象属性
+          直接在调用处判断形态，会把「改 content」的细节撒得到处都是。
+          这里统一收敛：不管原来是 str 还是内容块列表，都重写成标准的单个文本块，
+          保证下游（发请求、估算 token）读到的结构一致。
+
+        为什么重写成「单个文本块」而不是保留原来的多块结构？
+          L3 的产物就是「一段折叠后的纯文本」，原来的多块（比如图片、多个 text 块）
+          在工具输出里几乎不会出现，工具结果本质上就一段文字，重写成单块最干净，
+          也让 message_text() 能一次读全，不遗漏。
+        """
+        if isinstance(message, dict):
+            message["content"] = [{"type": "text", "text": text}]  # 字典形态：重写 content 键
+        else:
+            message.content = [{"type": "text", "text": text}]  # 对象形态：重写 content 属性
+
+
     def _requires_compression(self) -> bool:
         if self._compress_threshold and self.history_token_usage:  # 有阈值配置，也有用量记录
             current_usage = self.history_token_usage[-1]  # 拿最新一次的用量
@@ -720,6 +784,90 @@ class HistoryManager(BaseHistoryManager):
         else:
             self.history_token_usage.append(remaining_usage)
         return True
+
+    def _microcompact_tool_outputs(self, keep_recent: int = 3) -> bool:
+        """L3 Microcompact：把「较早的可重复查询工具结果」折叠成极简占位（2026-11-09 第 3 批，对齐 Claude Code）
+
+        核心思想（对齐 Claude Code 的 micro_compact）：
+          工具结果刚写进历史时允许最宽到 30000 字符（MAX_TOOL_OUTPUT_CHARS），
+          那是"上下文还空"时给模型的方便——一次看全、少反复读文件。
+          但对话变长后，这些"早就被模型消费过的大块输出"是最该先压的对象。
+
+        关键：**只折叠「可重复查询」工具的结果**（is_repeatable=True 的那类）：
+          - file_read / file_grep / file_glob 这类"读操作"，重跑一遍能拿到（甚至更新鲜的）
+            相同结果，所以折叠成一句"已压缩，重跑即可"完全无损。
+          - file_write / file_edit / cmd_runner 这类"有副作用的操作"，执行一次就改变一次
+            系统状态，重跑不是"拿回相同结果"而是"再做一次副作用"。它们的结果**绝不折叠**，
+            否则模型会以为重跑能无害拿回数据，实际却重复改了文件、重复跑了测试。
+
+        占位文案（对齐 Claude Code 的 "Earlier tool result compacted. Re-run if needed."，改用中文）：
+          [更早的工具结果已折叠，需要完整内容时请重新运行对应工具。]
+
+        和 L1（_truncate_tool_output）有什么区别？
+          L1 是"写进历史那一刻"掐头留尾到 30000，属于"进门前先消毒"，对所有工具一视同仁；
+          L3 是"对话变长后"对可重复查询的工具结果做整条折叠，属于"进门后、发现挤了再瘦身"。
+          两者是不同时机的两道闸：先给足、后收紧。
+
+        和 L2（_snip_oldest_round）有什么区别？
+          L2 是"整条删掉"中间的消息（保头+尾47）；L3 是"不删消息、只把消息里的
+          工具输出文字换成一短句"。L2 砍的是"消息条数"，L3 砍的是"单条消息的体积"。
+          两者互补：一个解决"消息太多"，一个解决"单条太大"。
+
+        返回值：True 表示真的折叠了至少一条工具结果；False 表示"没有可折叠的"。
+
+        为什么保留最近 keep_recent 条工具结果完整？
+          最近几条工具结果通常属于"当前正在推进的子任务"，模型正在依据它们
+          做下一步判断，压了会丢关键信息；而更早的工具结果结论已被消化，
+          可以放心折叠。这和 L4 投影"保最近 3 轮"的思路一脉相承。
+        """
+        current_messages = self.messages_history[-1]  # 拿到当前这一页
+
+        # 找出所有 tool 消息的下标，再从右往左数 keep_recent 条，得到"要保留完整"的边界。
+        tool_indices = [i for i, msg in enumerate(current_messages) if _role(msg) == Role.TOOL]
+        if len(tool_indices) <= keep_recent:
+            return False  # 工具结果总共就 <= keep_recent 条，没有"较早的"可压
+
+        # 最近 keep_recent 条工具结果的下标集合（这些保持原样）。
+        recent_tool_indices = set(tool_indices[-keep_recent:])
+
+        changed = False  # 记录本轮是否真的压过任何一条
+        for i, msg in enumerate(current_messages):
+            if i in recent_tool_indices or _role(msg) != Role.TOOL:
+                continue  # 最近几条或非 tool 消息，跳过
+
+            # —— 关键判断：这个工具的结果能不能安全折叠成"重跑即可" ——
+            # 只有"可重复查询"（读操作）的工具才折叠；有副作用的（写/执行）绝不碰。
+            tool_name = msg.get("name") if isinstance(msg, dict) else getattr(msg, "name", None)
+            if not tool_name or not self._is_repeatable_tool(tool_name):
+                continue  # 拿不到工具名，或这个工具不可重复查询 → 保守跳过，保留原文
+
+            text = message_text(msg)  # 取出这条工具输出的纯文本
+            if len(text) <= MICROCOMPACT_TOOL_OUTPUT_CHARS:
+                continue  # 本来就不大（<= 8000 字），不值得折叠，留着更省事
+
+            # —— 折叠成极简占位（整条替换，不再掐头留尾） ——
+            # 为什么整条替换而不是保留 8000 字摘要？
+            #   可重复查询的工具，重跑成本极低，且能拿到"更新鲜"的结果。
+            #   保留 8000 字摘要反而是"既占空间、又可能过时"——不如一句占位，
+            #   模型需要时自己重跑 file_read / file_grep 拿最新结果。
+            # 文案用中文：这句会直接进模型上下文，中文更贴合本项目的沟通习惯，
+            #   也方便模型在中文场景下自然理解"这条结果被折叠过、需要就重跑"。
+            folded = "[更早的工具结果已折叠，需要完整内容时请重新运行对应工具。]"
+            self._set_message_text(msg, folded)
+            changed = True
+
+        if changed:
+            # 折叠后用量账本失真（好几条工具输出变短了），重算成当前页的估值，
+            # 让上层"是否还超阈值"的判断用的是新数字。账本可能为空，append 兜底。
+            remaining_tokens = estimate_messages_tokens(current_messages)
+            remaining_usage = TokenUsage(
+                input_tokens=remaining_tokens, output_tokens=0, total_tokens=remaining_tokens,
+            )
+            if self.history_token_usage:
+                self.history_token_usage[-1] = remaining_usage
+            else:
+                self.history_token_usage.append(remaining_usage)
+        return changed
 
     # if there is more than one  session, compress the oldest chat session
     # else compress the current roll assistant output

@@ -234,6 +234,8 @@ def _approval_param(default: bool, description: str) -> dict:
 class FileRead(BaseTool):
     """读文件，输出带行号，可分段读取"""
 
+    is_repeatable = True  # 读操作，重跑拿到（甚至更新鲜的）相同内容，L3 压缩可安全折叠
+
     def __init__(self):
         super().__init__()  # 父类初始化（目前是空的，但保持和其他工具一致的写法）
 
@@ -596,6 +598,8 @@ class FileEdit(BaseTool):
 class FileGlob(BaseTool):
     """按通配符找文件，结果按修改时间从新到旧排序"""
 
+    is_repeatable = True  # 只读查找，重跑拿到相同文件列表，L3 压缩可安全折叠
+
     def __init__(self):
         super().__init__()
 
@@ -723,6 +727,8 @@ class FileGlob(BaseTool):
 
 class FileGrep(BaseTool):
     """在文件里按正则搜索内容，输出 路径:行号:内容"""
+
+    is_repeatable = True  # 只读搜索，重跑拿到相同（甚至更新鲜的）命中，L3 压缩可安全折叠
 
     def __init__(self):
         super().__init__()

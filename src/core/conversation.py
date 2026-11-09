@@ -210,6 +210,14 @@ class Conversation:
             #   以后上下文太长需要压缩时，它会先调这个方法把旧对话总结成摘要，
             #   而不是直接把旧消息删掉（那样模型会真的忘事）。
             self._history_manager.set_summarizer(self._summarize_messages)
+            # 【2026-11-09 五层压缩第 3 批】把"工具是否可重复查询"的判断函数交给历史管理器：
+            #   L3 Microcompact 折叠旧工具结果时，只折叠"可重复查询"（读操作）的结果，
+            #   有副作用的（写文件/跑命令）绝不折叠——否则模型会误以为重跑能无害拿回数据。
+            #   这里用 lambda 包一层，把"查工具属性"这件事从 ToolManager 转交给 HistoryManager，
+            #   避免 HistoryManager 直接依赖 ToolManager（那会形成循环导入）。
+            self._history_manager.set_repeatable_checker(
+                lambda name: self._tool_manager.is_tool_repeatable(name)
+            )
             self._prompt_manager = PromptManager()  # 建提示词管理器
             # 【2026-11-07 第 13 轮】会话落盘 + Esc 打断
             self._session = None  # 当前会话的存储句柄，start_conversation 时才创建

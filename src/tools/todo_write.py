@@ -19,6 +19,8 @@ from ui.ui_manager import UIManager  # 导入界面管理器，用来把清单�
 
 
 class TodoWrite(BaseTool):
+    is_repeatable = True  # 待办清单是会话级状态，重读不产生副作用，L3 压缩可安全折叠
+
     def __init__(self):
         super().__init__()  # 父类初始化
         self.todos = []  # 存当前的待办清单，一开始是空的
