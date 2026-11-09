@@ -1,5 +1,9 @@
 **/__pycache__/
 *.egg-info/
+# 构建产物：`pip wheel .` / `python -m build` 会在仓库里生成这两个目录，
+# 不排除的话每次打包都多出一堆未跟踪文件，容易误提交。
+build/
+dist/
 .env
 .env.*
 !.env.example

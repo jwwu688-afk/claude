@@ -20,6 +20,16 @@ dependencies = [
     "httpx",
 ]
 
+[tool.setuptools]
+# 【可移植性修复】py-modules 必须显式声明：
+#   本项目是 src 布局，src/main.py 是"顶层模块"而不是"包"，
+#   packages.find 只扫包、不会把它算进去 —— 打出来的 wheel 里因此没有 main.py，
+#   而 [project.scripts] 的入口点写的是 main:cli，install 完一敲 thinker 就
+#   ModuleNotFoundError（只有 pip install -e . 时靠 .pth 把 src 塞进 sys.path 才侥幸能跑）。
+#   package-dir 把 "" 映射到 src，py-modules 里的 main 才会解析成 src/main.py。
+package-dir = {"" = "src"}
+py-modules = ["main"]
+
 [tool.setuptools.packages.find]
 where = ["src"]
 

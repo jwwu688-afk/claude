@@ -1,13 +1,21 @@
 {
+	"_说明": [
+		"这是仓库内的示例模板，程序不会读它。Thinker 真正读取的是 ~/.thinker/mcp.json。",
+		"想启用外部工具：把本文件复制到 ~/.thinker/mcp.json，再把下面的占位符换成你自己的绝对路径。",
+		"command 建议写解释器的绝对路径（例如 Windows 的 C:/Python312/python.exe），比裸 'python' 可靠。",
+		"args 里的脚本路径必须是绝对路径：MCP 子进程的 cwd 继承自你启动 thinker 时所在的目录，相对路径会找不到文件。",
+		"没有这个文件也不影响使用，内置工具（file_*、cmd_runner 等）照常可用。"
+	],
 	"mcpServers": {
 		"weather": {
 			"type": "stdio",
-			"command": "D:\\Anaconda\\envs\\claude\\python.exe",
-			"args": ["D:\\code\\thinker\\src\\mcp_servers\\weather.py"]
+			"command": "<你的 Python 解释器绝对路径>",
+			"args": ["<本仓库绝对路径>/src/mcp_servers/weather.py"]
 		},
 		"calculator": {
-			"command": "D:\\Anaconda\\envs\\claude\\python.exe",
-			"args": ["D:\\code\\thinker\\src\\mcp_servers\\calculator.py"]
+			"type": "stdio",
+			"command": "<你的 Python 解释器绝对路径>",
+			"args": ["<本仓库绝对路径>/src/mcp_servers/calculator.py"]
 		}
 	}
 }
