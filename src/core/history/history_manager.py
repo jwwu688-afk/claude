@@ -278,11 +278,51 @@ class BaseHistoryManager(ABC):
         #     钱花了、消息也被多删了。
         #   现在压完就标记"这份用量已经处理过"，直到下一次真正的请求
         #     更新用量（update_token_usage 会把标记清掉）才允许再压。
+        #
+        # 【2026-11-09 五层压缩】压缩从「一跳到底」改成「四档区间映射、落点直做」：
+        #   原来 _requires_compression() 一旦判真，就直接 _compress_current_message()
+        #   （调摘要模型，最贵的手段）。现在按"压力"分层，四档阈值真正参与判断：
+        #     占用 < 0.80            → 不压缩
+        #     占用 [0.80, 0.85)      → 只做 L2（Snip 剪中间）
+        #     占用 [0.85, 0.90)      → 只做 L3（Microcompact 二次瘦身）
+        #     占用 [0.90, 0.95)      → 只做 L4（Context Collapse 只读投影）
+        #     占用 >= 0.95           → 只做 L5（调模型全量摘要，兜底）
+        #   关键：「落点直做」——落在哪档就只做那一档，不从低层往上爬、也不叠加。
+        #   这是"区间映射"的字面语义：压力多大，就上对应重量的那一种手段。
+        #   本批次只实现 L2 和 L5；L3/L4 留待后续批次，届时在下面的预留位接入。
         if self._compressed_for_current_usage:  # 这份用量已经压过了
             return
-        if not self._requires_compression():  # 调用下面的判断方法
+        if not self._requires_compression():  # 低于 0.8 总闸，不用压
             return
-        await self._compress_current_message()  # 需要就执行压缩
+
+        # 根据当前占用比例，直接算出「这一轮该做哪一层」（落点直做，不爬层）。
+        # tier 语义：1=L2, 2=L3, 3=L4, 4=L5。四档阈值在此真正生效。
+        ratio = self._current_usage_ratio()
+        if ratio < self._snip_threshold:
+            tier = 1
+        elif ratio < self._micro_threshold:
+            tier = 2
+        elif ratio < self._collapse_threshold:
+            tier = 3
+        else:
+            tier = 4
+
+        # 按落点执行对应层。每一层都是「只做自己这一件事」，做完本轮即止。
+        if tier == 1:
+            # ② L2：零成本剪中间（保头 + 尾47，剪中间换占位，不调模型）。
+            # 循环剪到「够用」或「没得剪」：L2 内部自己降到位，因为这一档只有它可用。
+            for _ in range(len(self.messages_history[-1])):
+                if not self._requires_compression():  # 每剪一次就重新判断，够用了就停
+                    self._compressed_for_current_usage = True
+                    return
+                if not self._snip_oldest_round():  # 没得剪了，退出本层
+                    break
+        # elif tier == 2:  # ③ L3 预留位：后续批次接入（旧工具结果二次瘦身）
+        # elif tier == 3:  # ④ L4 预留位：后续批次接入（只读投影）
+        elif tier == 4:
+            # ⑤ L5：压力已到 0.95，才调模型做全量摘要（最贵，兜底）。
+            await self._compress_current_message()
+
         self._compressed_for_current_usage = True  # 本轮用量已处理，不再重复压
 
     @abstractmethod
@@ -330,6 +370,13 @@ class HistoryManager(BaseHistoryManager):
             #   为什么要留成"外部注入"而不是在这里直接调模型？
             #     1. 历史管理器不该知道 API 密钥、模型名这些事（分层清晰）
             #     2. 单元测试里不注入它，压缩就自动退回"直接删除"的老做法，不会真的去花钱调模型
+            # 【2026-11-09 五层压缩】四档分层阈值：把 [0,1] 切成五段，决定「压力有多大、用哪层手段」。
+            #   _compress_threshold(0.8) 是"总闸"，超过才进入压缩链；
+            #   0.85/0.9/0.95 三档是"分层触发线"，对应 L2 Snip / L3 Microcompact / L4 Collapse。
+            #   执行时从低到高递进：先试便宜层，每层做完重新估 token，降回 0.8 以下就停。
+            self._snip_threshold = float(os.getenv("SNIP_THRESHOLD", 0.85))
+            self._micro_threshold = float(os.getenv("MICRO_THRESHOLD", 0.90))
+            self._collapse_threshold = float(os.getenv("COLLAPSE_THRESHOLD", 0.95))
             self._initialized = True  # 打标记
 
     def set_summarizer(self, summarizer):
@@ -501,6 +548,86 @@ class HistoryManager(BaseHistoryManager):
             return current_usage.total_tokens > self._compress_threshold * self._model_max_tokens
             # 如果"用掉的"已经超过"上限 × 0.8"，就返回 True（该压了）
         return False  # 其他情况都说"不用压"
+
+    def _current_usage_ratio(self) -> float:
+        """算出当前上下文占用比例（0~1 之间的小数），供分层压缩判断用
+
+        为什么单独抽一个方法，而不是在 _requires_compression 里硬写除法？
+          分层压缩需要在每个层级"重新评估"占了多少，好决定要不要进下一层。
+          每次都写一遍 `total_tokens / max_tokens` 既重复又容易漏掉除零判断，
+          抽出来一处维护。没有用量记录时返回 0（当没占用）。
+        """
+        if not self.history_token_usage or self._model_max_tokens == 0:
+            return 0.0
+        return self.history_token_usage[-1].total_tokens / self._model_max_tokens
+
+    def _snip_oldest_round(self) -> bool:
+        """L2 Snip：零成本「保两头、剪中间」（2026-11-09 五层压缩第 1 批，对齐 Claude Code snipCompact）
+
+        学 Claude Code 的做法（snipCompact.ts：KEEP_FIRST=3 / KEEP_RECENT=47）：
+          - 「头」= system 消息 + 第一个 user 消息（任务目标所在，永远保留）；
+          - 「尾」= 最近 47 条消息（近期上下文，最相关）；
+          - 「中间」整段删掉，替换成一条本地占位公告，**不调任何模型**。
+        这样既快速减少消息数量，又不丢"任务目标"和"最近进展"这两样最关键的东西。
+
+        和原来自家 _compress_multiple_sessions 的区别：
+          那个方法删最老一轮后紧接着调 _summarize_if_possible（一次 API、花钱）。
+          这一层是纯删除 + 固定占位文案，零 API 成本——先用便宜手段，够用就停。
+
+        返回值：True 表示真的剪掉了一段；False 表示"消息太少、没得剪"。
+
+        为什么"尾"要保留最近 47 条？
+          47 这个数来自 Claude Code 的经验值：最近 47 条通常能覆盖"当前正在推进的子任务"的
+          完整上下文（读文件 → 改代码 → 跑测试的整条链路），再往前往往已经是上一个任务了。
+          而"头"保留 system + 第一个 user，是为了让模型始终记得"最开始要解决什么问题"。
+        """
+        current_messages = self.messages_history[-1]  # 拿到当前这一页
+
+        # 消息太少（比如还没有 47 条尾巴可留）时，剪中间没意义，直接返回 False。
+        # 这里用一个比 47 略大的门槛：至少要有「头 + 若干中间 + 47 尾」才值得剪。
+        if len(current_messages) <= 50:
+            return False
+
+        # —— 确定"头"：system 消息 + 第一个 user 消息 ——
+        head = []  # 准备装"头"的那几条
+        first_user_index = -1  # 第一个 user 消息的位置（任务目标所在）
+        for i, msg in enumerate(current_messages):
+            if _role(msg) == Role.SYSTEM:
+                head.append(msg)  # 所有 system 消息都进"头"
+            elif first_user_index == -1 and _role(msg) == Role.USER:
+                first_user_index = i  # 记下第一个 user 的位置
+                head.append(msg)  # 第一个 user 也进"头"
+                break  # 头找齐了，停
+        # 走到这，head 里是「所有 system + 第一个 user」。它们是最该保住的"任务目标"。
+
+        # —— 确定"尾"：最近 47 条 ——
+        # 从尾部往回取 47 条，但刀口必须落在"安全位置"（不能把 assistant(tool_calls) 和它的 tool 结果拆开）。
+        tail_start = len(current_messages) - 47  # 尾巴想从这开始保留
+        tail_start = align_top_cut(current_messages, tail_start)  # 刀口对齐到安全位置（可能往前挪）
+
+        # —— 防一手：如果"尾"的起点比"头"的末尾还靠前（说明头和尾重叠了），说明消息其实没多到需要剪 ——
+        head_end = first_user_index + 1  # "头"占用的最后一位下标（开区间）
+        if tail_start <= head_end:
+            return False  # 头和尾已经接上了，中间没东西可剪
+
+        # —— 组装：头 + 占位公告 + 尾 ——
+        removed_count = tail_start - head_end  # 中间被剪掉了多少条
+        notice = make_note_message(f"[已裁剪中间 {removed_count} 条消息以节省上下文空间]")
+        tail = current_messages[tail_start:]  # 尾 = 从安全刀口往后的 47 条（可能因对齐少几条）
+
+        self.messages_history[-1] = head + [notice] + tail  # 新的一页 = 头 + 占位 + 尾
+
+        # 裁剪后用量账本失真（删了一堆消息），重算成"当前这一页的估值"，
+        # 让下一层判断用的是新数字。账本可能为空，用 append 兜底（同 seed_usage_from_messages）。
+        remaining_tokens = estimate_messages_tokens(self.messages_history[-1])
+        remaining_usage = TokenUsage(
+            input_tokens=remaining_tokens, output_tokens=0, total_tokens=remaining_tokens,
+        )
+        if self.history_token_usage:
+            self.history_token_usage[-1] = remaining_usage
+        else:
+            self.history_token_usage.append(remaining_usage)
+        return True
 
     # if there is more than one  session, compress the oldest chat session
     # else compress the current roll assistant output
