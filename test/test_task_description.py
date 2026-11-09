@@ -52,14 +52,15 @@ def reset_registry():
     如果不还原，后面的用例就会看到多出来的类型，断言跟着飘。
     """
     manager = SubagentManager()
-    for mapping in (
-        manager._system_prompt_map,
-        manager._description_map,
-        manager._tools_map,
-    ):
-        for key in list(mapping.keys()):
-            if key != "general-purpose":
-                del mapping[key]
+    # 【第 18 轮】改前这里直接删 _system_prompt_map / _description_map / _tools_map
+    #   三张表里的非 general-purpose 项。第 18 轮把三张表合并成了一个 _specs，
+    #   且内置定义改成"构造即加载"，所以"还原"的正确做法是：
+    #   把单例丢掉、重新造一个——__init__ 里会自动装回那四个内置类型。
+    #   直接删 _specs 里的项也行，但那样会漏掉"内置到底应该有哪些"这个事实，
+    #   以后内置从 4 个变 6 个，这个测试就会悄悄只还原一部分。
+    SubagentManager._instance = None  # 丢掉旧实例
+    SubagentManager._initialized = False  # 清初始化标记
+    SubagentManager()  # 重新构造 = 重新装回内置定义
 
 
 def test_description_lists_every_registered_type():
@@ -80,7 +81,10 @@ def test_description_has_no_unregistered_type():
     task = fresh_task()
     description = task._tool_description()
     registered = set(SubagentManager().list_types())
-    for ghost in ("greeting-responder", "code-reviewer", "greeting_responder", "code_reviewer"):
+    # 【第 18 轮】code-reviewer 从"幽灵类型"变成了真实内置类型，
+    #   所以它从这份名单里移除了。留下的三个仍是"没登记过"的名字：
+    #   greeting-responder 是第 8.1 轮误触发的源头，两个下划线写法是模型常见的变体。
+    for ghost in ("greeting-responder", "greeting_responder", "code_reviewer"):
         assert ghost not in registered, f"测试前提不成立：{ghost} 居然被登记了"
         assert ghost not in description, f"说明书里出现了未登记的类型：{ghost}"
     print("  ✓ 说明书里没有幽灵类型")

@@ -735,6 +735,35 @@ async def cmd_clear(conversation, args: str) -> None:
 # =============================================================================
 # 八、注册
 #
+async def cmd_agents(conversation, args: str) -> None:
+    """/agents —— 列出内置的子 agent 类型（第 18 轮新增）
+
+    为什么需要这条命令：
+      类型、工具白名单、模型都写在 builtin_agents.py 里。没有它，用户要么去读源码，
+      要么只能从 task 说明书里猜。一条命令把"现在有几类、各自能干什么、用什么模型"
+      一次说清。
+
+    为什么没有 reload 参数：
+      定义是代码的一部分，改完要重启进程——和改其它代码一样。
+      简化之后没有"扫目录"这回事，也就没有可重载的东西。
+      （前一版有 reload，是因为那时刻意支持从 .thinker/agents 读 md。）
+    """
+    from tools.subagent.subagent_manager import SubagentManager  # 局部导入：避免命令模块和工具模块在导入期互相牵连
+
+    ui = conversation._ui_manager
+    specs = SubagentManager().list_specs()
+
+    ui.print_info(f"内置 {len(specs)} 个子 agent：")
+    for spec in specs:
+        # 一行摘要 + 一行人设说明。
+        #   为什么把工具和模型也打出来：用户能一眼判断"派它会不会弹审批"
+        #   （只读工具免审批）、"会不会用到大模型"。
+        ui.print_info(f"  {spec.name}  工具：{spec.tools_text()} ｜ 模型：{spec.model_text()}")
+        ui.print_info(f"    {spec.description}")
+
+
+# =============================================================================
+# 命令注册（放在文件末尾，理由见本节开头）
 # 为什么放在文件末尾，而不是每条命令定义完就注册：
 #   读代码的人按"头部说明 → 数据结构 → 工具函数 → 各命令 → 注册表"的顺序看下来，
 #   最后一屏就能看到"到底有哪些命令"。散落在中间的话，得来回翻。
@@ -747,3 +776,4 @@ register(CommandSpec("init", "/init [--global] [--force] [--here]", "生成 / �
 register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cmd_cost))
 register(CommandSpec("compact", "/compact", "立刻压缩上下文（不等 80%）", cmd_compact))
 register(CommandSpec("clear", "/clear", "清空上下文并开一个新会话", cmd_clear))
+register(CommandSpec("agents", "/agents", "列出子 agent 类型（同时重新扫描目录）", cmd_agents))

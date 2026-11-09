@@ -1,110 +1,121 @@
 # =============================================================================
 # 文件：src/tools/subagent/subagent_manager.py
-# 作用：管理"子 agent 的人设"。目前只登记了一种：general-purpose（通用型）。
+# 作用：子 agent 的登记表。四种内置类型，全程序共用一份。
 #
-# "人设"就是一段系统提示词，决定这个子 agent 的性格和工作方式。
-# 比如通用型的要求是：查得细、要给绝对路径、不要主动创建文件、不要说表情包。
+# 【2026-11-09 第 18 轮·简化版】删掉了用户级（~/.thinker/agents）和项目级
+#   （<cwd>/.thinker/agents）两层目录，也删掉了 frontmatter 解析。
+#   现在的模型只有一层：内置。
 #
-# 如果你想加一个"代码审查员"类型的子 agent，就在这里再登记一条，
-# 然后在 Task 工具的说明里告诉模型"有这么个类型可用"就行。
+#   为什么砍掉目录：
+#     1. 需求是"所有人都能用的一套内置 agent"，不需要每人再维护一份；
+#     2. 三层加载带来三个概念（优先级、同名覆盖、来源标注）和一堆边界
+#        （坏文件隔离、编码、改完要重扫），而维护这些定义的只有一个人；
+#     3. 目录不存在时它本来就不生效，等于"代码里留着两条永不执行的路"。
+#   想要第五种 agent 就直接在 builtin_agents.py 加一个 AgentSpec 常量——
+#   代价是改代码，好处是没有"为什么我改了没生效"这类问题。
 #
-# 【2026-11-06 第 3 轮】这段人设提示词已从英文翻译成中文。
-# 【2026-11-06 第 8 轮】原来这里让子 agent "用 Grep / Glob / Read"，
-#   但工具清单里根本没有这三个名字，派活时子 agent 只会反复收到"找不到这个工具"。
-#   已改成实际登记的 file_grep / file_glob / file_read。
+# 为什么还是单例：Task / Conversation / ToolManager / HistoryManager 全是单例，
+#   这里保持一致。真要并行子 agent 得先把这一整套拆掉（见 ROADMAP #10）。
 # =============================================================================
 
-# adapt from Claude Code
-general_purpose_prompt = """
-你是 Thinker（Anthropic 官方的 Claude 命令行工具）的一个 agent。
-拿到用户的消息后，你应该使用手头可用的工具把任务完成。
-只做被要求做的事，不多做也不少做。
-任务完成后，写一份详细的说明作为回复。
+import re  # 兼容接口里解析 "a, b, c" 这种写法
+from typing import Dict, List, Optional
 
-你的强项：
-- 在大型代码库里搜索代码、配置和代码模式
-- 同时分析多个文件，理解系统架构
-- 排查需要翻很多文件才能搞清的复杂问题
-- 执行多步骤的调研任务
+from tools.subagent.agent_spec import AgentSpec, build_system_prompt
+from tools.subagent.builtin_agents import BUILTIN_AGENTS
 
-工作准则：
-- 搜索文件：按文件名找用 file_glob，按内容搜用 file_grep，已经知道具体路径时用 file_read。不要用 cmd_runner 去拼 grep / find 命令（Windows 的 cmd.exe 里默认没有这些命令）。
-- 修改文件：改文件里的一小段用 file_edit，整体重写或新建用 file_write；两者都要求先用 file_read 读过目标文件。
-- 分析问题：先看全局再逐步收窄。一种办法没有结果，就换一种策略。
-- 要细致：查多个位置，考虑不同的命名习惯，找相关文件。
-- 除非为了实现目标绝对必要，否则绝不要创建文件。优先修改已有文件，而不是新建。
-- 不要主动创建文档（*.md）或 README，只有用户明确要求时才创建。
-- 最终回复里要给出相关文件名和代码片段。回复中出现的一切文件路径都必须是绝对路径，不要用相对路径。
-- 为了沟通清楚，不要使用表情符号。
 
-注意：
-- 除非为了实现目标绝对必要，否则绝不要创建文件。优先修改已有文件，而不是新建。
-- 不要主动创建文档（*.md）或 README，只有用户明确要求时才创建。
-- 最终回复里要给出相关文件名和代码片段。回复中出现的一切文件路径都必须是绝对路径，不要用相对路径。
-- 为了和用户沟通清楚，绝对不要使用表情符号。
-"""
+def _normalize_tools(raw) -> Optional[tuple]:
+    """把 "全部" / "a, b, c" 归一化成工具元组（None = 继承全部）
+
+    为什么还留着这个：`register_subagent_prompt()` 是第 8.1 轮的老接口，
+    测试和临时脚本会用它造一个假类型。它接受字符串，所以需要这一步解析。
+    """
+    if raw is None:
+        return None
+    value = str(raw).strip()
+    if value in ("", "*", "all", "ALL", "全部"):
+        return None
+    names = []
+    for piece in re.split(r"[,，、;；]", value):  # 中英文分隔符都认
+        name = piece.strip()
+        if name and name not in names:
+            names.append(name)
+    return tuple(names)
 
 
 class SubagentManager:
-    # 单例：全程序共用一个登记表
     _instance = None  # 唯一实例
     _initialized = False  # 是否已初始化
-    _system_prompt_map = {}  # 字典：类型名 → 对应的提示词（真正发给子 agent 的那段）
-    # 【2026-11-06 第 8.1 轮新增】下面两张表存的是"给主 agent 看的说明"，
-    #   和上面的人设提示词是两回事：人设进子 agent 的 system prompt，
-    #   这两张表进 task 工具的说明书（也就是每次请求都发给模型的 tools 字段）。
-    #   分开存的原因：原来 task.py 里把这句说明手写在描述里，
-    #   结果描述里写了 general-purpose，示例里又冒出 greeting-responder
-    #   和 code-reviewer 两个根本没登记的类型，模型照着示例派活。
-    #   现在统一从这里取，登记了什么就只说有什么。
-    _description_map = {}  # 字典：类型名 → 一句话用途
-    _tools_map = {}  # 字典：类型名 → 可用工具说明
 
     def __new__(cls):
-        if cls._instance is None:  # 第一次创建
+        if cls._instance is None:
             cls._instance = super(SubagentManager, cls).__new__(cls)
-            cls._instance.register_subagent_prompt(
-                "general-purpose",  # 类型名
-                general_purpose_prompt,  # 人设提示词
-                description=(
-                    "通用型 agent，用于调研复杂问题、搜索代码、执行多步骤任务。"
-                    "当你搜索某个关键词或文件、前几次尝试没有把握能找到时，用这个 agent 帮你搜。"
-                ),
-                tools="全部",
-            )
-            # 登记第一种（也是目前唯一一种）子 agent：通用型
         return cls._instance
 
-    def get_subagent_prompt(self, prompt_type):
-        # 按类型名取提示词
-        if prompt_type not in self._system_prompt_map:  # 如果模型编了个不存在的类型名
-            raise ValueError(f"子 agent 类型 '{prompt_type}' 不存在")  # 报错
-        return self._system_prompt_map[prompt_type]  # 返回对应的提示词
+    def __init__(self):
+        if self._initialized:
+            return
+        # 构造即加载：内置定义是代码的一部分，不需要读盘、也不用等工具表注册完。
+        #   为什么用 dict 而不是 list：主 agent 传进来的 subagent_type 是字符串，
+        #   按名字查是最高频的操作（每次派活都走一遍），O(1) 比遍历合适。
+        self._specs: Dict[str, AgentSpec] = {spec.name: spec for spec in BUILTIN_AGENTS}
+        self._initialized = True
 
-    def list_types(self):
-        """列出所有已登记的类型名（2026-11-06 第 8.1 轮新增）
+    # -------------------------------------------------------------------------
+    # 查询
+    # -------------------------------------------------------------------------
+    def list_specs(self) -> List[AgentSpec]:
+        """按登记顺序返回所有定义（顺序由 builtin_agents.BUILTIN_AGENTS 决定）"""
+        return list(self._specs.values())
 
-        给 task 工具拼说明书用，也用来校验模型传进来的类型是否存在。
-        这样以后新增一个类型（比如 code-reviewer）只需要在 __new__ 里多登记一条，
-        工具说明、参数校验、错误提示三处会自动跟着变，不用再改第二个文件。
+    def get_spec(self, name: str) -> AgentSpec:
+        """按名字取定义；取不到抛 ValueError
+
+        为什么这里可以抛：调用方（Task.act）已经先做过 list_types() 校验，
+        走到这里说明名字一定合法。真抛了就是代码 bug，不该被当成"用户写错了"。
         """
-        return list(self._system_prompt_map.keys())
+        if name not in self._specs:
+            raise ValueError(f"子 agent 类型 '{name}' 不存在")
+        return self._specs[name]
 
-    def describe(self, prompt_type):
-        """取某个类型的"用途 + 可用工具"（2026-11-06 第 8.1 轮新增）
+    def list_types(self) -> List[str]:
+        """所有类型名（task 的候选值、错误提示、/agents、测试都从这里取）"""
+        return list(self._specs.keys())
 
-        返回一个二元组 (用途说明, 可用工具)，没登记过就返回空串和"未说明"。
-        只用于拼说明书，不参与执行，所以取不到也不该抛异常。
+    def describe(self, prompt_type: str):
+        """取某个类型的（用途, 可用工具），给 task 说明书用
+
+        取不到返回 ("", "未说明") 而不是抛异常：它只用于拼说明书，
+        拼不出来顶多难看，不该把整轮对话打断。
         """
-        return (
-            self._description_map.get(prompt_type, ""),
-            self._tools_map.get(prompt_type, "未说明"),
-        )
+        spec = self._specs.get(prompt_type)
+        if spec is None:
+            return "", "未说明"
+        return spec.description, spec.tools_text()
 
+    def get_subagent_prompt(self, prompt_type: str) -> str:
+        """取某个类型的完整 system prompt（人设正文 + 环境 + 边界）
+
+        为什么在这里拼、而不是返回裸正文：调用方（conversation.start_task）
+        需要的是"能直接塞进 system 消息的整段文字"。环境信息每次都要重算
+        （日期会变），放在调用点会让 start_task 多背一份拼装逻辑。
+        """
+        return build_system_prompt(self.get_spec(prompt_type))
+
+    # -------------------------------------------------------------------------
+    # 兼容接口
+    # -------------------------------------------------------------------------
     def register_subagent_prompt(self, prompt_type, prompt, description="", tools="全部"):
-        # 登记（新增）一种类型
-        self._system_prompt_map[prompt_type] = prompt  # 塞进字典
-        # 【2026-11-06 第 8.1 轮】后两个参数带默认值，是为了兼容旧写法：
-        #   原来只有两个参数，老代码调用不会因为少传而报错。
-        self._description_map[prompt_type] = description  # 用途说明（给主 agent 看）
-        self._tools_map[prompt_type] = tools  # 可用工具（给主 agent 看）
+        """手工登记/覆盖一种类型（第 8.1 轮的接口，保留）
+
+        什么时候用它：测试和临时脚本想造一个假类型，不想新增内置定义。
+        注意它**会覆盖**同名内置定义，而且只影响当前进程（不落盘）。
+        """
+        self._specs[prompt_type] = AgentSpec(
+            name=prompt_type,
+            description=description,
+            body=prompt,
+            tools=_normalize_tools(tools),
+            model=None,
+        )

@@ -34,6 +34,13 @@ if src_path not in sys.path:
 
 from core.conversation import Conversation  # noqa: E402
 from ui.input_handler import InputHandler  # noqa: E402
+
+# 【第 18.6 轮】关掉输入行下方的留白，让本文件专注测补全逻辑。
+#   为什么要显式关：留白会在提示符之前先写 "\n\n\x1b[2A"，而本文件有多处断言
+#   在看"写出的第一个片段是不是提示符"、以及把字节流渲染成屏幕。留着空白会
+#   让这些断言全部错位——但错的是断言的前提，不是补全逻辑本身。
+#   留白自己的行为由 test_line_wrap.py 覆盖，两件事分开测。
+os.environ.setdefault("THINKER_INPUT_PADDING", "0")
 from ui.line_editor import LineEditor, display_width  # noqa: E402
 
 _passed = 0

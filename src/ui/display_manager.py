@@ -28,12 +28,46 @@ from rich.padding import Padding  # 给内容加内边距（这里用来做左�
 from rich.text import Text  # 富文本：可以给一段文字的不同部分上不同颜色
 from rich.table import Table  # 【第 7 轮】用来做「圆点 + 正文」的两列布局
 from typing import Optional  # 类型标注：表示"可能是这个，也可能是 None"
+import atexit  # 【第 19 轮】进程退出时兜底恢复光标（等待动画期间光标是隐藏的）
 import os  # 【第 10 轮】读取 THINKER_NO_SPINNER 开关
 import sys  # 【第 10 轮】等待动画直接往 stdout 写，需要它
 import threading  # 【第 10 轮】单行 spinner 跑在后台线程里
 import time  # 【第 7 轮】计算"已经等了多久"给 spinner 用
 
 from . import theme  # 本项目统一的配色和符号（见 theme.py）
+
+
+def build_spinner_frame(elapsed: float):
+    """按等待秒数算出这一帧的（纯文本, 带颜色的文本）（2026-11-09 第 19 轮新增）
+
+    为什么抽成模块级纯函数：
+      `_spin_loop` 跑在后台线程里、直接往 stdout 写转义码，几乎没法断言。
+      把"这一帧长什么样"抽出来之后，宽度不超标、动词轮换、省略号循环
+      这些规则都能离线测（见 test/test_spinner_frame.py）。
+      这和 `_render_screen` 的思路一致：把"算"和"写"分开，"算"才可测。
+
+    返回二元组：
+      plain  —— 不带转义码的版本，专门用来算显示宽度（cell_len 会忽略 ANSI、
+                但中文算 2 列，只有拿纯文本算才准）；
+      styled —— 真正写进终端的版本。
+
+    动态感从三个周期叠出来（周期互质，不会整帧重复）：
+      · 转轮每 100ms 一帧（8 帧 → 0.8s 一圈）
+      · 省略号每 500ms 一格（0~3 个点 → 2s 一个循环）
+      · 动词每 3s 换一个（5 个词 → 15s 一个循环）
+      三个周期错开，看起来就是"一直在动"，而不是一张循环图在闪。
+    """
+    frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]
+    verb = theme.WAIT_VERBS[int(elapsed // 3) % len(theme.WAIT_VERBS)]
+    dots = "." * (int(elapsed * 2) % 4)  # 0/1/2/3 个点
+    tail = f"{verb}{dots} ({int(elapsed)}s)"
+
+    plain = f"{frame} {tail}"
+    styled = (
+        f"{theme.ACCENT_ANSI}{frame}{theme.RESET_ANSI} "
+        f"{theme.DIM_ANSI}{tail}{theme.RESET_ANSI}"
+    )
+    return plain, styled
 
 
 class DisplayManager:
@@ -302,18 +336,22 @@ class DisplayManager:
             return False
 
     def _spin_loop(self) -> None:
-        """等待动画：一根原地转的橙色星芒（2026-11-07 第 10 轮新增）
+        """等待动画：转轮 + 动词 + 省略号 + 秒数（2026-11-07 第 10 轮新增，第 19 轮重做）
 
-        每 200ms 重画一次同一行，写法是 `\\r`（回到行首）+ 内容 + 补齐空格。
+        每 100ms 重画一次同一行：`\\r`（回到行首）+ 内容 + 补齐空格。
 
-        两条硬规则（都是踩出来的）：
+        三条硬规则，都是踩出来的：
 
-        1. **每帧总宽度必须完全一致**。秒数从 (9s) 变 (10s) 会多一个字符，
+        1. **每帧总宽度必须完全一致**。秒数从 (9s) 变 (10s) 会多一列，
            如果这一帧比上一帧短，右边就会留下上一帧的残影。所以每帧都
            pad 到固定 CELLS 列，用空格把旧内容吃掉。
         2. **不依赖 `\\x1b[2K` 清行**。2K 是标准 CSI，Windows Terminal 支持，
-           但伪终端里实测清行之后尾巴还在（会看到 "✻ 正在思考… (1s)  Thought …" 粘连）。
+           但伪终端里实测清行之后尾巴还在（只能看到粘连的残字）。
            空格覆盖不依赖终端对指令的支持，最稳。
+        3. **等待期间隐藏光标**（第 19 轮新增）。规则 1 要补空格，补出来的空白
+           会把光标推到文字右侧很远的地方——屏幕上只剩一个方块在空白里闪，
+           看起来就是"光标位置不对"。隐藏之后视觉焦点落在转轮上。
+           恢复放在 finally，线程异常退出也不会把光标永久藏起来。
 
         线程是 daemon：万一主流程异常退出，它不会拖住进程。
         """
@@ -323,22 +361,29 @@ class DisplayManager:
             # 等 200ms 还没结果才显示，短等待彻底安静。
             if self._spinner_stop.wait(0.2):
                 return
+            # 藏在延迟之后：短等待连一次光标闪动都不会有。
+            sys.stdout.write(theme.CURSOR_HIDE)
+            sys.stdout.flush()
             while not self._spinner_stop.is_set():
                 elapsed = time.time() - self._stream_start
-                frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]
-                plain = f"{frame} 正在思考… ({int(elapsed)}s)"
+                plain, styled = build_spinner_frame(elapsed)  # 帧内容抽在模块级，可离线测
                 pad = max(0, self._SPINNER_CELLS - cell_len(plain))  # 补齐到固定宽度
-                line = (
-                    f"{theme.ACCENT_ANSI}{frame}{theme.RESET_ANSI} "
-                    f"{theme.DIM_ANSI}正在思考… ({int(elapsed)}s){theme.RESET_ANSI}"
-                )
-                sys.stdout.write("\r" + line + " " * pad + "\x1b[K")
+                sys.stdout.write("\r" + styled + " " * pad + "\x1b[K")
                 sys.stdout.flush()
-                # 10 帧/秒。之前降成 5 帧是想减少重绘，结果四帧星芒切换得太慢，
+                # 10 帧/秒。之前降成 5 帧是想减少重绘，结果转轮切换得太慢，
                 # 视觉上反而"一顿一顿"更像在闪——转得连续才不像故障。
                 self._spinner_stop.wait(0.1)
         except Exception:  # spinner 出问题绝不能影响主流程
             pass
+        finally:
+            # 无论正常结束还是异常，都要把光标还回去。
+            # 为什么不用 atexit：它只在进程正常退出时跑，被强杀时也不保证执行；
+            # 线程自己是最先知道"我不转了"的，放 finally 覆盖面最大。
+            try:
+                sys.stdout.write(theme.CURSOR_SHOW)
+                sys.stdout.flush()
+            except Exception:
+                pass
 
     def _stop_spinner(self) -> None:
         """停掉等待动画，并把那一行擦干净（2026-11-07 第 10 轮新增）
@@ -361,7 +406,7 @@ class DisplayManager:
         if stopped and self._is_tty():
             # 三重保险：回车回到行首、2K 清整行、空格彻底覆盖、再回车归位。
             # 只靠其中一种在某些终端上会漏（实测过 2K 之后尾巴还在的情况）。
-            sys.stdout.write("\r\x1b[2K" + " " * 100 + "\r")
+            sys.stdout.write("\r\x1b[2K" + " " * 100 + "\r" + theme.CURSOR_SHOW)
             sys.stdout.flush()
 
     def _start_body_live(self) -> None:
@@ -603,3 +648,30 @@ class DisplayManager:
         head_length = max(0, limit - 40)  # 留 40 个字符的位置给后面的省略说明
         preview = one_line[:head_length].rstrip()  # 截取前面一段
         return f"{preview} …（共 {len(text)} 字符，已省略 {len(text) - head_length}）"
+
+
+def _restore_cursor_on_exit() -> None:
+    """进程退出时兜底恢复光标（2026-11-09 第 19 轮新增）
+
+    为什么需要这层兜底：
+      等待模型时我们把光标隐藏了（否则它会悬在补齐空格的右边闪）。
+      正常情况下 `_spin_loop` 的 finally 会恢复它，但那只覆盖"线程正常退出"。
+      如果主流程直接抛异常退出（Ctrl+C、未捕获异常），daemon 线程在解释器退出时
+      会被直接杀掉，finally 不保证执行——终端就会一直看不见光标，
+      用户只能 `reset` 或者重开窗口。
+
+    why atexit 而不是把恢复写进 main 的 finally：
+      main 里已经有好几层 try/finally，再塞一条恢复语句，以后新增退出路径
+      必然漏一处。atexit 只注册一次，所有正常退出路径都会经过它。
+
+    注意：非 tty（重定向到文件）时什么都不写，避免把转义码写进输出文件。
+    """
+    try:
+        if sys.stdout.isatty():
+            sys.stdout.write(theme.CURSOR_SHOW)
+            sys.stdout.flush()
+    except Exception:  # 退出路径上的任何异常都不该阻止进程退出
+        pass
+
+
+atexit.register(_restore_cursor_on_exit)

@@ -34,6 +34,75 @@
 import os  # commonprefix：求多个候选的最长公共前缀
 import sys  # 判断是不是真终端、直接写 stdout
 import unicodedata  # 判断一个字符在终端里占几列（中文是双宽）
+import shutil  # 【第 18.6 轮】取终端宽度：判断输入是否折行、折到第几行
+import re  # 【第 18.8 轮】识别 ANSI 转义码：提示符里的颜色码不能算进显示宽度
+
+
+# 【第 18.8 轮】标准 CSI 转义序列（\x1b[ ... 最终字节），例如颜色码 \x1b[38;5;209m、
+# 复位 \x1b[0m、清行 \x1b[2K。参数字节 0x30~0x3F、中间字节 0x20~0x2F、
+# 最终字节 0x40~0x7E，这是 VT/CSI 的通用语法，不用为每个颜色码单独写分支。
+# 为什么必须剥掉：theme.prompt_text() 返回的是 "\x1b[38;5;209m>\x1b[0m "，
+# 肉眼可见宽度只有 2 列，但旧版 display_width 把转义码的每个字符都当可见字符算，
+# 一行凭空多出十几列。折行点、擦除宽度、光标列因此整体错位——这才是
+# 「真机上退格删不干净、而纯函数测试全绿」的根因：测试传的是干净 "> "，真机传的是带色码的。
+_ANSI_CSI_RE = re.compile(r"\x1b\[[0-?]*[ -/]*[@-~]")
+
+
+def strip_ansi(text: str) -> str:
+    """去掉字符串里的 ANSI CSI 转义码，只留下真正会显示在屏幕上的字符（第 18.8 轮新增）
+
+    用途有两个：算显示宽度、算光标行列。两者都只关心"占了几列"，
+    颜色码本身占 0 列，混进去必然算错。
+    只处理 CSI（ESC [ ...），本项目自己写的转义码全是这一类；
+    OSC（ESC ] ...）之类不在这里出现，不做过度设计。
+    """
+    return _ANSI_CSI_RE.sub("", text)
+
+
+def split_visible_lines(text: str, cols: int) -> list:
+    """把一段（可能带颜色码的）文字切成若干"屏幕行"，每行可见宽度不超过 cols-1 列
+
+    【第 18.8 轮新增｜为什么需要它】
+      第 18.6 轮靠终端自己软换行（autowrap），再用 \b / \x1b[1A / CHA 去回退光标。
+      这条路在 conhost 上被证明走不通：
+        · \b 在行首不跨行，第一行的字永远擦不到；
+        · 写满一行时，conhost 与 xterm 一个"立刻换行"、一个"等下一个字符才换行"，
+          同一个字符串算出来的光标行号可能差 1，上移行数就错了；
+        · CHA（\x1b[nG）在部分终端上不生效，光标会落到错误的列。
+      只要还让终端自动折行，这些差异就没法同时兼容。
+
+      所以多行输入改成"受控分帧重写"：由我们自己切成一行一行，
+      每行只写 cols-1 列（绝不写满），行与行之间显式发 \x1b[1B 下移。
+      这样光标位置完全由代码决定，不依赖任何终端的 autowrap 行为。
+
+    参数 cols：终端总列数。每行上限取 cols-1，是故意留一列不写满。
+    返回：字符串列表，至少 1 行；颜色码完整保留在它原来所属的那一行里，
+          不会被从中间劈开变成屏幕上的乱码。
+    """
+    limit = max(1, cols - 1)
+    lines = []
+    cur = []
+    width = 0
+    i = 0
+    while i < len(text):
+        match = _ANSI_CSI_RE.match(text, i)
+        if match:
+            # 转义码整段附加到当前行、不占列。必须先判断它，否则 '\x1b' 会被
+            # 当成普通字符算 1 列，后面的 '[38;5;209m' 还会被写进屏幕上。
+            cur.append(match.group(0))
+            i = match.end()
+            continue
+        ch = text[i]
+        w = display_width(ch)
+        if cur and width + w > limit:
+            lines.append("".join(cur))
+            cur = []
+            width = 0
+        cur.append(ch)
+        width += w
+        i += 1
+    lines.append("".join(cur))
+    return lines
 
 
 # --- 按键常量 ---------------------------------------------------------------
@@ -76,8 +145,14 @@ def display_width(text: str) -> int:
       A（Ambiguous）在中文环境下通常按双宽显示，但不同终端不一致，
       这里按单宽算（宁可少擦一格让人看到残留，也不要多擦把提示符擦掉）。
     控制字符理论上宽度是 0，但本模块只会传可打印内容，不做特殊处理。
+
+    【第 18.8 轮】先 strip_ansi 再逐字符算：提示符 theme.prompt_text() 带
+    \x1b[38;5;209m ... \x1b[0m，这些转义码在屏幕上占 0 列。旧实现把它们
+    当成普通 ASCII 计列，导致折行点早了十几列、擦除时把左边的历史输出也抹掉。
+    这里统一剥离，_cursor_rowcol / _paint / _erase_text 的调用方不用各自处理。
     """
-    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in text)
+    visible = strip_ansi(text)
+    return sum(2 if unicodedata.east_asian_width(ch) in ("W", "F") else 1 for ch in visible)
 
 
 class LineEditor:
@@ -122,6 +197,16 @@ class LineEditor:
         self._history = []  # 本次运行内提交过的输入，最新的在末尾
         self._history_index = None  # 当前翻到第几条；None = 正在编辑自己的草稿
         self._draft = ""  # 翻历史之前手里那半句，按 ↓ 回到这里
+
+        # --- 受控分帧渲染状态（第 18.8 轮新增）---
+        # 短输入仍然走"只写增量字符 / 只擦一个字符"的快速路径，屏幕不闪；
+        # 一旦输入接近一行宽，就切成"整段逐行重写"，光标位置由下面两个量钉住。
+        # 为什么不每次都重算：终端的 autowrap 模型（立刻换行 / 延迟换行）在不同终端
+        # 上不一致，靠"从文本反推光标在第几行"会差 1 行；而这两个状态量是
+        # 由我们自己的 \x1b[1B 下移一步步写出来的，永远精确。
+        self._controlled = False  # 本行输入是否已进入受控分帧模式（进入后本行不退出）
+        self._frame_rows = 1  # 屏幕上输入区当前占了几行（含提示符那一行）
+        self._frame_cursor_row = 0  # 光标当前停在输入区的第几行（0 起）
 
     @property
     def available(self) -> bool:
@@ -229,12 +314,26 @@ class LineEditor:
         cursor = 0  # 光标在 buffer 里的下标，0=行首，len(buffer)=行尾（第 18.1 轮）
         self._history_index = None  # 每次开始新的一行，历史位置归零
         self._draft = ""  # 草稿也清掉，避免把上一行的半句话带进来
+        # 【第 18.8 轮】受控状态是"一行之内"的：每次开始新输入必须归零，
+        # 否则上一行长输入留下的 _frame_rows 会让这一行一上来就往历史输出里乱擦。
+        self._controlled = False
+        self._frame_rows = 1
+        self._frame_cursor_row = 0
+        self._reserve_bottom_space()  # 【第 18.6 轮】先把输入行下方的空白留出来
         self._write(prompt)
 
         while True:
             ch = self.read_key()  # 阻塞，读一个字符（中文也能拿到）
 
             if ch in KEY_ENTER:
+                # 【第 18.8 轮】受控模式下光标可能被 ←/Home 移到输入区的中间行，
+                # 直接换行会把后面的横线、状态栏、模型回复插进输入区中间。
+                # 先把光标送到输入区最后一行的行首，再换行，后续输出才接在整段输入之后。
+                if self._controlled:
+                    down = self._frame_rows - 1 - self._frame_cursor_row
+                    self._write("\r")
+                    if down > 0:
+                        self._write("\x1b[{}B".format(down))
                 self._write("\n")  # 自己换行：逐字符模式下回车不会自动换行
                 text = "".join(buffer)
                 self._remember(text)  # 先记历史再返回（顺序反了会漏记刚提交的这句）
@@ -269,7 +368,7 @@ class LineEditor:
                         self._paint(prompt, old_text, "".join(buffer), cursor)
                 # 光标动了就重定位（历史翻页/Delete 已自己重画，跳过）
                 if code in (EXT_LEFT, EXT_RIGHT, EXT_HOME, EXT_END):
-                    self._move_cursor("".join(buffer), old_cursor, cursor)
+                    self._move_cursor(prompt, "".join(buffer), old_cursor, cursor)
                 # 其余两字节键（F1-F12、Insert 等）不处理，键码已吃掉
                 continue
 
@@ -293,7 +392,13 @@ class LineEditor:
                 # 注意这和"等模型回复时按 Esc 打断"是两件事，那个由 EscWatcher 负责，
                 # 两者运行时机不重叠：一个在等用户打字，一个在等模型输出。
                 if buffer:
-                    self._erase_text("".join(buffer))
+                    old_text = "".join(buffer)
+                    if self._controlled:
+                        # 受控模式下 \b 跨不了行，_erase_text 只会擦掉光标所在那一行，
+                        # 上面几行的字会整片留在屏幕上。必须整段重画成空输入。
+                        self._paint(prompt, old_text, "", 0)
+                    else:
+                        self._erase_text(old_text)
                     buffer.clear()
                     cursor = 0
                 continue
@@ -346,6 +451,13 @@ class LineEditor:
             return
 
         if is_show_list:
+            # 【第 18.8 轮】受控帧下方的行数是渲染状态的一部分，往里插两行候选
+            # 会让 _frame_rows / _frame_cursor_row 全部失效。补全候选只可能出现在
+            # "/" 开头的短命令上，和"超长输入"实际不会同时发生；真撞上了就
+            # 保守地响一声、不列候选，宁可少一个提示也不要把屏幕搞乱。
+            if self._controlled:
+                self._bell()
+                return
             # 候选列在下一行，然后重画提示符和已输入内容，用户可以直接接着打
             self._write("\n" + "  ".join(matches) + "\n")
             self._write(prompt + text)
@@ -443,6 +555,106 @@ class LineEditor:
         """
         self._write("\a")
 
+    def _reserve_bottom_space(self) -> None:
+        """在输入行下方预留几行空白（第 18.6 轮新增）
+
+        解决什么：
+          输入行原本永远贴在终端最后一行。用户用滚轮往上翻看历史时，
+          光标会滚出视口——看起来"光标没了"，也没法把输入行停在屏幕中间。
+          下方留 N 行空白后，往上滚 N 行就能让输入行居中；而且打字时的重绘
+          不会把视口拉回底部（光标没碰到缓冲区最后一行）。
+
+        怎么留：先输出 N 个换行（光标下移 N 行，屏幕可能因此滚一行），
+        再用 `\\x1b[{N}A` 把光标移回原来的行——那 N 行就成了"输入行下方的空白"。
+        上移指令在 conhost 里实测可用（第 18.5 轮验证过 `\\x1b[1A`）。
+
+        N 取环境变量 THINKER_INPUT_PADDING，默认 4（第 18.8 轮从 2 调大）：
+          · 0 = 关掉，回到"输入贴在最后一行"的老样子；
+          · 【关键】N 同时也是"能往上滚几行"。conhost 在程序一旦有输出时，
+            会把视口拉回光标所在行：往上滚超过 N 行，光标就跑出视口，
+            敲第一个字屏幕立刻弹回底部。18.6 轮默认只给 2 行，用户滚两格
+            就被拽回去，体感就是"只能往下滚、字永远在最后一行"。
+            给 4 行能明显翻动，又不至于每轮空出小半屏。
+          做成环境变量而不是写死：窗口高度、终端（conhost / Windows Terminal /
+          PyCharm）差别很大，用户该能自己调，不用改代码。
+          长输入把留白吃掉时，_repaint_frame 会按需再把缓冲区往下撑开，
+          所以输入再长也不会重新贴回最后一行。
+
+        代价（说清楚，免得以后当 bug 报）：
+          每轮输入多占 N 行。模型回复通常远长于 N 行，空白会被输出吃掉；
+          但某轮只有一行输出时，会残留几行空白，屏幕利用率略降。
+          这是"能滚动"换来的空间成本，不是错乱。
+
+        为什么不用保存/恢复光标（`\\x1b[s` / `\\x1b[u`）：conhost 对这对指令的
+        支持不稳定，而 `\\x1b[NA` 已经被实测证明可用。
+        """
+        try:
+            n = int(os.getenv("THINKER_INPUT_PADDING", "4"))
+        except ValueError:
+            n = 4  # 环境变量写错（比如写了 "两行"）就按默认值，不值得为此中断输入
+        if n <= 0:
+            return
+        self._write("\n" * n)  # 光标下移 n 行，腾出空白
+        self._write("\x1b[{}A".format(n))  # 移回原行：空白就留在下方了
+
+    @staticmethod
+    def _term_cols() -> int:
+        """当前终端宽度（多少列）（第 18.6 轮新增）
+
+        为什么每次实时取、不在启动时缓存：用户可以随时拉宽/拉窄窗口，
+        缓存下来的旧宽度会让"这一行有没有折行"整体判断错位——
+        退格可能删到上一行去，比删不掉更糟。
+
+        fallback=(80, 24) 是给"输出被重定向、拿不到真实尺寸"的场景兜底：
+        宁可算错也不让程序抛异常，输入层崩了整个会话就没法用了。
+        """
+        try:
+            return max(1, shutil.get_terminal_size(fallback=(80, 24)).columns)
+        except Exception:
+            return 80  # 取不到就按 80 列算，这是终端最经典的默认宽度
+
+    @staticmethod
+    def _cursor_rowcol(prompt: str, text: str, cursor: int, cols: int):
+        """算出光标停在第几个「可视行」、第几列（第 18.6 轮新增）
+
+        【第 18.8 轮的角色变化】生产渲染已经不再依赖这个函数：
+          第 18.6 轮用它判"退格是否跨行"，但 conhost 的自动换行时机和
+          xterm 不一样，反推行号会差 1，正是真机删不干净的根源。
+          现在多行输入一律走 _repaint_frame（自己分帧、自己记行号），
+          本函数保留下来描述"终端自然折行"的换算规则，并由 test_line_wrap.py
+          钉住边界用例；排查显示问题时也能拿它做对照。别再拿它驱动光标指令。
+
+        为什么需要它：
+          输入一旦超过一行宽度，终端会自动折行（软换行）。但程序手里的
+          buffer 始终是一个连续字符串，完全不知道屏幕上其实已经占了两行。
+          不换算成"行 + 列"，退格和中间编辑都会按单行来算，结果就是删错位置。
+
+        模拟规则和终端保持一致：一个字符在当前行写不下，就换行再写。
+        用 display_width 而不是 len——中文占两列，用字符数算会把折行点算早。
+
+        返回 (row, col)，都从 0 开始：
+          row  —— 从提示符所在行算起，光标在第几个可视行；
+          col  —— 这一行里光标左边有多少列。
+        特例：col == cols 表示"这一行刚好写满、光标还在行尾等着换行"，
+        这是终端 autowrap 的真实状态，不是越界。
+
+        为什么做成静态方法、把 cols 当参数传：
+          这样测试可以注入固定宽度（比如 10 列），不必依赖跑测试那台机器的
+          窗口大小——否则同一份断言在 80 列和 120 列的终端上结果不同。
+        """
+        row = 0
+        col = 0
+        # 【第 18.8 轮】这里是**逐字符**循环，strip_ansi 必须在循环外对整段 prompt 做：
+        # 单独拿一个 '\x1b' 去匹配 CSI 正则永远匹配不上，会被错算成 1 列。
+        visible = strip_ansi(prompt) + text[:cursor]
+        for ch in visible:
+            width = display_width(ch)
+            if col + width > cols:  # 这一行放不下了 → 换行
+                row += 1
+                col = 0
+            col += width
+        return row, col
+
     def _erase_text(self, text: str) -> None:
         """把屏幕上已经显示出来的这段文字擦掉（2026-11-08 第 16.2 轮重写）
 
@@ -459,6 +671,111 @@ class LineEditor:
         width = display_width(text)
         if width > 0:
             self._write("\b \b" * width)
+
+    @staticmethod
+    def _frame_pos(lines: list, prompt: str, text: str, cursor: int):
+        """算出 cursor 这个字符下标落在受控帧的哪一行、哪一列（第 18.8 轮新增）
+
+        参数 lines 是 split_visible_lines 切好的屏幕行。做法是把"光标左边一共
+        多少可见列"按每行宽度依次扣减，扣到哪一行装得下就停在那一行。
+
+        【为什么判据是 remaining < width，不是 <=】
+          remaining 恰好等于本行宽度时，光标指的是**下一行的第一个字符**
+          （因为每行只写 cols-1 列就显式下移了），不是停在本行末尾。
+          写成 <= 会让光标停在上一行最后一列，接着打的字就叠在本行末尾。
+          这是分帧渲染和终端自然折行最容易搞混的一处边界。
+
+        返回 (row, col)，都从 0 开始，col 是"光标左边有多少列"。
+        """
+        remaining = display_width(prompt) + display_width(text[:cursor])
+        for row, line in enumerate(lines):
+            width = display_width(line)
+            if remaining < width:
+                return row, remaining
+            remaining -= width
+        # 光标在整段文字末尾：落在最后一行、该行最后一个字符之后
+        return len(lines) - 1, display_width(lines[-1])
+
+    def _repaint_frame(self, prompt: str, text: str, cursor: int, cols: int) -> None:
+        """整段重画输入区：先逐行清空，再逐行手写，最后把光标放到指定位置
+
+        【第 18.8 轮新增｜为什么不再用增量擦除】
+          第 18.6 轮的做法是"退格退一格、擦一个字符、必要时上移一行"。
+          在 conhost 上被真机证明修不好，三个原因叠在一起：
+            1. 提示符带颜色转义码，旧版把它算成十几列，折行点整体错位；
+            2. \b 在可视行行首不跨行，上一行末尾那个字永远擦不到——
+               用户看到的就是"删完第二行，第一行还留着最后一个字符"；
+            3. 写满一行时 conhost 与 xterm 的 autowrap 时机不同，
+               加上 CHA（\x1b[nG）在部分终端不生效，"该上移几行、跳到第几列"
+               根本算不准，光标会被丢到历史输出里，屏幕上出现孤立残字。
+
+          这里换成"受控分帧"：所有行都由我们自己切、自己写，每行最多 cols-1 列
+          （绝不写满），行间用 \x1b[1B 显式下移。屏幕上的光标位置因此
+          完全由本函数决定，与终端的自动换行实现无关。
+
+        【用到的指令都是最基础的 CSI】
+          \x1b[nA 上移、\x1b[nB 下移、\x1b[nC 右移、\r 回行首。
+          全部在第 18.5 轮验证过的同一个指令族里，不再依赖 CHA / ED / EL。
+
+        参数 cursor：新光标在 text 里的字符下标；重画完会把它精确放回去，
+                    所以中间插入、Home/End、历史翻页也都走这一条路。
+        """
+        lines = split_visible_lines(prompt + text, cols)
+        rows = len(lines)
+        # 旧帧可能比新帧长（比如一次删掉很多字），要按两者较大值清，
+        # 否则旧帧多出来的那几行会整片留在屏幕上。
+        clear_rows = max(self._frame_rows, rows)
+
+        # --- 1. 从当前光标所在行回到输入区起始行 ---
+        # 起步位置用的是上一帧记下来的 _frame_cursor_row，不是靠文本反推，
+        # 这正是能绕开 autowrap 差异的关键。
+        if self._frame_cursor_row > 0:
+            self._write("\x1b[{}A".format(self._frame_cursor_row))
+        self._write("\r")
+
+        # --- 2. 输入变长时，先把缓冲区往下撑开 ---
+        # 不撑开的话，下面的 \x1b[1B 会在屏幕最后一行被夹住，行数就对不上，
+        # 光标会被送到历史输出里。多撑 1 行给底部留白，顺带保证长输入时
+        # 输入行下方始终有空白（滚轮能往上滚的前提，见 _reserve_bottom_space）。
+        grow = max(0, clear_rows - self._frame_rows)
+        extra = grow + (1 if grow > 0 else 0)
+        if extra > 0:
+            self._write("\n" * extra)  # 光标下移，缓冲区尾部多出这些空行
+            self._write("\x1b[{}A".format(extra))  # 立刻移回起始行，空行留在下方
+
+        # --- 3. 逐行清空 ---
+        # 每行只写 cols-1 个空格：写满 cols 列会触发终端自动换行，不同终端
+        # 换行时机不同，清行行数就会错。留一列不写即可完全避开。
+        blank = " " * max(0, cols - 1)
+        for i in range(clear_rows):
+            self._write("\r" + blank + "\r")
+            if i < clear_rows - 1:
+                self._write("\x1b[1B")  # 显式下移一行，不靠自动换行
+        if clear_rows > 1:
+            self._write("\x1b[{}A".format(clear_rows - 1))
+        self._write("\r")
+
+        # --- 4. 逐段重写（颜色码已经由 split_visible_lines 完整保留在各段里）---
+        for i, line in enumerate(lines):
+            self._write(line)
+            if i < rows - 1:
+                self._write("\r\x1b[1B")  # 回本行行首后下移，下一行从第 0 列开始
+
+        # --- 5. 把光标放回 cursor 对应的位置 ---
+        # 写完最后一段后光标在 (rows-1, 该段宽度)，先回起始行，再下移/右移。
+        target_row, target_col = self._frame_pos(lines, prompt, text, cursor)
+        if rows > 1:
+            self._write("\r\x1b[{}A".format(rows - 1))
+        else:
+            self._write("\r")
+        if target_row > 0:
+            self._write("\x1b[{}B".format(target_row))
+        if target_col > 0:
+            self._write("\x1b[{}C".format(target_col))
+
+        # 记下这一帧的形状，供下一次按键"从当前光标回到起点"使用。
+        self._frame_rows = rows
+        self._frame_cursor_row = target_row
 
     def _redraw(self, buffer: list, prompt: str, new_text: str) -> None:
         """把当前行改写成 new_text（2026-11-08 第 16 轮新增，16.2 轮简化）
@@ -484,6 +801,10 @@ class LineEditor:
           屏幕上会出现明显抖动。而绝大多数按键是"在末尾追加一个字符"，
           这种情况直接写那一个字符就够了，零重画。
 
+        【第 18.8 轮】上面三条路只服务"短输入"（不到一行宽）。一旦接近行宽，
+          函数开头会先切到 _repaint_frame 整段重画并 return，这里一条都走不到。
+          这样分是权衡：短输入零闪烁，长输入才付重画的代价。
+
         三条路按代价从低到高：
           1. 纯追加（光标在末尾、旧内容是新内容的前缀）→ 只写增量
           2. 末尾退格删一个字符 → 只擦那一个字符（按列宽）
@@ -494,6 +815,20 @@ class LineEditor:
         """
         if old_text == new_text:
             return  # 内容没变（光标移动由 _move_cursor 负责），别白画一遍
+
+        # 【第 18.8 轮】接近一行宽就切到受控分帧重绘。
+        # 判据取 cols-1 而不是 cols：必须在"还没真正折行"的那一帧就切过去，
+        # 此时光标仍在第 0 行、位置精确；等终端真的折行了再切，就得猜
+        # conhost 是立刻换行还是延迟换行，又回到 18.6 轮的老问题。
+        # 一旦进入受控，本行输入不再退回快速路径（readline 开头会重置状态），
+        # 否则快速路径会按"光标在单行末尾"来算，而屏幕其实是多行的。
+        cols = self._term_cols()
+        before = display_width(prompt) + display_width(old_text)
+        after = display_width(prompt) + display_width(new_text)
+        if self._controlled or max(before, after) >= cols - 1:
+            self._controlled = True
+            self._repaint_frame(prompt, new_text, cursor, cols)
+            return
 
         # 路 1：纯追加
         if cursor == len(new_text) and new_text.startswith(old_text):
@@ -506,6 +841,10 @@ class LineEditor:
             and old_text.startswith(new_text)
             and len(old_text) - len(new_text) == 1
         ):
+            # 【第 18.8 轮】跨可视行的情况已经在 _paint 开头交给 _repaint_frame，
+            # 走到这里必然是同一行内的退格，\b 一定够用，按列宽擦即可。
+            # 18.6 轮"上移一行 + CHA 跳列"的补丁在 conhost 上算不准行列，
+            # 已整体删除——不要再加回来，那正是残留字符的来源。
             self._erase_text(old_text[-1])
             return
 
@@ -521,7 +860,7 @@ class LineEditor:
         if back > 0:
             self._write("\b" * back)
 
-    def _move_cursor(self, text: str, old: int, new: int) -> None:
+    def _move_cursor(self, prompt: str, text: str, old: int, new: int) -> None:
         """只移动光标，不改内容（第 18.1 轮新增）
 
         为什么不复用 _paint 的"整行重画"：按一下 ← 就重画整行，屏幕会闪一下，
@@ -532,7 +871,14 @@ class LineEditor:
 
         边界：往左退格到列 0 就停（\b 不会换行），所以这一行如果折行了，
         Home 只会退到"当前这一屏行"的行首。这是不用 ANSI 的代价，折行是少数情况。
+
+        【第 18.8 轮】受控分帧模式下 \b 连一行都跨不过去，方向键必须整段重画：
+        内容一个字不改，只是把目标光标位置交给 _repaint_frame 重新定位。
+        代价是重画一次，换来 Home / ← 在多行输入里也能真的跳到行首。
         """
+        if self._controlled:
+            self._repaint_frame(prompt, text, new, self._term_cols())
+            return
         if new < old:
             self._write("\b" * display_width(text[new:old]))
         elif new > old:

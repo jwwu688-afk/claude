@@ -93,20 +93,30 @@ class ToolManager:
     def _register_tool(self, name, tool_instance):
         self.tools[name] = tool_instance  # 就是往字典里塞一条
 
-    async def get_tools_description(self, exclude=None):
+    async def get_tools_description(self, exclude=None, allow=None):
         """Return the tool schemas to put in request["tools"].（生成要发给模型的工具清单）
 
         Args:
             exclude: tool names to hide (None = show all). Conversation passes
                      {"task"} for sub-agents so they cannot delegate further.
-            参数 exclude：不想让模型看到的工具名集合。子 agent 会把 task 排除掉。
+            allow: tool names to KEEP (None = 不限制). 子 agent 的类型化白名单从这里生效。
+                   为什么需要它：改前只有 exclude（黑名单），子 agent 只能"被拿走 task"，
+                   其余工具全给——想做一个只读的 explore agent 根本无从下手。
+        参数 exclude：不想让模型看到的工具名集合。子 agent 会把 task 排除掉。
+        参数 allow：【第 18 轮】白名单。None 表示不限制；给了集合就只发集合里的。
+                allow 和 exclude 同时生效（先过白名单、再剔黑名单），
+                这样"给 explore 三个只读工具"和"任何子 agent 都不给 task"
+                这两条规则可以各管各的，不用在调用处手工求差集。
         """
         self._ensure_mcp_registration()  # 【2026-11-06 第 2 轮新增】确保后台注册任务已启动
         if self.register_mcp_task is not None:  # 启动了才需要等
             await self.register_mcp_task  # 先等后台那个"注册 MCP 工具"的任务干完
         exclude = exclude or set()  # 如果传了 None，就换成空集合（方便后面判断"在不在里面"）
+        allow = None if allow is None else set(allow)  # None 保持 None，表示"不限制"
         descriptions = []  # 准备结果列表
         for tool_name, tool_instance in self.tools.items():  # 遍历字典的每一对"键和值"
+            if allow is not None and tool_name not in allow:  # 不在白名单里
+                continue  # 【第 18 轮】不给它，从源头掐断（比事后拦更可靠）
             if tool_name in exclude:  # 如果在"要隐藏"的名单里
                 continue  # 跳过它
             descriptions.append(tool_instance.json_schema())  # 取它的"自我介绍"，加进清单

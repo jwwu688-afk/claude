@@ -192,7 +192,11 @@ class APIClient:
         参数 request_params：一个字典，里面装着 messages（消息列表）、tools（工具清单）等
         返回：一个元组 (模型回复对象, token 用量)
         """
-        request_params["model"] = model or self.model  # 【第 6 轮】允许调用方指定模型（摘要用小模型）
+        # 【第 18 轮】允许调用方在 request 里指定模型（子 agent 的 model 字段走这条路）。
+        #   优先级：显式传参 > request 里已有的 model > 全局 self.model。
+        #   为什么要读 request_params 里已有的值：改前这里是无条件覆盖，
+        #   调用方就算在 request 里塞了 model 也会被抹掉，子 agent 的模型覆盖就永远不生效。
+        request_params["model"] = model or request_params.get("model") or self.model
         try:  # 开始"试一试"，如果里面出错会跳到 except
             response = self.client.chat.completions.create(**request_params)
             # ** 的意思是"把字典拆开当参数传进去"，等价于 create(messages=..., tools=..., model=...)
@@ -212,7 +216,11 @@ class APIClient:
         这是个"生成器函数"（函数体里有 yield），调用它不会立刻执行，
         而是返回一个可以一段段取值的对象，用 for 循环去取。
         """
-        request_params["model"] = self.model  # 填模型名
+        # 【第 18 轮】流式请求也允许用 request 里指定的模型（子 agent 的 model 字段）。
+        #   改前这一行是无条件 `= self.model`，等于把"每个子 agent 可以用不同模型"
+        #   这条路彻底堵死——不管上层怎么传，发出去的都是全局模型。
+        #   这里用 get() 兜底：没有指定就退回全局，行为和改前完全一致。
+        request_params["model"] = request_params.get("model") or self.model  # 填模型名（子 agent 可覆盖）
         request_params["stream"] = True  # 告诉接口：我要流式返回，别憋到最后才给我
         request_params["stream_options"] = {"include_usage": True}
         # 额外要求：最后也要告诉我用了多少 token（不加这句，流式模式下往往拿不到用量）

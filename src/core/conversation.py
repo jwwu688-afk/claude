@@ -31,6 +31,7 @@ from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限�
 from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器：负责生成"系统提示词"
 from core.prompt.reminder import get_reminder  # 导入函数：生成一段"提醒模型去看 todo"的文字
 from core.session import SessionStore, load_messages_for_resume  # 【第 13 轮】会话持久化
+from core.stream_pump import StreamInterrupted, iter_stream_with_esc  # 【第 18.7 轮】Esc 在等待首字节时也能打断
 from tools.tool_manager import ToolManager  # 导入工具管理器：负责注册工具、执行工具
 from ui.esc_watcher import EscWatcher  # 【第 13 轮】Esc 打断
 from ui.ui_manager import UIManager  # 导入界面管理器：负责显示和要输入
@@ -192,6 +193,11 @@ class Conversation:
     _history_manager = None  # 类属性：历史管理器
     _prompt_manager = None  # 类属性：提示词管理器
     _task_depth = 0  # 计数器：0 表示"我是主 agent"，大于 0 表示"我正在被某个子任务调用"
+    # 【2026-11-09 第 18 轮】当前正在跑的子 agent 定义栈（AgentSpec）。
+    #   为什么需要"栈"而不是一个字段：子 agent 不能再派活（两道闸），所以理论上只有一层；
+    #   但万一将来放开嵌套，或者某次异常没清干净，用栈能让"当前是谁"始终有据可查，
+    #   比一个会被覆盖的字段好排查。主 agent 时栈为空。
+    _agent_stack = []
 
     def __new__(cls):
         """Singleton pattern implementation.（单例模式：保证全程序只有一个 Conversation）"""
@@ -221,6 +227,10 @@ class Conversation:
             self._prompt_manager = PromptManager()  # 建提示词管理器
             # 【2026-11-07 第 13 轮】会话落盘 + Esc 打断
             self._session = None  # 当前会话的存储句柄，start_conversation 时才创建
+            # 【第 18 轮】每个实例自己持一份栈。虽然 Conversation 是单例、类属性也能用，
+            #   但测试会通过 __new__ 造裸对象（不经 __init__），类属性容易串味道；
+            #   current_agent 里用 getattr 兜底，两条路都不会炸。
+            self._agent_stack = []
             self._esc = EscWatcher()  # 监听 Esc 的后台线程（不支持的平台会自动降级）
             self._initialized = True  # 打上标记，下次不再重复创建
 
@@ -239,6 +249,22 @@ class Conversation:
           2. 决定"活干完了是停下来交差，还是继续问用户要输入"
         """
         return self._task_depth > 0  # 深度大于 0 就是子 agent
+
+    @property
+    def current_agent(self):
+        """当前正在跑的子 agent 定义（AgentSpec）；主 agent 时返回 None（第 18 轮新增）
+
+        三个地方要用它：
+          1. `_get_available_tools()` —— 按它的 tools 白名单决定发哪些工具；
+          2. `_execute_tool()` —— 硬调越权工具时拦住；
+          3. `_run_one_iteration()` —— 按它的 model 覆盖本轮模型。
+
+        用 getattr 兜底的理由和 add_message 里一样：单例的 __init__ 只跑一次，
+        测试/裸对象可能先 __new__ 出来，属性还没赋值。返回 None 表示"当主 agent 处理"，
+        这是安全方向（主 agent 本来就有全部权限）。
+        """
+        stack = getattr(self, "_agent_stack", None)
+        return stack[-1] if stack else None
 
     def add_message(self, message):
         """Add message through history manager.（往当前对话里追加一条消息）
@@ -439,21 +465,39 @@ class Conversation:
             self._ui_manager.print_error(f"发生系统错误：{e}")  # 在界面上报个错
             traceback.print_exc()  # 再把完整的错误现场打印出来，方便定位问题
 
-    async def start_task(self, task_system_prompt: str, user_input: str) -> str:
+    async def start_task(self, task_system_prompt: str = None, user_input: str = "", agent=None) -> str:
         """
         开始一个"子任务"。这是 Task 工具（就是让模型能派活给子 agent）的入口。
 
         关键点：它会在消息历史里"新开一页"，
         所以子 agent 看不到主对话的历史，主对话也不会被子 agent 的啰嗦过程污染。
         干完活以后，只把最后一条回复带回去。
+
+        【第 18 轮】新增 agent 参数（AgentSpec）。
+          为什么不能只传一段 prompt：子 agent 类型化之后，每个类型除了人设，
+          还带着「能用哪些工具」和「用哪个模型」。只传文本的话，这两样带不进来，
+          Conversation 也就没法在清单层和执行层按类型收窄。
+          兼容：agent 为 None 时仍用 task_system_prompt（脚本/测试的老路还能走）。
         """
-        # Initialize with system message
+        # 【第 18 轮】深度和栈必须同进同出，所以入栈紧跟在深度 +1 之后，
+        #   出栈统一放在下面的 finally 里（异常、失败返回、正常交差三条路都会走到）。
         self._task_depth += 1  # 深度 +1：从现在起，我就是个子 agent 了
+        self._agent_stack.append(agent)  # 记下"这一层是谁在干活"
+
         self._history_manager.start_new_chat()  # 新开一页消息记录（相当于翻到新的一页纸）
+        system_prompt_text = task_system_prompt
+        if agent is not None:
+            # 局部 import：agent_spec 会去 import core.prompt.environment，
+            # 放在模块顶部会让"对话总管 → 子 agent 模块 → 提示词"这条链提前成形，
+            # 以后 environment 里想 import conversation 就会成环。
+            from tools.subagent.agent_spec import build_system_prompt
+
+            system_prompt_text = build_system_prompt(agent)
+
         system_message = {
             "role": "system",  # 子 agent 也有自己的人设
             "content": [
-                {"type": "text", "text": task_system_prompt}  # 子 agent 专用的系统提示词
+                {"type": "text", "text": system_prompt_text}  # 子 agent 专用的系统提示词
             ]
         }
         self.add_message(system_message)  # 注意：因为刚翻到新一页，所以这条会加在新页面上
@@ -471,13 +515,18 @@ class Conversation:
         except Exception as e:  # 如果子任务出错了
             self._ui_manager.print_error(f"执行子任务时发生系统错误：{e}")  # 报错
             traceback.print_exc()  # 打印现场
-            self._task_depth -= 1  # 深度 -1，把计数器还原
             self._discard_current_chat()  # 【2026-11-06 优化】把出错的那一页消息丢掉
             # 【2026-11-06 优化】原来是 sys.exit(1)，直接把整个程序干掉：
             #   子 agent 只要有一个工具抛异常，你的 CLI 就退出、主对话上下文全丢。
             #   现在改成"把错误当成子任务的结果交回去"，主 agent 可以自己决定换个做法。
             return f"子任务执行失败：{e}"  # 返回失败说明，让主 agent 看到并自行补救
-        self._task_depth -= 1  # 正常结束时也要把深度还原
+        finally:
+            # 【第 18 轮】深度的还原从"两条路各减一次"改成 finally 只减一次。
+            #   改前正常路径减一次、异常路径减一次，看着对称，但以后加第三条 return
+            #   就一定会漏；而漏掉的后果是"之后所有对话都以为自己在子 agent 里"，
+            #   表现为主 agent 突然拿不到 task 工具、不再问用户输入——极难归因。
+            self._agent_stack.pop()  # 出栈，和上面的 append 严格配对
+            self._task_depth -= 1  # 深度还原
         return self._history_manager.finish_chat_get_response()  # 收起这一页，把最后一条回复返回给主 agent
 
     def _discard_current_chat(self):
@@ -540,6 +589,15 @@ class Conversation:
             "tools": await self._get_available_tools(),  # 我能用的所有工具清单
         }
 
+        # 【第 18 轮】子 agent 可以自带模型（md 里写 model: xxx）。
+        #   为什么不直接改 self._api_client.model：那是全局状态，子 agent 结束后
+        #   还得改回来，一旦中途异常就永久改了主 agent 的模型。
+        #   走 request 字段是"只对这一轮生效"，天然没有还原问题。
+        #   APIClient 那边已改成"request 里有就用 request 的"（见 get_completion_stream）。
+        agent = self.current_agent
+        if agent is not None and agent.model:
+            request["model"] = agent.model
+
         # Start assistant response
         # 【第 4 轮】圆点不再单独打印：它现在画在流式区域内部，
         # 这样模型"只调工具不说话"时，屏幕上不会多出一个空圆点。
@@ -578,10 +636,11 @@ class Conversation:
 
             # Process streaming response
             try:
-                for chunk in iterator:  # 一段一段收
-                    if esc is not None and esc.triggered:  # 用户按了 Esc
-                        interrupted = True
-                        break
+                # 【第 18.7 轮】改走 iter_stream_with_esc：读流的活交给后台线程，
+                #   这里每 50ms 醒一次先看 Esc 再看队列。
+                #   改前是 `for chunk in iterator` + 循环体内检查 Esc——模型思考时
+                #   （首字节还没到）循环体一次都不执行，那 11 秒里按 Esc 完全没反应。
+                for chunk in iter_stream_with_esc(iterator, esc):  # 一段一段收
                     if isinstance(chunk, str):  # 情况一：这是一小段文字
                         # This is content chunk
                         full_content += chunk  # 拼到总文字上
@@ -596,6 +655,12 @@ class Conversation:
                     elif hasattr(chunk, 'usage') and chunk.usage:  # 情况三：这是个独立的用量数据
                         # This is standalone token usage information
                         token_usage = chunk.usage  # 记下来
+            except StreamInterrupted:
+                # 【第 18.7 轮】Esc 打断走这里，不再在循环体里 break。
+                #   为什么用异常：打断可能发生在"还没收到任何数据"的时候，
+                #   那时根本没有循环体可执行，只能在等的地方抛出来。
+                #   已经输出的半截内容保留（下面 interrupted 分支统一处理）。
+                interrupted = True
             finally:
                 if esc is not None:
                     esc.stop()  # 收掉监听线程
@@ -874,10 +939,22 @@ class Conversation:
         子 agent（深度 > 0）看到的清单里没有 task，所以它根本不会想到要去派活。
         这叫"从源头掐断"：连选项都不给它，比事后拦它更可靠。
 
+        【第 18 轮】再加一道「类型白名单」：
+          每个子 agent 定义里可以写 tools（比如 explore 只有 file_glob/file_grep/file_read），
+          这里把 allow 传给工具管理器，模型连"越权工具长什么样"都看不到。
+          和 exclude 的分工：exclude 是"任何子 agent 都不给 task"，
+          allow 是"这个类型只给这几个"。两者都生效，不用在调用处手工求差集。
+
         为什么是 async？因为要等 MCP 工具注册完（连外部服务器要时间）。
         """
         exclude = {"task"} if self.is_subagent else None  # 如果是子 agent，就排除 task 工具
-        return await self._tool_manager.get_tools_description(exclude=exclude)  # 向工具管理器要清单
+        allow = None  # None = 不限制（主 agent、或"继承全部"的子 agent）
+        agent = self.current_agent
+        if agent is not None and agent.tools is not None:
+            # 白名单里再剔一次 task：万一用户在自己写的 md 里塞了 task（加载时已经告警并剔除），
+            # 或者以后有人手工 register 时绕过了解析，这里仍然兜住。
+            allow = {name for name in agent.tools if name != "task"}
+        return await self._tool_manager.get_tools_description(exclude=exclude, allow=allow)  # 向工具管理器要清单
 
     @staticmethod
     def _needs_user_approval(tool_name: str, args: dict) -> bool:
@@ -1117,6 +1194,31 @@ class Conversation:
             is_last_tool,
         )
 
+    def _is_tool_allowed(self, tool_name: str) -> bool:
+        """这个工具对「当前正在干活的 agent」是否可用（第 18 轮新增）
+
+        三层白名单里的第二层（第一层是清单里不给，第三层是说明书里只说有哪几个）。
+        为什么清单层不够：模型是有记忆的，它可能凭上一轮的工具清单、或者凭训练里的
+        习惯直接写出一个工具名。清单层只是"看不到"，不是"用不了"。
+        这里在执行前再拦一次，把拒绝理由写进工具结果——模型下一轮就能改道。
+
+        三种情况：
+          · 主 agent（current_agent 为 None）→ 全部允许；
+          · 子 agent 且 tools 为 None（继承全部）→ 允许，但 task 永远不许；
+          · 子 agent 且 tools 有值 → 只允许名单里的，task 永远不许。
+        """
+        agent = self.current_agent
+        if agent is None:
+            return True  # 主 agent：没有任何限制
+        if tool_name == "task":
+            # 子 agent 不能再派活。这是三道闸里最里的一道，和 task.py 里的第二道重复，
+            # 但重复是故意的：task.py 那层只拦"从 task 工具进来的调用"，
+            # 这一层拦的是"任何路径发起的调用"。
+            return False
+        if agent.tools is None:
+            return True  # 继承全部（除 task）
+        return tool_name in agent.tools
+
     async def _execute_tool(self, tool_call, args, is_last_tool=False, show_header=True):
         """Execute a tool call and handle the response.（执行一个工具，成功失败都要有回应）
 
@@ -1131,6 +1233,23 @@ class Conversation:
         tool_args = {k: v for k, v in args.items() if k != 'need_user_approve'}
         # 上面这行是"过滤字典"：把 need_user_approve 这个标记去掉，
         # 因为它是给我们看的，不是给工具本身用的参数。用的是字典推导式。
+
+        # 【第 18 轮】执行层硬闸：类型白名单外的工具，就算模型硬调也执行不了。
+        #   为什么拒绝理由要带上"可用工具清单"：
+        #     只说"不可用"的话，模型下一轮十有八九再猜一个名字撞一次；
+        #     把清单给它，同一轮就能改道（这个教训在 task 的未知类型提示上已经吃过一次）。
+        if not self._is_tool_allowed(tool_call.function.name):
+            agent = self.current_agent
+            available = agent.tools_text() if agent is not None else "（未知）"
+            agent_name = agent.name if agent is not None else "未知类型"
+            reason = (
+                f"工具 '{tool_call.function.name}' 对当前子 agent（{agent_name}）不可用。\n"
+                f"当前可用的工具：{available}。\n"
+                "请改用这些工具完成任务；确实做不到就直接在汇报里说明，不要绕道。"
+            )
+            self._finish_tool_call(tool_call, reason, is_last_tool, error=True)
+            return
+
         if show_header:  # 没画过才画，避免同一个调用出现两行头
             self._ui_manager.show_preparing_tool(tool_call.function.name, tool_args)  # 显示"准备调用 xx 工具"
 

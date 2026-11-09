@@ -413,9 +413,12 @@ def test_schemas_and_prompt_consistency():
     assert "sed -i \"起始行,结束行 c 新内容\"" not in cmd_doc, "cmd_runner 说明书还在教 sed -i"
     assert "file_read" in cmd_doc, "cmd_runner 说明书应指向新的文件工具"
 
-    subagent = (src_root / "tools" / "subagent" / "subagent_manager.py").read_text(encoding="utf-8")
-    assert "Grep 或 Glob" not in subagent, "子 agent 人设里还写着不存在的工具名"
-    assert "file_glob" in subagent, "子 agent 人设应改用真实工具名"
+    # 【第 18 轮】子 agent 的人设文本从 subagent_manager.py 搬到了 builtin_agents.py。
+    #   静态检查必须跟着搬家：留在原处的话，它检查的是一个已经没有人设的文件，
+    #   结果就是"永远查不到问题"的假绿——这类断言比没有断言更危险。
+    agents_src = (src_root / "tools" / "subagent" / "builtin_agents.py").read_text(encoding="utf-8")
+    assert "Grep 或 Glob" not in agents_src, "子 agent 人设里还写着不存在的工具名"
+    assert "file_glob" in agents_src, "子 agent 人设应改用真实工具名"
 
     system_rule = (src_root / "core" / "prompt" / "system_rule.py").read_text(encoding="utf-8")
     assert "file_edit" in system_rule and "file_grep" in system_rule, "系统提示词应包含工具选择规则"

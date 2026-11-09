@@ -20,6 +20,7 @@
 # =============================================================================
 
 from tools.base_tool import BaseTool  # 导入父类
+from tools.subagent.agent_spec import MAX_DESCRIPTION_CHARS  # 【第 18 轮】说明书里描述的长度上限
 from tools.subagent.subagent_manager import SubagentManager  # 导入"子 agent 人设管理器"
 from ui.ui_manager import UIManager  # 导入界面管理器，用来提示"正在派活"
 
@@ -72,11 +73,21 @@ class Task(BaseTool):
         # refusal path above.
         # 翻译：只有确实要开工了才把这盏灯点亮，上面被拒绝的那条路上它还保持 False
         self._has_initialized_task = True  # 标记"正在跑子任务"
-        self._ui_manager.print_info(f"正在把任务交给 {subagent_type} 子 agent：{description}\n 任务说明：{prompt}")
-        # 在界面上提示一下"我把活派给谁了、活是什么"
-        subagent_system_prompt = self._subagent_manager.get_subagent_prompt(subagent_type)
-        # 取出这类子 agent 的"人设设定"（比如：你是专门查代码的，要详尽、要给绝对路径）
-        response = await conversation.start_task(task_system_prompt=subagent_system_prompt, user_input=prompt)
+        spec = self._subagent_manager.get_spec(subagent_type)
+        # 【第 18 轮】把 spec 一并交给 start_task：它除了人设，还带着工具白名单和模型。
+        #   只传 prompt 的话，这两样就带不进子 agent 那一页，白名单和模型覆盖都不会生效。
+        self._ui_manager.print_info(
+            f"正在把任务交给 {spec.name} 子 agent：{description}\n"
+            f" 工具：{spec.tools_text()} ｜ 模型：{spec.model_text()}\n"
+            f" 任务说明：{prompt}"
+        )
+        # 在界面上提示一下"我把活派给谁了、它有什么权限、活是什么"。
+        #   为什么要显示工具和模型：用户能一眼看出"这次派活会不会弹审批"
+        #   （只读工具免审批）以及"会不会花大模型的钱"。
+        response = await conversation.start_task(agent=spec, user_input=prompt)
+        # 让对话总管新开一页，跑完这个任务，把最终答复拿回来
+        #   system prompt 由 start_task 用 agent_spec.build_system_prompt() 拼，
+        #   这里不再自己拼一遍（两处拼会不一致）。
         # 让对话总管新开一页，跑完这个任务，把最终答复拿回来
 
         self._has_initialized_task = False  # 灯灭掉，表示子任务结束了
@@ -146,12 +157,46 @@ class Task(BaseTool):
           现在登记表里有什么就写什么，说明和代码不会再对不上。
         """
         lines = []  # 每个类型一行
-        for prompt_type in self._subagent_manager.list_types():  # 遍历登记表
-            purpose, tools = self._subagent_manager.describe(prompt_type)  # 取用途和可用工具
-            lines.append(f"- {prompt_type}：{purpose}（可用工具：{tools}）")
+        # 【第 18 轮】改成遍历 spec，一行里同时给出「用途 / 工具 / 模型」。
+        #   为什么要显示工具：主 agent 能据此判断"派给它够不够用"，
+        #   比如 explore 没有 cmd_runner，需要跑命令时就不该派给 explore。
+        #   为什么要显式写出模型：同一个任务换个便宜模型能省钱，
+        #   而"继承"两个字让主 agent 知道它没被特殊对待。
+        for spec in self._subagent_manager.list_specs():
+            purpose = spec.description
+            if len(purpose) > MAX_DESCRIPTION_CHARS:
+                # 截断理由：这段文字进的是 tools 字段，每次请求都发。
+                # 类型越多、描述越长，固定开销越大，而主 agent 判断"该不该派"
+                # 看前一两句就够了。
+                purpose = purpose[:MAX_DESCRIPTION_CHARS].rstrip() + "…"
+            lines.append(
+                f"- {spec.name}：{purpose}（工具：{spec.tools_text()}；模型：{spec.model_text()}）"
+            )
         if not lines:  # 一个类型都没有（理论上不会发生）
             return "- （当前没有登记任何类型，请不要使用这个工具）"
         return "\n".join(lines)
+
+    def _selection_hint(self):
+        """拼出「怎么选类型」的引导（第 18 轮新增）
+
+        为什么要动态生成而不是写死一段说明：
+          第 8.1 轮踩过一次——说明书里写着 code-reviewer、greeting-responder，
+          但代码里根本没登记，模型照着示例派活，然后收到"类型不存在"。
+          这里只在类型**确实存在**时才给建议，宁可不写，也不给不存在的选项。
+        """
+        hints = []
+        registered = self._subagent_manager.list_types()
+        if "explore" in registered:
+            hints.append("- 只想知道「东西在哪、谁调用了谁」→ explore：只读、不弹审批、最省事")
+        if "plan" in registered:
+            hints.append("- 要「先讲清楚怎么改再动手」→ plan：只读调研，产出分步方案")
+        if "code-reviewer" in registered:
+            hints.append("- 改完想让人挑错 → code-reviewer：只读审查，按严重度给意见")
+        if "general-purpose" in registered:
+            hints.append("- 需要边查边改、或者要跑命令 → general-purpose（兜底，拿不准就选它）")
+        if not hints:
+            return ""
+        return "怎么选类型：\n" + "\n".join(hints) + "\n\n"
 
     def _tool_description(self):
         # 这段是告诉模型"什么时候该派活、什么时候不该派"的说明书。
@@ -168,7 +213,7 @@ class Task(BaseTool):
 可用的 agent 类型及其可用的工具：
 {self._types_block()}
 
-使用 task 工具时，必须指定 subagent_type 参数来选择用哪种 agent。
+{self._selection_hint()}使用 task 工具时，必须指定 subagent_type 参数来选择用哪种 agent。
 
 以下情况适合用：
 - 需要在大范围代码库里找一个你几次尝试都没定位到的东西
