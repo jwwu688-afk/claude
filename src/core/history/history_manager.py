@@ -318,7 +318,15 @@ class BaseHistoryManager(ABC):
                 if not self._snip_oldest_round():  # 没得剪了，退出本层
                     break
         # elif tier == 2:  # ③ L3 预留位：后续批次接入（旧工具结果二次瘦身）
-        # elif tier == 3:  # ④ L4 预留位：后续批次接入（只读投影）
+        #
+        # ④ L4（tier == 3，占用 0.90~0.95）：这里「故意留空」，不做任何事。
+        #   为什么留空？因为 L4 是「只读投影」，它不改 messages_history 存储，
+        #   而是「发请求时换个压缩视图」。这个动作不在压缩链里做，而是由
+        #   conversation.py 的 _get_messages_with_cache_mark 在发请求前通过
+        #   should_use_projection() 判断后调用 get_projection() 完成。
+        #   所以 tier == 3 这一档「落点」的活，其实已经被发请求路径接走了，
+        #   压缩链里自然无事可做——留空即是正确行为，不是没实现。
+        #
         elif tier == 4:
             # ⑤ L5：压力已到 0.95，才调模型做全量摘要（最贵，兜底）。
             await self._compress_current_message()
@@ -524,6 +532,67 @@ class HistoryManager(BaseHistoryManager):
         # 为什么要复制？因为调用方（比如加缓存标记）会修改返回的列表，
         # 不复制的话会把原始记录也改掉
 
+    def get_projection(self, recent_rounds: int = 3) -> list:
+        """L4 Context Collapse：生成一份「只读投影」，不改底层存储（2026-11-09 五层压缩第 2 批）
+
+        核心思想（对齐 Claude Code 的 Context Collapse）：
+          底层 messages_history[-1] 一字不动，这里只返回一份「压缩视图」给模型看。
+          原始数据始终完整保留，随时可以 rewind 到完整历史——这是它和 L2/L3/L5
+          最大的不同：那三层都是"真删/真改存储"，这一层是"只换视角、不动数据"。
+
+        投影规则（recent_rounds=3，已和用户确认）：
+          - system 消息：全部保留（规则设定永远不能丢）。
+          - 最近 3 轮对话：完整保留（当前正在推进的工作，细节都要）。
+          - 更早的对话：折叠成一条"骨架公告"，只留早期 user 消息的文字作为"历史任务线索"，
+            丢弃早期 assistant 的思考、tool 调用细节和 tool 结果——这些已经被消化过，且可重取回。
+
+        为什么要保留早期 user 消息的文字？
+          早期每轮 user 消息通常是"一个已完成的子任务的目标"，保留它们能让模型
+          知道"之前一路做了哪些事"，而不用保留每一步的详细过程。这正是投影的意义：
+          留"结论/目标"、去"过程/细节"。
+
+        返回值是一份深拷贝出来的新列表，和 messages_history 完全解耦，
+        调用方怎么改它都不会影响底层存储。
+        """
+        current_messages = self.messages_history[-1]  # 底层存储（只读，不动它）
+
+        # 找出所有 user 消息的位置，用来界定"最近 recent_rounds 轮"的起点。
+        user_indices = self._get_user_message_indices(current_messages)
+        if len(user_indices) <= recent_rounds:
+            # 对话轮数本来就 <= recent_rounds，没有"更早期"需要折叠，直接返回完整副本。
+            return copy.deepcopy(current_messages)
+
+        # 第 (len - recent_rounds) 个 user 消息，就是"最近 recent_rounds 轮"的第一句。
+        # 例：共 10 轮、recent_rounds=3 → 从第 7 个 user 消息（下标 user_indices[7]）开始是最近 3 轮。
+        recent_start = user_indices[len(user_indices) - recent_rounds]
+
+        # —— 拆成三段：早期（折叠）+ 近期（保留）——
+        early = current_messages[:recent_start]   # 更早的部分（要被折叠）
+        recent = current_messages[recent_start:]  # 最近 recent_rounds 轮（完整保留）
+
+        # system 消息全保留（它们可能在 early 里，也可能单独）。
+        system_messages = [msg for msg in early if _role(msg) == Role.SYSTEM]
+
+        # 早期部分里，只抽取 user 消息的文字，作为"历史任务线索"。
+        early_user_texts = []
+        for msg in early:
+            if _role(msg) == Role.USER:
+                text = message_text(msg).strip()
+                if text:
+                    early_user_texts.append(text)
+
+        # 折叠公告：把早期 user 消息的目标拼成一条骨架，告诉模型"之前做过这些事"。
+        if early_user_texts:
+            skeleton = "以下是更早对话的任务线索（详细过程已折叠，如需可重新查看）：\n" + "\n".join(
+                f"- {t}" for t in early_user_texts
+            )
+        else:
+            skeleton = "（更早的对话已折叠，无用户输入线索）"
+        skeleton_notice = make_note_message(skeleton)
+
+        # 投影 = system + 骨架公告 + 近期完整对话。返回的是全新列表，与底层存储解耦。
+        return system_messages + [skeleton_notice] + copy.deepcopy(recent)
+
     def start_new_chat(self) -> None:
         self.messages_history.append([])  # 新开一页空纸
         self.history_token_usage.append(TokenUsage(0, 0, 0))  # 新页面的用量从 0 开始记
@@ -560,6 +629,29 @@ class HistoryManager(BaseHistoryManager):
         if not self.history_token_usage or self._model_max_tokens == 0:
             return 0.0
         return self.history_token_usage[-1].total_tokens / self._model_max_tokens
+
+    def should_use_projection(self) -> bool:
+        """判断「发请求时是否该用只读投影」而不是完整历史（2026-11-09 第 2 批新增）
+
+        和 auto_messages_compression 的"落点直做"是什么关系？
+          那是"占用到了就动手压缩"；而这一层 L4 是"不改存储、只在发请求时换个视图"。
+          两者是配套的：当占用落在 [micro_threshold, collapse_threshold) 这一段
+          （即 0.90 ~ 0.95，正是四档区间映射里的 L4 档），且 conversation 要发请求时，
+          就用投影替代完整历史——既不真删数据，又让模型只看到压缩后的样子，
+          从而省下这一轮请求的输入 token。
+
+        判断口径：占用落在 [micro_threshold, collapse_threshold) 之间（0.90 ~ 0.95）。
+          为什么是「下界 >= 0.90、上界 < 0.95」而不是单边？
+            0.90 是 L4 的触发线：占用到了这里，就说明 L2/L3 那两档的手段已经"不够用"，
+              该换"只读投影"这个更省输入 token 的视角了。
+            0.95 是 L5 的触发线：一旦 >= 0.95，就该走 auto_messages_compression 里的
+              L5（调模型全量摘要），那是"真删存储"，投影就该退场、不再抢戏。
+          所以投影只负责 [0.90, 0.95) 这一小段，上下去向都由别的层接管。
+        返回值只在 conversation 发请求前被读取，不影响任何存储。
+        """
+        ratio = self._current_usage_ratio()
+        # 落在 [micro_threshold, collapse_threshold) 区间才投影；>= collapse 交给 L5 摘要。
+        return self._micro_threshold <= ratio < self._collapse_threshold
 
     def _snip_oldest_round(self) -> bool:
         """L2 Snip：零成本「保两头、剪中间」（2026-11-09 五层压缩第 1 批，对齐 Claude Code snipCompact）

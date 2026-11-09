@@ -813,7 +813,16 @@ class Conversation:
           - 打两个断点：系统提示词（永远命中）+ 最后一条消息（增量命中）
           - 最多 4 个（Anthropic 的上限，多了会被拒绝）
         """
-        messages = self._history_manager.get_current_messages()  # 取出全部消息（是一份副本，随便改）
+        # 【2026-11-09 五层压缩第 2 批】按需用「只读投影」替代完整历史：
+        #   占用落在 [micro_threshold, collapse_threshold)（0.90~0.95，即 L4 档）时，
+        #   用 get_projection() 拿压缩视图发给模型，底层存储一字不动。
+        #   这是 L4 Context Collapse 的落地——不改数据、只换视角。
+        #   一旦 >= collapse_threshold（0.95），就交给 auto_messages_compression 的 L5
+        #   调模型全量摘要（真删存储），投影自动退场。
+        if self._history_manager.should_use_projection():
+            messages = self._history_manager.get_projection()
+        else:
+            messages = self._history_manager.get_current_messages()  # 取出全部消息（是一份副本，随便改）
         if not messages:  # 空列表没什么好标的
             return messages
         if not self._api_client.prompt_cache_enabled:  # 当前接口不支持缓存
