@@ -82,8 +82,8 @@ Thinker 跑在终端里，能读代码、改文件、执行命令、自己决定
 ### 1. 安装
 
 ```bash
-git clone git@github.com:jwwu688-afk/claude.git
-cd claude
+git clone git@github.com:jwwu688-afk/thinker.git
+cd thinker
 
 python -m venv .venv
 # Windows
@@ -314,7 +314,7 @@ Thinker 支持标准 [MCP](https://modelcontextprotocol.io)（stdio 传输）。
     "weather": {
       "type": "stdio",
       "command": "C:/Python312/python.exe",
-      "args": ["D:/code/claude/src/mcp_servers/weather.py"]
+      "args": ["D:/code/thinker/src/mcp_servers/weather.py"]
     }
   }
 }
