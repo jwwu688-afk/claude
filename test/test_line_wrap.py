@@ -125,10 +125,11 @@ class ScriptedEditor(LineEditor):
       第 18.8 轮进一步把输出喂给 FakeScreen，直接看最终屏幕有没有残字。
     """
 
-    def __init__(self, keys, cols=10, screen=None):
+    def __init__(self, keys, cols=10, screen=None, rows=20):
         self._keys = list(keys)
         self.notes = []
         self._cols = cols
+        self._rows = rows  # 【第 20.1 轮】留白按窗口高度算，测试必须注入固定行高
         self._screen = screen
         super().__init__(key_reader=self._next_key)
 
@@ -144,6 +145,9 @@ class ScriptedEditor(LineEditor):
 
     def _term_cols(self):  # 覆盖真实终端宽度，让结果不依赖跑测试的机器
         return self._cols
+
+    def _term_rows(self):  # 覆盖窗口高度，让留白行数在测试里是确定值
+        return self._rows
 
 
 def _assert_screen_clean(editor, screen, marker):
@@ -316,19 +320,51 @@ def test_no_negative_or_overflow():
 
 
 def test_bottom_padding_default():
-    """输入行下方默认留 4 行空白（第 18.8 轮从 2 调大）
+    """不设环境变量时，留白按窗口高度给半屏（第 20.1 轮）
 
-    留白行数同时也是"能往上滚几行"：conhost 一有输出就把视口拉回光标处，
-    滚过留白行数光标就出视口，敲字立刻弹回底部。2 行的体感就是"滚不动"。
-    断言直接看输出的字节序列，顺带钉住默认值，防止以后被改回去。
+    用户第二次反馈"只能往上滚一点点、回不到提问那行"：conhost 的滚动范围
+    ≈ 已写过的总行数 − 一屏，内容不足一屏时几乎滚不动，全靠底部留白撑。
+    固定 4 行不够，改成 max(8, 行数//2)。这里注入 20 行窗口 → 10 行留白。
     """
-    print("测试 留白: 默认 4 行")
+    print("测试 留白: 默认半屏（20 行窗口 → 10 行）")
 
-    editor = ScriptedEditor(["\r"], cols=10)  # 什么都不输入，直接回车
+    editor = ScriptedEditor(["\r"], cols=10, rows=20)  # 什么都不输入，直接回车
     editor.readline("")
     out = "".join(editor.notes)
 
-    assert out.startswith("\n\n\n\n\x1b[4A"), f"留白序列不对：{out[:12]!r}"
+    assert out.startswith("\n" * 10 + "\x1b[10A"), f"留白序列不对：{out[:16]!r}"
+
+    print("  ✓ 通过")
+
+
+def test_padding_scales_with_window():
+    """窗口越高留白越多；矮窗口至少保底 8 行"""
+    print("测试 留白: 跟随窗口高度")
+
+    for rows, expected in ((40, 20), (16, 8), (24, 12)):
+        editor = ScriptedEditor(["\r"], cols=10, rows=rows)
+        editor.readline("")
+        out = "".join(editor.notes)
+        assert out.startswith("\n" * expected + "\x1b[{}A".format(expected)), (
+            f"{rows} 行窗口应留 {expected} 行，实际：{out[:20]!r}"
+        )
+
+    print("  ✓ 通过")
+
+
+def test_padding_env_overrides_window():
+    """显式设置 THINKER_INPUT_PADDING 时以它为准（想滚更远就自己调）"""
+    print("测试 留白: 环境变量优先")
+
+    os.environ["THINKER_INPUT_PADDING"] = "3"
+    try:
+        editor = ScriptedEditor(["\r"], cols=10, rows=40)
+        editor.readline("")
+        out = "".join(editor.notes)
+        assert out.startswith("\n\n\n\x1b[3A"), f"环境变量没生效：{out[:16]!r}"
+        assert not out.startswith("\n" * 20), "不该再按窗口高度算"
+    finally:
+        os.environ.pop("THINKER_INPUT_PADDING", None)
 
     print("  ✓ 通过")
 
@@ -342,10 +378,9 @@ def test_bottom_padding_can_be_disabled():
         editor = ScriptedEditor(["\r"], cols=10)
         editor.readline("")
         out = "".join(editor.notes)
-        # 注意：回车本身会写一个 "\n"，所以不能断言"out 不以换行开头"。
-        # 要断言的是"没有留白那两个换行 + 上移"，即开头不是 "\n\n"。
-        assert "\x1b[2A" not in out
-        assert not out.startswith("\n\n")
+        # 关掉留白后，整段输出就只剩"直接回车"自己写的那一个换行。
+        # 这么断言比"不以 \n\n 开头"更严：连上移指令都不许漏出来。
+        assert out == "\n", f"关闭后不该有任何留白序列：{out!r}"
     finally:
         os.environ.pop("THINKER_INPUT_PADDING", None)
 
@@ -487,6 +522,8 @@ def run_all_tests():
         test_backspace_crosses_two_lines,
         test_bottom_padding_default,
         test_bottom_padding_can_be_disabled,
+        test_padding_scales_with_window,
+        test_padding_env_overrides_window,
         test_ansi_prompt_width,
         test_split_visible_lines,
         test_frame_pos,
