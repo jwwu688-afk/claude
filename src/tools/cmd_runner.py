@@ -31,6 +31,27 @@ MAX_TIMEOUT = 600  # 上限 10 分钟（防止模型传个几小时把程序挂�
 #   现在两处共用 core/limits.py 里的同一个数字（默认 30000，可用环境变量覆盖）。
 MAX_OUTPUT_CHARS = MAX_TOOL_OUTPUT_CHARS
 
+# 【2026-11-10 新增】输出捕获的字节预算（按下标 2 以下才安全：这条线限制的是"内存"，不是上下文）
+#
+# 为什么需要这组常量（这是对照 Claude Code 行为补上的一块）：
+#   原实现用 process.communicate() 一次性读完全部输出，读到内存里之后才由 _truncate 按字符截断。
+#   问题在"读完全部"这一步：跑 `dir /s C:\` 或 `npm install` 这类命令，输出可能有几百 MB——
+#   _truncate 是在几百 MB 已经全部进内存之后才执行的，等于防了个寂寞。
+#
+# 现在的方案：边读边收，每个流最多保留 MAX_STREAM_HEAD_BYTES（开头）+
+#   MAX_STREAM_TAIL_BYTES（结尾）两段，中间的字节只计数不保存。
+#   为什么保留头和尾而不是只留头：命令输出的"结论"几乎总在结尾（构建结果、测试汇总、报错堆栈），
+#   只留头会让模型拿不到最有用的那段。
+#
+# 数值怎么定的：上下文层每流最多展示 MAX_OUTPUT_CHARS（默认 30000 字符），
+#   头尾各 200000 字节（约 40 万字节/流）保证了"上下文要用的部分一定在捕获范围内"，
+#   多出来的字节是给"人眼看错误定位"留的余量；单条命令内存占用被钉死在 ~1MB 以内。
+#   为什么按字节而不是按字符：管道读出来就是字节，按字节计数不用边读边解码（多字节字符
+#   可能跨块，按字符算必须维护增量解码器，复杂度不值当；切缝处最多损失一个字符）。
+STREAM_CHUNK_SIZE = 65536        # 每次从管道读 64KB
+MAX_STREAM_HEAD_BYTES = 200_000  # 每个流保留开头的字节数
+MAX_STREAM_TAIL_BYTES = 200_000  # 每个流保留结尾的字节数
+
 
 # 【第 15.3 轮】识别"这条命令其实是在按文件名找文件"。
 #
@@ -126,23 +147,39 @@ class CmdRunner(BaseTool):
                 stderr=asyncio.subprocess.PIPE,  # 把错误输出也接出来
             )
 
+            # 【2026-11-10 改】输出改为"边读边收"（增量捕获），不再用 communicate() 一次读完。
+            #   为什么两个流要各自起一个 task 并同时读：
+            #     如果先读 stdout 再读 stderr，一旦 stderr 管道被写满（64KB 缓冲区），
+            #     子进程会卡在"往 stderr 写"上再也不往下走，stdout 也就再也没有新数据——
+            #     经典的管道死锁。两个 task 并发读，谁都不会把对方憋死。
+            stdout_task = asyncio.create_task(self._read_stream(process.stdout))
+            stderr_task = asyncio.create_task(self._read_stream(process.stderr))
+
             try:  # 再试一层：等命令跑完，但最多等 timeout 秒
-                stdout_bytes, stderr_bytes = await asyncio.wait_for(
-                    process.communicate(),  # 等命令结束并收齐所有输出
+                # 只等进程退出即可；输出的收集由上面两个读取 task 自己做，
+                # 它们读到 EOF（管道关闭）就会自然结束，和退出互不阻塞。
+                await asyncio.wait_for(
+                    process.wait(),
                     timeout=timeout  # 【2026-11-06 优化】这里才真正用上了 timeout 参数
                     # 原来的写法是 timeout=30，写死在代码里，参数传什么都等于没传
                 )
             except asyncio.TimeoutError:  # 等超时了
                 await self._kill_process_tree(process)  # 【2026-11-06 优化】连子进程一起杀掉
+                # 杀完之后管道会关闭，读取 task 会自己结束；给 3 秒收尾时间，
+                # 收不回来就取消（极端情况：有个杀不掉的孙进程还攥着管道句柄）。
+                await self._drain_readers((stdout_task, stderr_task))
                 return f"命令执行超时：等了 {timeout:g} 秒仍未结束，进程已被强制终止。"  # 告诉模型"超时了"
 
-            # 把字节转成文字（Windows 上命令输出常常是 GBK，不是 UTF-8，所以要猜）
-            stdout = self._decode(stdout_bytes)
-            stderr = self._decode(stderr_bytes)
+            # 进程已退出，管道随后关闭；等两个读取 task 跑完（通常此刻已接近 EOF）。
+            # return_exceptions=True：某个流读挂了（比如传输层提前关闭）不炸整个工具，
+            # 把它当"这个流什么都没读到"处理——另一条流的内容仍然有效。
+            results = await asyncio.gather(stdout_task, stderr_task, return_exceptions=True)
+            stdout = self._decode_captured(results[0])  # 标准输出 → 文字（超出预算的中间部分有省略标记）
+            stderr = self._decode_captured(results[1])  # 错误输出 → 文字
 
             if process.returncode == 0:  # returncode 是"退出码"，0 表示成功（这是命令行世界的约定）
                 if stdout.strip():  # 如果标准输出（正常结果）去掉空白后还有内容
-                    return self._truncate(stdout)  # 就返回结果（太长会被截断）
+                    return self._truncate(stdout)  # 就返回结果（超出上下文预算时按字符再截一道，兜底）
                 else:  # 命令成功了但什么都没输出
                     return "命令执行成功，但没有产生任何输出。"  # 告诉他"跑成功了，但没输出"
             else:  # 退出码不是 0，说明命令出错了
@@ -153,6 +190,85 @@ class CmdRunner(BaseTool):
                 return f"命令执行失败，退出码 {process.returncode}，没有任何错误输出。"  # 至少告诉他退出码
         except Exception as e:  # 其他任何意外
             return f"cmd_runner 工具执行时发生异常：{str(e)}"  # 返回错误信息
+
+    @staticmethod
+    async def _read_stream(stream) -> tuple:
+        """增量读取一条输出管道：保留头尾、只对中间计数（2026-11-10 新增）
+
+        为什么是这个形状（返回四元组而不是直接返回文字）：
+          解码要等读完全部字节才能做（多字节字符可能跨块），所以这里只攒字节；
+          把"攒了什么"交给 _decode_captured 统一处理，读和解码各管一段，测试也好写。
+
+        策略（详见文件头常量处的注释）：
+          · 总量不超过 头预算+尾预算 时：全部保留（绝大多数命令都落在这档）；
+          · 超过之后：开头 head 预算固定不动，结尾用滚动窗口只留最后 tail 预算——
+            `tail = (tail + chunk)[-MAX:]` 每次裁一刀，成本和窗口大小成正比，恒定有界；
+          · 中间被丢掉的字节只累计总数（dropped），最后以一行省略标记呈现。
+
+        参数 stream：asyncio 的 StreamReader（process.stdout 或 process.stderr）。
+        返回 (总字节数, 开头字节, 结尾字节, 被丢弃字节数)。
+        """
+        head = bytearray()  # 开头部分（命令"在干什么"）
+        tail = bytearray()  # 结尾部分（命令"结果如何"——通常才是最有用的）
+        total = 0           # 一共读到了多少字节（用于算 dropped）
+        while True:
+            chunk = await stream.read(STREAM_CHUNK_SIZE)
+            if not chunk:  # 读到 EOF：进程端关闭了管道
+                break
+            total += len(chunk)
+
+            # 还没填满头部预算：先往 head 里塞
+            if len(head) < MAX_STREAM_HEAD_BYTES:
+                take = min(len(chunk), MAX_STREAM_HEAD_BYTES - len(head))
+                head += chunk[:take]
+                chunk = chunk[take:]  # 剩下的部分继续走 tail 逻辑（可能为空）
+
+            # 剩余部分进入尾部滚动窗口：拼上之后只留最后 MAX_STREAM_TAIL_BYTES 个字节
+            if chunk:
+                tail = (tail + chunk)[-MAX_STREAM_TAIL_BYTES:]
+
+        dropped = total - len(head) - len(tail)
+        # dropped 不可能是负数：head 和 tail 里的每个字节都来自读到的 chunk。
+        # 防御性 max 一下，万一未来改窗口逻辑时不小心重复计了数，报个 0 也好过报负数。
+        return (total, bytes(head), bytes(tail), max(0, dropped))
+
+    def _decode_captured(self, captured) -> str:
+        """把 _read_stream 的捕获结果转成文字，超出预算的中间部分替换为省略标记
+
+        为什么要单独一层而不在 _read_stream 里直接解码：
+          解码失败要换编码再试（_decode 的逻辑），那个"试"针对的是一段完整字节；
+          head 和 tail 被窗口切过之后各自都可能把多字节字符切半，要分开解码、分开兜底，
+          最后再用省略标记拼起来。混在一起做会让"省略了多少字节"和"哪个编码成功"搅在一起。
+
+        参数 captured：_read_stream 的返回值；也可能是 gather 塞进来的 Exception
+          （某个流读挂了）——这时按"这个流什么都没读到"处理，不让另一条流白读。
+        """
+        if isinstance(captured, Exception):  # 读取 task 失败：当空输出处理
+            return ""
+        _total, head, tail, dropped = captured
+        if dropped <= 0:
+            # 没丢过任何字节：head+tail 拼起来就是完整输出，按原来的路子解码
+            return self._decode(head + tail)
+        # 丢过字节：头尾分别解码（切缝处最多损失一个多字节字符，_decode 的
+        # errors="replace" 兜底会把它换成一个 �，不影响大局），
+        # 中间用一行标记说清省略了多少——让模型知道"下面不是完整输出"。
+        return (
+            self._decode(head)
+            + f"\n... [输出过长，中间省略了 {dropped} 字节] ...\n"
+            + self._decode(tail)
+        )
+
+    @staticmethod
+    async def _drain_readers(tasks) -> None:
+        """给读取 task 一个收尾窗口，超时没结束就取消（2026-11-10 新增）
+
+        什么时候会被调：超时杀进程树之后。正常情况下 taskkill /T 杀掉整棵进程树，
+        管道随之关闭、读取 task 立刻 EOF；但万一有个杀不掉的进程还攥着管道句柄，
+        读取 task 会一直挂着——不能让它拦着"返回超时结果"这件事。
+        """
+        done, pending = await asyncio.wait(set(tasks), timeout=3)
+        for task in pending:  # 3 秒还没结束的：取消，宁可少收一段输出也要按时返回
+            task.cancel()
 
     @staticmethod
     async def _kill_process_tree(process):
@@ -185,10 +301,10 @@ class CmdRunner(BaseTool):
         except Exception:  # 其他异常也不用管，反正要返回了
             pass
 
-        try:  # 收一下残留输出，别让管道一直挂着
-            await asyncio.wait_for(process.communicate(), timeout=2)
-        except Exception:  # 收不回来就算了
-            pass
+        # 【2026-11-10 改】原来这里还有一段 `await process.communicate()` 收残留输出，
+        #   现在必须删掉：输出已经改成并发读取 task 在收（见 _execute），communicate 内部
+        #   会再次去读同一对管道，两处并发读同一个流会直接抛 RuntimeError。
+        #   收尾这件事移交给了调用方的 _drain_readers（杀完进程管道关闭，读取 task 自然 EOF）。
 
     @staticmethod
     def _decode(raw: bytes) -> str:

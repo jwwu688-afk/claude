@@ -295,10 +295,27 @@ def _print_help(conversation) -> None:
     specs = sorted(REGISTRY.values(), key=lambda s: s.name)
     width = max(_display_width(spec.usage) for spec in specs)
 
+    # 【第 21.12 轮】摘要的截断挪到显示层、按「列数」算：
+    #   CommandSpec.summary 存的是压平后的全文（可能在注册时是英文长描述），
+    #   这里按终端实际宽度算出每行摘要的预算，超宽补省略号。
+    #   为什么不在注册时截：终端宽度是显示期才知道的事，注册期截死了，
+    #   换个宽度的终端要么浪费要么照旧折行（21.11 在 /skills 上付过的学费）。
+    #
+    # 【第 21.13 轮】预算里必须算上 **print_info 自带的圆点前缀（● + 空格 = 2 列）**
+    #   和 4 列安全边距。21.12 首版漏了圆点：行宽正好顶满 rich 的换行阈值，
+    #   rich 在"用法列和摘要之间的空格"处断行 → 整段摘要被挤到第二行顶格，
+    #   这就是用户截图里"摘要跑到第二行"的机制。上一轮 /skills 的偶发折行同理——
+    #   差的那 2 列让一部分行恰好越界，看起来像随机发生。
+    #   4 列边距：全角引号、表情符号这类"显示宽度难以精确预测"的字符兜底。
+    from ui.theme import console  # 局部导入：命令层其余部分不依赖 rich
+
+    summary_cols = max(20, console.width - 2 - 2 - width - 2 - 4)
+
     ui.print_info("可用命令：")
     for spec in specs:
         padding = " " * (width - _display_width(spec.usage))  # 按显示宽度补，不按字符数补
-        ui.print_info(f"  {spec.usage}{padding}  {spec.summary}")
+        summary = _truncate_by_width(spec.summary, summary_cols)
+        ui.print_info(f"  {spec.usage}{padding}  {summary}")
 
     ui.print_info("")
     # 这句不是装饰：用户第一次看到斜杠命令，最想知道的是
@@ -309,7 +326,10 @@ def _print_help(conversation) -> None:
     #   当成用户消息发出去、还按输入计费——不说清楚，这是最容易被当成 bug 的地方。
     #   只在真的登记了技能命令时才提这一句，没技能的用户不该被这个概念打扰。
     if _skill_command_names:
-        ui.print_info("技能命令（.thinker/skills 里那些）例外：它把技能正文当成你说的这句话发给模型。")
+        # 【第 21.13 轮】这句刻意很短：说明文字也会折行，顶到终端宽度时
+        #   续行顶格、和命令列表混在一起，看起来像"格式乱了"（用户截图的观感）。
+        #   哪些命令是技能，列表本身已经体现了；这里只留最关键的一句例外说明。
+        ui.print_info("技能命令例外：它把技能正文当成你说的这句话发给模型。")
     # 【第 16 轮】Tab 补全是个"隐形的功能"：不写在任何地方，用户永远不会发现。
     # 而 help 恰好是他会主动打开的地方，放在这里最省事。
     ui.print_info("输入 / 开头之后按 Tab，可以补全命令名（唯一匹配会直接补上）。")
@@ -866,20 +886,22 @@ def _skill_summary_text(description: str, max_cols: int = 60) -> str:
 
 
 def _one_line_summary(description: str) -> str:
-    """把技能描述压成 /help 里能放的一行摘要
+    """把技能描述压成单行文本（存进 CommandSpec.summary，2026-11-10 第 21 轮新增）
 
-    为什么要压：
-      /help 是"教用户有哪些命令"的清单，一行一条。描述里要是有换行，
-      整个列表的对齐就乱了；太长则会把后面的说明顶出屏幕。
-    为什么截 40 字：usage 列通常十几列，终端按 80 列算，剩给摘要的就这么多。
-      超出部分在 /skills 里能看到全文——那里才是"了解一个技能"的地方。
+    【第 21.12 轮】这里**不再截 40 字**，只负责把换行/连续空格压平——
+      截断挪到了 _print_help 的显示层按「列数」算。
+      为什么挪：40 个汉字占 80 列，加上用法列就超出终端宽度（用户截图抓到的：
+      /frontend-design 的摘要整段折到第二行）。字符数和显示宽度不是一回事，
+      这条教训 21.11 在 /skills 上已经付过一次学费，/help 不能再犯。
+      为什么保留"压平"：description 可能是多行块（`|`），不压平的话
+      一条命令会占好几行，列对齐全毁。
     """
     text = " ".join((description or "").split())  # 换行、连续空格压成单个空格
     if not text:
         # 没写描述不是错误（技能仍能用 /名字 手动调用），但摘要位不能空着，
         # 否则 /help 那一行看起来像渲染坏了。
         return "（技能没有写描述）"
-    return text[:40] + ("…" if len(text) > 40 else "")
+    return text
 
 
 def _make_skill_handler(name: str):
@@ -1083,15 +1105,18 @@ async def cmd_skills(conversation, args: str) -> None:
         #   · 摘要砍掉"触发：…"尾巴并截到 46 字：触发词是给**模型**挑技能用的，
         #     人浏览列表只需要知道"这是干什么的"，一条命令一项，基本不折行。
         name_width = max(_display_width(spec.name) for spec in specs)
-        # 【第 21.11 轮】摘要列宽按**终端实际宽度**动态算，不再写死 46 字符：
-        #   一行的总列数 = 前缀(2) + "/"(1) + 名字列 + 间隔(2) + 标签 + 空格(1) + 摘要。
-        #   用 rich 的 console.width 拿当前终端列数（命令一定跑在终端里，拿得到）；
-        #   再留 2 列余量防边界。终端窄（比如 80 列）时摘要自动变短，宽时自动变长。
+        # 【第 21.11 轮】摘要列宽按**终端实际宽度**动态算，不再写死 46 字符。
+        # 【第 21.13 轮】预算里必须算上 **print_info 自带的圆点前缀（● + 空格 = 2 列）**
+        #   和 4 列安全边距——上一版没算这两处，行宽恰好越界 2 列，
+        #   rich 在"名字列和摘要之间的空格"处断行，表现为"有的行突然折行"（用户截图实测）。
+        #   4 列边距：给全角引号这类"显示宽度难以精确预测"的字符兜底。
+        #   预算口径用 rich 的 console.width：**实际做折行的是 rich**，
+        #   预算和折行必须用同一个宽度口径，否则永远差那么两列。
         from ui.theme import console  # 局部导入：commands.py 其余部分不依赖 rich 的宽度
 
         tag_width = _display_width("[全局]")  # 两种来源标签显示宽度相同（各含 2 个汉字）
-        overhead = 2 + 1 + name_width + 2 + tag_width + 1
-        summary_cols = max(20, console.width - overhead - 2)
+        overhead = 2 + 2 + 1 + name_width + 2 + tag_width + 1 + 4
+        summary_cols = max(20, console.width - overhead)
         for spec in specs:
             # 标记位拼成一段括号，比每个技能打好几行更省屏幕。
             flags = []

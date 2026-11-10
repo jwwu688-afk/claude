@@ -11,13 +11,20 @@ description = "Thinker - a terminal coding agent"
 #   它们在 3.8 上会在模块导入时求值失败（TypeError: 'type' object is not subscriptable）。
 #   声明一个跑不起来的下限，比不声明更坑人——照着装的人会以为是自己环境坏了。
 requires-python = ">=3.9"
+# 【2026-11-10】依赖从裸包名改为"实测版本下限"。
+#   之前不写版本号的隐患：openai / mcp 这类 SDK 迭代很快，上游一个破坏性变更
+#   会让 `pip install thinker` 装出一个跑不起来的最新版——和上面 requires-python
+#   的教训同理："声明一个跑不起来的下限，比不声明更坑人"。
+#   下限取的是当前开发环境（D:/Anaconda/envs/thinker）里实际在跑、全套测试通过的版本：
+#   这些版本是"已验证能工作"的最低保证；更高的版本一般也兼容，但 >= 只承诺下限。
+#   注意 mcp 尤其要盯着：它还在 1.x 快速演进期，API 变动频繁，升级前先跑全量测试。
 dependencies = [
-    "openai",
-    "python-dotenv",
-    "mcp",
-    "rich",
-    "anthropic",
-    "httpx",
+    "openai>=1.99.5",
+    "python-dotenv>=1.1.1",
+    "mcp>=1.14.1",
+    "rich>=14.1.0",
+    "anthropic>=0.68.0",
+    "httpx>=0.28.1",
 ]
 
 [tool.setuptools]
