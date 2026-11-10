@@ -41,7 +41,10 @@ from rich.text import Text  # 富文本：可以给一段文字的不同部分�
 # 【第 18 轮】0.8.0 → 0.9.0：子 agent 类型化（.thinker/agents/*.md + 工具白名单 + 模型覆盖）。
 # 【第 17 轮】0.7.2 → 0.8.0：五层压缩（L2/L3/L4 三个新层）+ 压缩补测。小版本号进位理由：
 #   这是一次"行为可见"的功能级变更，压缩会真的删消息/换视图，不是补丁。
-VERSION = "0.9.4"  # 【第 18.8 轮】输入层受控分帧重绘 + 留白调大；启动时 banner 会显示，便于确认真机跑的是新代码
+# 【2026-11-10 第 21 轮】0.9.4 → 0.10.0：技能机制（.thinker/skills + skill 工具 + /技能名）。
+#   进位理由同第 17 轮：这是一次功能级变更，而且是**纯增量**——
+#   没有技能的用户看到的行为一字不变（工具不登记、提示词不加段、REGISTRY 里不多命令）。
+VERSION = "0.10.0"  # 【第 21 轮】技能机制；启动时 banner 会显示，便于确认真机跑的是新代码
 
 
 def _readable_dir(path: str) -> str:
@@ -111,6 +114,7 @@ def welcome():
 async def main(resume_path=None):
     # 定义主函数。前面带 async 表示它是"异步函数"，里面有等网络的操作也不会卡住界面
     welcome()  # 先画欢迎框
+    _print_skill_hint()  # 【第 21 轮】有技能就提一行，否则用户根本不知道这个功能存在
     conversation = Conversation()  # 先创建对话总管，后面收尾时还要用到它
     try:
         await conversation.start_conversation(resume_path)
@@ -139,6 +143,39 @@ def run_continue():
     return path
 
 
+def _print_skill_hint():
+    """有技能时在欢迎区下面提一行（2026-11-10 第 21 轮新增）
+
+    为什么值得单独打一行：
+      技能是纯文件驱动的功能——用户不建 .thinker/skills/ 目录，就永远看不到它，
+      也就不会想到去建。这和第 16 轮 Tab 补全的情况一样：功能做得再好，
+      不写在用户会看的地方等于没做。
+      刻意放在欢迎框下面而不是框里：框里只有三行（标题/模型/目录），
+      加进去会把那个干净的版式撑乱。
+
+    扫描失败为什么只打一行、不让程序退出：
+      技能是**附加功能**。目录读不了（权限、编码）时，用户的核心诉求
+      "跟模型对话"完全不受影响，为此拒绝启动属于本末倒置。
+      但也绝不能静默——静默降级等于把 bug 藏起来（第 16.1 轮的教训），
+      所以往 stderr 打一行，带上异常类型。
+    """
+    try:
+        from tools.skill.skill_manager import SkillManager
+
+        count = SkillManager().count()
+    except Exception as error:  # 扫描期的任何意外都不该拦住启动
+        print(f"[skills] 扫描技能目录失败（已跳过）：{type(error).__name__}: {error}")
+        return
+
+    if count:
+        console.print(
+            Text(
+                f"  已加载 {count} 个技能 · /skills 查看 · 输入 / 后按 Tab 可补全",
+                style=DIM,
+            )
+        )
+
+
 def cli():
     # 定义命令行入口函数。pyproject.toml 里配置的 thinker 命令，指向的就是这个函数
     argv = sys.argv[1:]
@@ -164,6 +201,17 @@ def cli():
     resume_path = None
     if "--continue" in argv or "-c" in argv:
         resume_path = run_continue()
+
+    # 【第 21 轮】把 .thinker/skills 下的技能登记成斜杠命令。
+    #   为什么必须在进对话之前：/help 和 Tab 补全都读 REGISTRY，
+    #   晚一步登记，用户在第一个输入提示符上就看不到技能命令——
+    #   而"第一个提示符"正是他唯一会去按 Tab 试试的时候。
+    #   为什么不用 try：登记失败通常意味着技能目录读不了，那种情况下
+    #   少几条命令不影响对话；但吞掉异常就没人知道技能失效了。
+    #   所以只在真正扫描/登记的地方兜异常（见 _print_skill_hint 的注释），这里不包。
+    from core.commands import register_skill_commands
+
+    register_skill_commands()
 
     try:
         asyncio.run(main(resume_path))

@@ -46,6 +46,15 @@ class ToolManager:
             self._register_tool(SmartContextCropper.get_tool_name(), SmartContextCropper())  # 登记裁剪工具
             self._register_tool(TodoWrite.get_tool_name(), TodoWrite())  # 登记待办工具
             self._register_tool(Task.get_tool_name(), Task())  # 登记子任务工具
+            # 【2026-11-10 第 21 轮】技能工具**按需**登记：磁盘上一个技能都没有时不登记。
+            #   为什么不像别的工具那样无条件登记：
+            #     工具的 description 字段每一轮请求都要发，而 skill 的说明书里
+            #     还嵌着「可用技能」清单。没有技能时那份说明书纯属白烧 token
+            #     （约 400 token/轮），模型还会去调一个永远返回"没有技能"的工具。
+            #   代价：/skills reload 之后新出现的技能要把工具补登记进去，
+            #     那会让 tools 清单变一次、前缀缓存失效一次——一次性代价，
+            #     由 refresh_skill_tool() 负责，已在该方法里写明。
+            self.refresh_skill_tool()
             self._register_tool(CmdRunner.get_tool_name(), CmdRunner())  # 命令行工具：跑命令、跑测试、git 操作
             # 【2026-11-06 第 8 轮】五个文件工具排在最后登记。
             #   按上面"越重要越晚登记"的约定：现在读/改文件是最高频的操作，
@@ -92,6 +101,48 @@ class ToolManager:
 
     def _register_tool(self, name, tool_instance):
         self.tools[name] = tool_instance  # 就是往字典里塞一条
+
+    def refresh_skill_tool(self) -> bool:
+        """按「磁盘上有没有技能」登记或摘掉 skill 工具（2026-11-10 第 21 轮新增）
+
+        返回值：True 表示这次**新登记**了 skill 工具。
+
+        为什么需要这个方法，而不是在 __init__ 里判断一次就完事：
+          /skills reload 会重新扫目录。启动时 0 个技能、之后用户新建了一个，
+          此时工具表里还没有 skill——不补登记的话，用户会遇到
+          "技能列表里看得见、模型却调不动"这种自相矛盾的状态。
+
+        为什么补登记要专门说一句"代价"：
+          工具清单在提示词缓存的**前缀**里。清单从 9 个变 10 个，前缀变了，
+          下一轮缓存命中归零、按原价计费一次。这是一次性代价，
+          但改这块的人必须知道它存在，否则会把"reload 之后突然贵了一下"当 bug 查。
+
+        摘掉那一路（0 个技能）现在其实是空转：reload 只能让技能变多或变少，
+          真删到 0 个时工具留在表里也只是"说明书里写着没有可用技能"。
+          但留着这一行是有意的——它让"工具表 = 技能数量"这个不变量成立，
+          以后别处想直接改工具表时，先看到这里有一条现成的收口。
+        """
+        # 局部 import：skill 子包会读 core.limits，而 core.commands 又可能回调本模块拿工具表。
+        # 放文件头会让"工具管理器 → 技能 → 命令"这条链在导入期成形，以后加东西容易成环。
+        from tools.skill.skill_manager import SkillManager
+        from tools.skill_tool import Skill
+
+        try:
+            has_skill = SkillManager().count() > 0
+        except Exception as error:
+            # 技能是**附加功能**：目录读不了（权限、编码、盘符被拔）时，
+            # 用户的核心诉求"跟模型对话"完全不受影响，为此让启动崩掉是本末倒置。
+            # 但也绝不能静默——静默降级等于把 bug 藏起来（第 16.1 轮的教训），
+            # 所以往 stderr 打一行，带上异常类型。
+            print(f"[skills] 扫描技能失败（本次不登记 skill 工具）：{type(error).__name__}: {error}")
+            return False
+
+        if has_skill and Skill.get_tool_name() not in self.tools:
+            self._register_tool(Skill.get_tool_name(), Skill())
+            return True
+        if not has_skill:
+            self.tools.pop(Skill.get_tool_name(), None)
+        return False
 
     async def get_tools_description(self, exclude=None, allow=None):
         """Return the tool schemas to put in request["tools"].（生成要发给模型的工具清单）

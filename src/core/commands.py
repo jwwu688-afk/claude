@@ -48,7 +48,7 @@
 #   其中两种根本没登记，模型照着示例派活，一直报"类型不存在"。
 #   那次之后，凡是"有几项、分别是什么"的东西，都改成从登记表里取。
 #
-# 【五、边界：分两批落地】
+# 【五、边界：分三批落地】
 #   第一批（第 14 轮）只做"纯读"：/memory /resume /init /cost。
 #   第二批（第 14.5 轮）加了会**改上下文**的两条：
 #     /compact 手动压缩 —— 会把旧对话换成摘要；
@@ -56,6 +56,18 @@
 #   为什么必须分两批：前四条的失败最多是"某个数字不对"，
 #   这两条的失败是"历史被改坏，后面每轮请求都 400"。
 #   风险等级不一样，混在一批里做，回归挂了没法二分定位是哪一条引起的。
+#
+#   第三批（第 21 轮）是"技能登记成命令"：
+#     磁盘上每有一个技能（.thinker/skills/ 下的 SKILL.md），就登记一条 /技能名。
+#     它的 handler 不打印正文、也不直接调模型，只把渲染好的正文放进
+#     Conversation 的"待发消息"槽位——斜杠命令"不进历史、不计费"的老规矩
+#     （第 14 轮）因此一字不动，而技能正文走的正是普通用户消息那条路。
+#
+# 【六、为什么技能必须有真命令，不能在 handle_command 里兜底查】
+#   /help 和 Tab 补全都遍历 REGISTRY。如果技能只在"未知命令"分支里被兜住，
+#   它们既不会出现在 /help 里、也不会被 Tab 补全——用户永远发现不了。
+#   第 8.1 轮的教训是"有几项、分别是什么"必须从登记表取；
+#   这次要保证"技能也是登记表里的"，就只能真的登记进去。
 # =============================================================================
 
 import os  # /resume 按 cwd 过滤"本项目的会话"；/init 要拼 THINKER.md 的路径
@@ -111,6 +123,30 @@ def register(spec: CommandSpec) -> None:
       真出问题时，"后注册的赢"也是最好理解的规则。
     """
     REGISTRY[spec.name] = spec
+
+
+# 【2026-11-10 第 21 轮】技能命令名台账。
+#   为什么要记：技能是磁盘上的文件，会增会删。/skills reload 时如果只"补登记新的"，
+#   已经删掉的那个技能仍留在 REGISTRY 里——用户敲 /old-name 会得到
+#   "技能已经不在了"，看起来像 reload 根本没生效。
+#   所以重新登记前，先按这个集合把上一轮登记的技能命令整体撤掉。
+#
+#   为什么不用"扫一遍 REGISTRY，凡是 handler 是技能的就删"：
+#     那要靠函数的 __name__ 或某种标记来认人，脆弱且难读。
+#     一份显式的名字集合，读代码的人一眼就知道它管什么。
+_skill_command_names: set = set()
+
+
+def builtin_command_names() -> set:
+    """内置命令名（= 注册表里除去技能登记的那些）
+
+    谁在问：SkillManager 扫描时用来拦"技能和内置命令重名"（比如一个叫 cost 的技能）。
+    为什么要减掉 _skill_command_names：
+      否则同名判断会把"上一轮自己登记过的技能命令"当成内置命令，
+      于是 reload 之后一个技能会因为跟它自己的旧命令重名而被拒载——
+      表现为"第一次能用，reload 一次就消失了"。
+    """
+    return {name for name in REGISTRY if name not in _skill_command_names}
 
 
 def is_command(text: str) -> bool:
@@ -268,6 +304,12 @@ def _print_help(conversation) -> None:
     # 这句不是装饰：用户第一次看到斜杠命令，最想知道的是
     # "它会不会也被记进对话、也被计费"。直接说清楚，省得他去试探。
     ui.print_info("斜杠命令在本地处理，不会发给模型，也不占上下文。")
+    # 【2026-11-10 第 21 轮】技能命令是**唯一**的例外，上面那句话对它不成立。
+    #   必须写出来：用户看到 /pdf 以为"本地处理不花钱"，结果它把两千字正文
+    #   当成用户消息发出去、还按输入计费——不说清楚，这是最容易被当成 bug 的地方。
+    #   只在真的登记了技能命令时才提这一句，没技能的用户不该被这个概念打扰。
+    if _skill_command_names:
+        ui.print_info("技能命令（.thinker/skills 里那些）例外：它把技能正文当成你说的这句话发给模型。")
     # 【第 16 轮】Tab 补全是个"隐形的功能"：不写在任何地方，用户永远不会发现。
     # 而 help 恰好是他会主动打开的地方，放在这里最省事。
     ui.print_info("输入 / 开头之后按 Tab，可以补全命令名（唯一匹配会直接补上）。")
@@ -763,6 +805,200 @@ async def cmd_agents(conversation, args: str) -> None:
 
 
 # =============================================================================
+# 九、技能（2026-11-10 第 21 轮）
+#
+# 这一节只做两件事：
+#   1. 把磁盘上的技能登记成斜杠命令（register_skill_commands）；
+#   2. /skills —— 看清楚现在加载了什么、哪些字段没生效、扫描时出了什么问题。
+#
+# 技能的正文怎么渲染、同名怎么覆盖、目录在哪，都在 tools/skill/ 里。
+# 命令层不重复实现那些规则，只取"已经扫好的清单"。
+# =============================================================================
+
+def _one_line_summary(description: str) -> str:
+    """把技能描述压成 /help 里能放的一行摘要
+
+    为什么要压：
+      /help 是"教用户有哪些命令"的清单，一行一条。描述里要是有换行，
+      整个列表的对齐就乱了；太长则会把后面的说明顶出屏幕。
+    为什么截 40 字：usage 列通常十几列，终端按 80 列算，剩给摘要的就这么多。
+      超出部分在 /skills 里能看到全文——那里才是"了解一个技能"的地方。
+    """
+    text = " ".join((description or "").split())  # 换行、连续空格压成单个空格
+    if not text:
+        # 没写描述不是错误（技能仍能用 /名字 手动调用），但摘要位不能空着，
+        # 否则 /help 那一行看起来像渲染坏了。
+        return "（技能没有写描述）"
+    return text[:40] + ("…" if len(text) > 40 else "")
+
+
+def _make_skill_handler(name: str):
+    """造一条技能命令的处理函数
+
+    参数 name：技能名。用闭包固定住，而不是从 args 里解析——
+      args 是"用户给的参数"（文件路径之类），技能名是"用户点了哪条命令"，
+      两者在 parse() 里已经分开了，再混回去等于把命令名当成参数。
+
+    这个 handler 只做三件事：
+      1. 现取一次 spec（可能在扫描之后被删了，所以要判空）；
+      2. 渲染正文（现读文件 + 变量替换 + 截断，和 skill 工具走同一个函数）；
+      3. 把正文放进 Conversation 的"待发消息"槽位。
+    它**不打印正文、不直接调模型**——正文由主循环当用户这一句发出去，
+    这样它才会进历史、下一轮模型还记得自己读过。
+    """
+
+    async def handler(conversation, args: str) -> None:
+        # 局部 import：和本文件其它命令一样，避免命令模块在导入期就拖进工具子包
+        # （tools/skill 会读 core.limits，将来也可能反向引用提示词）。
+        from tools.skill.skill_manager import SkillManager
+
+        manager = SkillManager()
+        ui = conversation._ui_manager
+        spec = manager.get(name)
+
+        if spec is None:
+            # 扫描之后文件被删掉的情况。不自动 reload：用户可能正在整理技能目录，
+            # 悄悄重扫会让"我刚删了它却又能用"更难理解。给一句明确的下一步即可。
+            ui.print_error(f"技能 '{name}' 已经不在了（可能刚被删除）。执行 /skills reload 刷新。")
+            return
+
+        body = manager.load_body(spec, args)
+        # 前缀标一行来源：模型看到这段文字时能区分"这是技能正文"和"这是用户自己写的"，
+        # 排查上下文时也一眼能找到技能是从哪一轮进来的。
+        conversation.set_pending_input(f"[技能已加载：{name}]\n{body}")
+
+        # 给用户一行回执。为什么不打印正文：正文动辄上千字，刷满屏幕之后
+        # 用户既看不到自己的输入，也不知道到底加载成功没有。一行长度就是最好的确认。
+        ui.print_info(f"已加载技能 /{name}（正文 {len(body):,} 字符），下面按它的步骤做。")
+
+    return handler
+
+
+def register_skill_commands() -> int:
+    """把磁盘上的技能登记成斜杠命令，返回本次登记了几条
+
+    什么时候调：
+      · main.cli() 启动时一次；
+      · /skills reload 时再一次。
+    两处都走这个函数，是为了避免"启动时和 reload 时行为不一致"——
+    那类问题最典型的表现是"重启好了、reload 没好"，而两者本该是同一件事。
+
+    为什么整批撤掉再登记，而不是只补新的：
+      技能文件会被删。只补不撤的话，删掉的 /old-name 还在 REGISTRY 里，
+      一敲就报"技能不存在"，看起来像 reload 没生效（见 _skill_command_names 的说明）。
+
+    为什么 user-invocable: false 的技能也加载、但不登记：
+      它是"只给模型用"的技能（比如一段自动生效的编码约定）。
+      出现在斜杠命令里会让用户以为要手动敲它，而它本来就是被模型按需加载的。
+    """
+    from tools.skill.skill_manager import SkillManager
+
+    manager = SkillManager()
+    manager.reload()  # 登记前必须拿到最新清单；重扫的代价是几十个 4KB 读，可以忽略
+
+    for name in list(_skill_command_names):
+        REGISTRY.pop(name, None)
+    _skill_command_names.clear()
+
+    registered = 0
+    for spec in manager.list_specs():
+        if not spec.user_invocable:
+            continue  # 不进斜杠命令（模型仍能通过 skill 工具调用）
+        usage = f"/{spec.name}"
+        if spec.argument_hint:
+            # 参数提示只影响 /help 的用法显示。没有就不加，免得每行都拖一个空的 [参数]。
+            usage += f" {spec.argument_hint}"
+        register(
+            CommandSpec(
+                name=spec.name,
+                usage=usage,
+                summary=_one_line_summary(spec.description),
+                handler=_make_skill_handler(spec.name),
+            )
+        )
+        _skill_command_names.add(spec.name)
+        registered += 1
+    return registered
+
+
+async def cmd_skills(conversation, args: str) -> None:
+    """/skills —— 列出已加载的技能；/skills reload 重新扫描
+
+    为什么这条必须有：
+      技能的目录、优先级、哪些字段没生效、扫描时哪一行写坏了……这些信息
+      如果只在启动日志里出现一次，用户改完文件想知道"现在到底加载了什么"
+      就只能去翻源码。一个"只写不读"的机制，用户没法信任它——
+      和 /memory 那条命令的理由一模一样（第 14 轮）。
+
+    参数 args：
+      "reload" → 重扫目录、重新登记斜杠命令、必要时补登记 skill 工具；
+      其他/空 → 只看不清单，不做任何改动。
+      为什么区分：重扫会改变 tools 清单（技能从 0 变 1 时），
+      那会让提示词缓存失效一次。不该在"我只是想看看"的时候发生。
+    """
+    from tools.skill.skill_manager import SkillManager, global_skills_dir, project_skills_dir
+
+    ui = conversation._ui_manager
+    wants_reload = args.strip().lower() == "reload"
+
+    if wants_reload:
+        count = register_skill_commands()  # 内部已经 reload 过，不再多扫一次
+        # 技能从 0 变 1 时，工具表里还没有 skill，需要补登记（见 ToolManager.refresh_skill_tool）。
+        tool_manager = getattr(conversation, "_tool_manager", None)
+        added = tool_manager.refresh_skill_tool() if tool_manager is not None else False
+        ui.print_success(f"已重新扫描技能目录，登记 {count} 条技能命令。")
+        if added:
+            # 必须提醒：工具清单在缓存前缀里，变了就会让下一轮缓存命中归零、按原价计费一次。
+            # 不说的话，用户过一会儿看 /cost 发现贵了一下，会以为是 reload 的 bug。
+            ui.print_info("skill 工具是这次新登记的：下一轮请求的工具清单会变，提示词缓存会失效一次。")
+
+    manager = SkillManager()
+    specs = sorted(manager.list_specs(), key=lambda spec: spec.name)  # 按名字排，稳定
+    if specs:
+        # 顺序固定成"全局在前、项目在后"：和扫描顺序一致，用户容易对上。
+        ui.print_info(f"全局目录：{global_skills_dir()}")
+        ui.print_info(f"项目目录：{project_skills_dir()}")
+        ui.print_info("")
+        ui.print_info(f"已加载 {len(specs)} 个技能：")
+        for spec in specs:
+            # 标记位拼成一段括号，比每个技能打好几行更省屏幕。
+            flags = []
+            if not spec.user_invocable:
+                flags.append("不进斜杠命令")
+            if not spec.description.strip():
+                # 【第 21.1 轮】没描述不再等于"模型看不到"，只是清单里显示占位文字。
+                # 标记保留，是因为"给模型看的那一行信息量很低"仍然值得提醒用户补一句。
+                flags.append("没有描述，清单里只显示占位")
+            # 【第 21.2 轮】这里原来还有一行"未生效字段：…"（allowed-tools / model / hooks…）。
+            #   整套 UNSUPPORTED_FIELDS 机制删掉了：不认识的字段直接忽略、不展示。
+            #   少一个概念，就少一处"某人改了字段表、忘了改这里"的可能。
+            suffix = f"（{'；'.join(flags)}）" if flags else ""
+            description = spec.description or "（无描述）"
+            ui.print_info(f"  /{spec.name}  [{spec.source_text()}] {description}{suffix}")
+    else:
+        ui.print_warning("还没有加载到任何技能。")
+        ui.print_info(f"在 {project_skills_dir()} 下建一个 <名字>/SKILL.md 就能用（也可以放 <名字>.md）。")
+
+    # 同名覆盖：必须在列表下面单独说，否则用户会奇怪"我明明改了全局那份"
+    for name, path in manager.shadowed:
+        ui.print_info(f"同名覆盖：/{name} 用的是项目版本，被盖住的是 {path}")
+
+    warnings = manager.warnings
+    if warnings:
+        # 扫描问题单独一段。为什么要主动打出来：第 16.1 轮的教训是
+        # "静默降级 = 把 bug 藏起来"，一个名字写错、一个 frontmatter 没闭合，
+        # 都只会表现为"技能没生效"，不说清楚用户只能靠猜。
+        ui.print_warning(f"扫描时有 {len(warnings)} 条问题：")
+        for warning in warnings:
+            ui.print_info(f"  · {warning}")
+
+    ui.print_info("")
+    # 热更新的口径分两半，这里必须说清（见 docs/优化记录/21-… §热更新）：
+    #   正文每次调用都现读，改字立即生效；元数据进了工具说明书和 REGISTRY，是快照。
+    ui.print_info("只改正文不用 reload（每次都现读）；改了名字/描述/开关要 /skills reload。")
+
+
+# =============================================================================
 # 命令注册（放在文件末尾，理由见本节开头）
 # 为什么放在文件末尾，而不是每条命令定义完就注册：
 #   读代码的人按"头部说明 → 数据结构 → 工具函数 → 各命令 → 注册表"的顺序看下来，
@@ -777,3 +1013,7 @@ register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cm
 register(CommandSpec("compact", "/compact", "立刻压缩上下文（不等 80%）", cmd_compact))
 register(CommandSpec("clear", "/clear", "清空上下文并开一个新会话", cmd_clear))
 register(CommandSpec("agents", "/agents", "列出子 agent 类型（同时重新扫描目录）", cmd_agents))
+# 【2026-11-10 第 21 轮】技能的管理入口。它必须在技能命令之前就登记好：
+#   SkillManager 扫描时拿 builtin_command_names() 拦"和内置命令重名"的技能，
+#   而 skills 自己也是内置命令——不先登记，一个叫 skills 的技能目录就能把 /skills 顶掉。
+register(CommandSpec("skills", "/skills [reload]", "列出已加载的技能；reload 重新扫描", cmd_skills))

@@ -20,6 +20,25 @@ from core.prompt.enviroment import get_enviroment_info  # 导入函数：生成�
 from core.prompt.memory import load as load_project_memory  # 导入函数：加载 THINKER.md
 from core.prompt.system_rule import get_system_rule  # 导入函数：生成行为规矩文字
 
+# 【2026-11-10 第 21 轮】技能那一小段（有技能时才拼进去）。
+#
+# 为什么工具说明书里已经写了、这里还要再说一遍：
+#   第 8 轮的"工具选择"一节就是这个先例——光在 file_read 的说明书里写"请用我"，
+#   模型有时仍会凭习惯去敲 dir；把规则放进系统提示词（每轮都带、优先级最高）之后就稳了。
+#   技能是同一个问题：说明书在 tools 字段里，模型可能一扫而过，
+#   而"先加载再动手"是它最容易跳过的步骤（跳过之后它会按自己脑补的流程干，
+#   看起来还挺像样，但和手册里的约定完全不同）。
+#
+# 为什么只写三句、不复述技能清单：
+#   清单在 skill 工具的说明书里，是**动态生成**的。在这里再列一遍，
+#   等于同一件事维护两处：新建一个技能文件，这里的清单不会跟着变，
+#   模型就会拿着过期清单去调不存在的技能。所以这里只给规则，不给数据。
+SKILLS_SECTION = """## 技能
+
+这个项目里可能有若干「技能」——写在 .thinker/skills/ 下的操作手册（怎么做 PDF、怎么发版、怎么 review）。
+任务和某个技能的描述对得上时，先用 skill 工具把它的正文加载进来，再按正文里的步骤做。
+不要凭技能名猜正文内容，也不要跳过技能自己编一套流程。""".strip()
+
 
 class BasePromptManager(ABC):
     # 抽象基类，相当于"提示词管理器上岗证"
@@ -52,6 +71,9 @@ class PromptManager(BasePromptManager):
         #     前者是人写的项目规矩，全文注入；
         #     后者是模型自己积累的经验，只注入索引，细节靠 file_read 按需取。
         #   两者都放在中间，因为"规矩"要最先立住、"环境"要在最后便于引用。
+        # 【2026-11-10 第 21 轮】变成五段：在自动记忆和环境信息之间插了"技能"。
+        #   插在这里而不是末尾，是为了保住"环境永远在最后"这条第 11 轮的判断——
+        #   日期/目录这类每轮都要引用的东西放尾部最容易被模型读到。
         sections = [get_system_rule()]  # 第一段：行为规矩
 
         memory = load_project_memory()  # 第二段：项目记忆（找不到就是空字符串）
@@ -64,5 +86,15 @@ class PromptManager(BasePromptManager):
             sections.append(auto_memory)
             # 目录不存在时返回空串，同样整段跳过
 
-        sections.append(get_enviroment_info())  # 第四段：当前环境信息
+        # 【2026-11-10 第 21 轮】第四段：技能规则（只在真的加载到技能时才拼）
+        #   局部 import 的理由：core 层不该在导入期就依赖 tools 层。
+        #   tools/skill 现在只读 core.limits，但以后它可能想引用提示词相关的东西，
+        #   那时模块顶部的 import 就会成环——留一个函数内 import，这个坑就提前避掉了。
+        #   代价是每次拼提示词多一次 dict 查找（模块已在 sys.modules 里），可以忽略。
+        from tools.skill.skill_manager import SkillManager
+
+        if SkillManager().count() > 0:
+            sections.append(SKILLS_SECTION)
+
+        sections.append(get_enviroment_info())  # 第五段：当前环境信息
         return "\n\n".join(sections).strip()

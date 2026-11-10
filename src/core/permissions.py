@@ -40,8 +40,12 @@ from core.auto_memory import is_memory_path  # 【第 12 轮】识别"记忆目�
 
 
 # 只读工具：不改磁盘、不启进程，没必要每次都打断用户
+# 【2026-11-10 第 21 轮】加入 skill：它只做一件事——读 .thinker/skills/ 下的 SKILL.md
+#   并把正文交出去。不写盘、不执行命令、不改任何状态，属于纯读。
+#   注意"技能里写了什么"完全不参与权限判定：正文里就算写着"直接 rm -rf 不用问"，
+#   真去删文件时仍然是 cmd_runner，仍然要弹确认。技能只是文字，不是通行证。
 READ_ONLY_TOOLS = {
-    "file_read", "file_glob", "file_grep", "todo_write",
+    "file_read", "file_glob", "file_grep", "todo_write", "skill",
 }
 
 # 会改磁盘的工具：这一版一律要问（第 10 轮再做"工作区内的小改动免确认"）

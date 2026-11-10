@@ -231,6 +231,10 @@ class Conversation:
             #   但测试会通过 __new__ 造裸对象（不经 __init__），类属性容易串味道；
             #   current_agent 里用 getattr 兜底，两条路都不会炸。
             self._agent_stack = []
+            # 【2026-11-10 第 21 轮】"待发消息"槽位。斜杠命令 /技能名 在这里放一段
+            #   已经渲染好的技能正文，_read_user_input 会把它当成用户这一句返回，
+            #   于是它走正常的 add_message → 发模型流程。普通命令永远是 None。
+            self._pending_input = None
             self._esc = EscWatcher()  # 监听 Esc 的后台线程（不支持的平台会自动降级）
             self._initialized = True  # 打上标记，下次不再重复创建
 
@@ -377,6 +381,17 @@ class Conversation:
 
         子 agent 不走这里：它们不读用户输入（`_task_depth > 0` 时主循环直接返回）。
         这里保留一个兜底判断，是为了将来万一有别的地方调用。
+
+        【第 21 轮】多了一个 pending 分支：技能的斜杠命令（/pdf a.pdf）在 handler 里
+          把渲染好的正文放进"待发消息"槽位，这里取出来当成用户这一句返回。
+          为什么放在 handle_command 之后、add_message 之前：
+            · 之后：只有命令 handler 会写 pending，普通命令的 pending 永远是 None，
+              所以"斜杠命令不进历史、不计费"的规矩一字不变（第 14 轮）；
+            · 之前：返回的这段话会走正常流程被 add_message 记进历史、发给模型——
+              这正是技能想要的效果（"我说了这段要求"）。
+          为什么不走"先让模型调一次 skill 工具"：
+            用户是主动点名的，语义上就是"我说了这段要求"；而且那样要多花一次
+            往返（模型先决定调工具、再看着正文干活），白付一次输入。
         """
         while True:
             # 【第 16 轮】把补全源传进去：用户敲 "/" 之后按 Tab，就能把命令名补全。
@@ -385,6 +400,41 @@ class Conversation:
             if not is_command(text) or self._task_depth > 0:
                 return text
             await handle_command(text, self)  # 处理完继续循环，等用户真正想说的话
+
+            # 【第 21 轮】技能命令会在这里留下待发正文。取出即清空（见 take_pending_input），
+            #   所以同一段正文不可能被发两次、也不会串到下一句输入上。
+            pending = self.take_pending_input()
+            if pending:
+                return pending  # 当成用户这一句，正常进历史
+
+    def set_pending_input(self, text: str) -> None:
+        """放一段"等着被当成用户输入"的文字（2026-11-10 第 21 轮新增）
+
+        谁会用：技能的斜杠命令 handler。它把渲染好的技能正文放进来，
+        让主循环把它当成用户这一句处理，而不是自己直接去调模型
+        （那样会绕过 add_message，这段话就不在历史里了，下一轮模型会"忘了自己读过"）。
+
+        为什么只留一个槽位、后写覆盖先写：
+          一次输入只可能触发一条命令，两条命令同时写 pending 是不可能的。
+          用列表反而会引出"要不要按顺序发、发完要不要清空"这些没必要的分支。
+        """
+        self._pending_input = text
+
+    def take_pending_input(self):
+        """取出待发消息，**取出即清空**；没有就返回 None（2026-11-10 第 21 轮新增）
+
+        为什么取出就清空，而不是让调用方自己清：
+          这里最容易出的 bug 是"忘了清"，后果是同一段技能正文被重复当成用户消息，
+          每一轮都白发一次、还重复计费。把清空和取出绑在同一个动作里，
+          调用方就没有机会写错。
+
+        为什么用 getattr 拿默认值：
+          Conversation 是单例，测试和子 agent 场景会先 __new__ 造裸对象、不走 __init__，
+          那种对象上没有 _pending_input。返回 None 等于"没有待发消息"，是安全方向。
+        """
+        pending = getattr(self, "_pending_input", None)
+        self._pending_input = None
+        return pending
 
     @staticmethod
     def _complete_command(text: str) -> list:
@@ -946,14 +996,24 @@ class Conversation:
           allow 是"这个类型只给这几个"。两者都生效，不用在调用处手工求差集。
 
         为什么是 async？因为要等 MCP 工具注册完（连外部服务器要时间）。
+
+        【第 21 轮】子 agent 的排除名单从 {"task"} 变成 {"task", "skill"}。
+          两个理由，都不是"顺手省点 token"：
+            1. 子 agent 的提示词是刻意精简的（agent_spec.build_system_prompt 只给三行环境）。
+               技能正文动辄两三千字，可能比它手上的任务本身还长，而它只需要"找东西/看代码"；
+            2. 技能正文是写给**主 agent** 的，里面很可能写着"用 todo_write 记一下进度"
+               "拿不准就派个子 agent"。子 agent 拿到这些指令会去撞 todo_write——
+               而那个工具的状态存在单例实例上，一撞就覆盖主 agent 的待办清单。
+          这是两道闸里的第一道（清单层），第二道在 _is_tool_allowed。
         """
-        exclude = {"task"} if self.is_subagent else None  # 如果是子 agent，就排除 task 工具
+        exclude = {"task", "skill"} if self.is_subagent else None  # 子 agent：派活和加载技能都不给
         allow = None  # None = 不限制（主 agent、或"继承全部"的子 agent）
         agent = self.current_agent
         if agent is not None and agent.tools is not None:
             # 白名单里再剔一次 task：万一用户在自己写的 md 里塞了 task（加载时已经告警并剔除），
             # 或者以后有人手工 register 时绕过了解析，这里仍然兜住。
-            allow = {name for name in agent.tools if name != "task"}
+            # 【第 21 轮】skill 同理：白名单里写了也不给，和 exclude 那条保持一致。
+            allow = {name for name in agent.tools if name not in ("task", "skill")}
         return await self._tool_manager.get_tools_description(exclude=exclude, allow=allow)  # 向工具管理器要清单
 
     @staticmethod
@@ -1214,6 +1274,11 @@ class Conversation:
             # 子 agent 不能再派活。这是三道闸里最里的一道，和 task.py 里的第二道重复，
             # 但重复是故意的：task.py 那层只拦"从 task 工具进来的调用"，
             # 这一层拦的是"任何路径发起的调用"。
+            return False
+        if tool_name == "skill":
+            # 【第 21 轮】子 agent 也不能加载技能。清单层已经不给它看了（_get_available_tools），
+            # 但模型可能凭上一轮的工具清单、或者凭训练里的习惯直接写出工具名，
+            # 所以执行层再拦一次。拒绝理由要写清"自己去干"，否则模型会绕着试。
             return False
         if agent.tools is None:
             return True  # 继承全部（除 task）

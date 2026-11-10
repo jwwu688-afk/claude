@@ -19,7 +19,7 @@ Thinker 是一个用 Python 复刻 Claude Code 的终端编程助手：单层主
 ```
 src/
   core/          对话总管、API 客户端、历史/压缩、权限、提示词（含 memory.py）、斜杠命令（commands.py）
-  tools/         内置工具 + MCP 适配 + 子 agent
+  tools/         内置工具 + MCP 适配 + 子 agent + 技能（skill/，见下）
   ui/            显示与输入（theme 管配色符号）
   mcp_servers/   示例 MCP 服务器（weather / calculator）
 test/            脚本式测试，不是 pytest
@@ -54,7 +54,54 @@ python test/test_p0_fixes.py
 /compact                           立刻压缩一次上下文（不等 80%，会调一次摘要模型）
 /clear                             清空上下文并开一个新会话（旧会话文件保留，可 /resume 回去）
 /agents                            列出子 agent 类型、工具白名单、模型与来源（每次执行都会重扫 .thinker/agents）
+/skills [reload]                   列出已加载的技能、来源与扫描问题；reload 重扫目录
 ```
+
+技能文件放在 `.thinker/skills/` 下的技能会**自动登记成斜杠命令**（`/pdf`、`/release` …），
+不需要改代码。格式与坑见下面「技能」一节。
+
+## 技能（第 21 轮）
+
+技能是**写在文件里的操作手册**，只把 `name + description` 常驻在 `skill` 工具的说明书里，
+正文在模型（或用户 `/名字`）真正用到时才从磁盘读。三层加载：
+
+```text
+.thinker/skills/<名字>/SKILL.md     项目级（进仓库）
+~/.thinker/skills/<名字>/SKILL.md   全局（跟人走）
+.thinker/skills/<名字>.md           单文件形态也行（没有支撑文件时）
+```
+
+同名时**项目覆盖全局**（和 THINKER.md 的层叠方向一致），被覆盖的那份在 `/skills` 里会标出来。
+
+放在哪一档：
+- **`~/.thinker/skills/`（全局）**：给"开发任何项目都用得上"的活，比如发版流程、排查套路、某技术栈的加接口步骤。
+  Thinker 本身是工具，绝大多数技能应该放这里——绑死某个仓库的目录结构，换个项目就废了。
+- **`<项目>/.thinker/skills/`（项目级）**：只放这个仓库特有的约定（比如它自己的文档结构、它自己的发版步骤）。
+
+最小可用文件：
+
+```markdown
+---
+name: pdf
+description: 读取、解析、抽取 PDF 的正文与表格。用户提到 pdf/论文/扫描件/发票时使用。
+argument-hint: [文件路径]
+---
+
+# PDF 处理
+
+要处理的文件：$ARGUMENTS
+
+1. 先用 `file_read` 看一眼文件头。
+2. 需要按页抽取时跑 `${SKILL_DIR}/scripts/extract.py <路径>`。
+```
+
+- 可用变量只有三个：`$ARGUMENTS`、`${SKILL_DIR}`、`${PROJECT_DIR}`（都不支持 `$0/$1`）。
+- 认得的字段只有四个：`name` / `description` / `user-invocable` / `argument-hint`。
+  其余字段（`allowed-tools` / `model` / `hooks` / `disable-model-invocation` …）**一律忽略**，
+  不报错也不提示——从别处拷技能过来多写几行是正常事。
+- **所有技能一律对模型可见**（第 21.1 轮定的口径）：没写 `description` 也进清单，只是显示占位文字。
+- 名字只能是小写字母 + 数字 + 单个连字符（它同时是斜杠命令名）。
+- 只改正文不用 reload（每次调用都现读）；改了名字/描述/开关要 `/skills reload`。
 
 输入 `/` 开头后按 **Tab** 可以补全命令名（第 16 轮）：唯一匹配直接补上并跟一个空格，
 多个匹配先补到公共前缀、再按一次列出候选。候选来自 `REGISTRY`，新增命令会自动出现在补全里。
@@ -105,6 +152,9 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 - **不要引入 pytest**，保持测试零依赖。
 - **不要改 `enviroment.py` 的函数名**（`get_enviroment_info` 是原作者拼错的 environment），多处调用，改了会连锁报错。
 - 不要动 `core/permissions.py` 的判定顺序，那是有意排的。
+- **不要让「技能正文」影响权限判定**。技能只是文字：正文写"直接 rm -rf 不用问"也不生效，
+  `classify()` 只看工具名和参数。所以也不要加 `allowed-tools`——那等于开一个
+  "仓库里的文本能让权限变松"的口子；要免审批就去做 `classify()` 里的用户允许清单。
 
 ## 已知的坑
 
@@ -138,3 +188,8 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 - **子 agent 的工具白名单是「工具粒度」，不是「命令粒度」**。给了 `cmd_runner` 就等于给了全部命令，做不到"只允许 git diff"。所以内置 `explore` 的白名单只有 `file_glob/file_grep/file_read` 三个只读工具——这也是它全程零审批的前提：审批判定（`permissions.classify`）不看"当前是不是子 agent"，只要工具要问就一定会问（第 18 轮）。
 - **`todo_write` 的状态存在工具实例上，而实例在 ToolManager 单例里只有一份**。子 agent 一调它就会覆盖主 agent 的待办清单，连状态行提醒都跟着错，且没有任何报错。所以任何子 agent 的白名单都别给 `todo_write`（第 18 轮发现）。
 - **子 agent 只有内置这一种来源**。第 18 轮先做过 `.thinker/agents` + `~/.thinker/agents` 两层目录，后来按需求整套删掉了。加类型要在 `src/tools/subagent/builtin_agents.py` 里加一个 `AgentSpec` 常量；**不要再把目录扫描加回来**——那会带回优先级、同名覆盖、来源标注三个概念，而维护定义的只有一个人。`test_subagent_types.py` 里有一条 `test_project_dir_is_ignored` 专门盯着这件事。
+- **技能的元数据是注册期快照，正文才是实时的**。改了 `name` / `description` / 两个布尔要 `/skills reload`（它们进了工具说明书和 `REGISTRY`）；只改正文不用——`skill_spec.render()` 每次都从磁盘现读。别把这两件事混成一句"技能支持热更新"，不然用户会以为改了描述立刻生效。
+- **子 agent 不给 `skill`**，和 `task` 一样是两道闸（`_get_available_tools` 的 exclude + `_is_tool_allowed`）。理由不只是省 token：技能正文是写给主 agent 的，里面常有"用 `todo_write` 记进度"这类话，子 agent 照做会踩掉主 agent 的待办清单（单例实例）。
+- **技能命令要记在 `_skill_command_names` 里**。`REGISTRY` 里同时有内置命令和技能命令，同名冲突检查（`builtin_command_names()`）必须把技能那部分减掉，否则 reload 之后技能会"跟自己的旧命令重名"而被拒载——表现为"能用一次，reload 就消失"。
+- **假 YAML 会把 `argument-hint: [文件路径]` 当成内联列表**。已在 `skill_spec._hint_text()` 里还原成方括号写法；以后再加"看起来像列表"的字段，记得同样处理，别去改解析器——那会变成给每个字段开特例。
+- **不要再给技能加"模型看不见"的开关，也不要加"未生效字段"的标注**（21.1 / 21.2 各删过一次）。可见性多一维就多一个"我明明写了技能，模型却说不知道"的排查方向；字段标注则要"识别 → 存字段 → 拼展示 → 写测试"四处跟着维护，而它不改变任何行为。现在规则只有一条：**认得就读，不认得就丢**。清单长度靠 `MAX_SKILLS_*` 卡，不靠藏技能。
