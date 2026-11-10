@@ -35,10 +35,10 @@ docs/优化记录/    每轮改动的详细记录
 #   （.env 不受影响：python-dotenv 跟着包所在目录向上找，换目录照样读得到。）
 thinker
 
-# 跑测试：都是独立脚本，没有 pytest
-python test/test_memory.py
-python test/test_conversation_loop.py
-python test/test_p0_fixes.py
+# 验证：仓库已不带测试套件（早期的 27 个脚本整套移除了）
+#   现在能自动跑的只有 demo 的 Node 逻辑回归；其余靠人工冒烟。
+node demo/plane/test/game.test.js
+python -m compileall -q src
 ```
 
 项目记忆在会话内用 `/init` 生成（见下）。
@@ -115,7 +115,7 @@ argument-hint: [文件路径]
 - **注释用中文，解释"为什么"而不是"是什么"**。这是项目最重要的风格，每个非平凡的决定都要写清背景和踩过的坑。
 - 每个文件顶部有一段 `# =====` 包围的说明，讲这个文件在整体里负责什么。
 - 改动涉及行为时，注释里标注轮次，例如 `【2026-11-07 第 11 轮】`，方便对照 `docs/优化记录/`。
-- 新增功能要补测试，测试写成**独立脚本**：直接 `python test/xxx.py`，最后打印 `🎉 所有测试通过（N/N）`。
+- 仓库不再带测试套件（27 个脚本整套移除）。要验证改动，写一次性冒烟脚本放在仓库外（如 `D:/workbuddy/thinker-预览/`），**不要提交进仓库**；demo 的 `node demo/plane/test/game.test.js` 是唯一保留的自动化测试。
 - 界面上的符号和颜色只能从 `ui/theme.py` 取，不要在各处硬编码。
 
 ### 注释标准（每轮优化都必须做到）
@@ -179,7 +179,7 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 - **Esc 的检查点不能只放在「收数据」的循环里**。第 18.7 轮之前，`for chunk in iterator: if esc.triggered: break` 看着没问题，但模型思考时（首字节未到）循环体一次都不执行，那十几秒里按 Esc 完全无效。现在读流在后台线程（`core/stream_pump.py`），主线程每 50ms 醒一次先看 Esc。以后任何「等外部 IO」的地方（网络、子进程、文件锁）想支持打断，都得用同样的形状：别在主线程同步等，否则检查点再密也没机会跑。
 - **不许 `except Exception: return False` 这种静默降级**。第 16.1 轮的 `unget` 就是这么写的：`msvcrt.ungetch` 要的是 bytes（`b"a"`），传 str 必 TypeError；宽字符版 `ungetwch` 对中文又抛 OSError。异常被 `except` 吞掉后，代码静默退回有 bug 的老写法——用户看到的是"补丁完全没生效"。降级分支至少要往 stderr 打一行，否则它不是兜底，是把 bug 藏起来。
 - **不确定的 API，先跑一行验证再动结构**。`ungetch(str)` 会不会报错，一行 `python -c` 就知道；第 16.1 轮却先写了整套逻辑、测试和文档，最后发现这一步从根上不成立。同理：`getwch` 返回 str 但 `ungetch` 收 bytes，这种"读和写不对称"的地方特别容易想当然。
-- **输入层是按「一行」写的；第 18.8 轮起，多行输入不再靠反推光标行列，而是整段受控重绘**。18.6 轮那套"`\b` 擦 + 上移一行 + CHA `\x1b[nG` 跳列"在 conhost 真机上没修好，三个根因叠着：① `theme.prompt_text()` 带颜色转义码，旧 `display_width` 把 `\x1b[38;5;209m` 当成可见字符算，折行点凭空早了十几列；② `\b` 在可视行行首不跨行，被删字符留在下一行没人擦——就是用户看到的"第一行留下最后一个字符"；③ conhost 与 xterm 写满一行时的 autowrap 时机不同，反推行号会差 1，CHA 在部分终端还不生效。现在 `_repaint_frame()` 自己按 `cols-1` 切行、用 `\x1b[1B` 显式下移、逐行空格覆盖，光标位置完全由代码状态（`_frame_rows` / `_frame_cursor_row`）决定。`_cursor_rowcol()` 降级为诊断算例，**不要再用它驱动光标指令**。改这块时一定要跑 `test_line_wrap.py` 的 `FakeScreen` 用例：它按 VT 语义执行真实输出序列并检查屏幕上有没有残字，"数 `\x1b[1A` 出现几次"证明不了屏幕干净。
+- **输入层是按「一行」写的；第 18.8 轮起，多行输入不再靠反推光标行列，而是整段受控重绘**。18.6 轮那套"`\b` 擦 + 上移一行 + CHA `\x1b[nG` 跳列"在 conhost 真机上没修好，三个根因叠着：① `theme.prompt_text()` 带颜色转义码，旧 `display_width` 把 `\x1b[38;5;209m` 当成可见字符算，折行点凭空早了十几列；② `\b` 在可视行行首不跨行，被删字符留在下一行没人擦——就是用户看到的"第一行留下最后一个字符"；③ conhost 与 xterm 写满一行时的 autowrap 时机不同，反推行号会差 1，CHA 在部分终端还不生效。现在 `_repaint_frame()` 自己按 `cols-1` 切行、用 `\x1b[1B` 显式下移、逐行空格覆盖，光标位置完全由代码状态（`_frame_rows` / `_frame_cursor_row`）决定。`_cursor_rowcol()` 降级为诊断算例，**不要再用它驱动光标指令**。改这块时要人工在真机上验证（原来的 `test_line_wrap.py` 的 `FakeScreen` 用例已随测试套件一起移除）：按 VT 语义逐行核对屏幕上有没有残字，"数 `\x1b[1A` 出现几次"证明不了屏幕干净。
 - **`THINKER_INPUT_PADDING` 默认 4（18.6 轮是 2），会改变输入行下方的空白**。它靠 `\n` × N + `\x1b[NA` 实现。关键是 **N 同时也是"能往上滚几行"**：conhost 只要检测到程序有输出就把视口拉回光标所在行，往上滚超过 N 行光标就出视口，敲第一个字屏幕立刻弹回底部——2 行的体感就是"只能往下滚、字永远贴在最后一行"。长输入把留白吃掉时，`_repaint_frame()` 会按需再撑开缓冲区。改输入层测试时若看到提示符前多了 `\n` 和上移序列，那是它，在测试文件里设 `0` 关掉即可——不要为此改断言去迎合它。
 - **Windows 控制台的键值和 Unix 不一样**：退格是 `\x08` 不是 `\x7f`，方向键是 `\x00` / `\xe0` 开头的**两字节**（漏掉第二个字节，它就会被当成普通字符插进输入里变成乱码）。这些值散在代码里极难排查，统一放在 `ui/line_editor.py` 的常量区。
 - **`input()` 的 prompt 不是输入内容**。拼进 prompt 的字符显示得出来，但退格删不掉、也不会出现在返回值里（第 16.1 轮踩过：用户输入的第一个字删不动，而且被静默丢掉一个字）。要让一个已读走的字符"回到输入流"，用 `msvcrt.ungetch()` 塞回控制台缓冲区，然后正常调 `input(prompt)`——别拼 prompt。
@@ -189,7 +189,7 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 - **测试脚本失败必须 `sys.exit(1)`**。有几份老脚本只在 `except` 里打印 `❌` 就结束，退出码仍是 0，批量跑会被算成通过——第 17.1 轮就是这么发现两个压缩用例早已失效的（"21 个脚本全绿"其实藏了两个红）。新写的测试一律带非 0 退出码；批量跑时同时看退出码和输出里的 `❌|Traceback`。
 - **子 agent 的工具白名单是「工具粒度」，不是「命令粒度」**。给了 `cmd_runner` 就等于给了全部命令，做不到"只允许 git diff"。所以内置 `explore` 的白名单只有 `file_glob/file_grep/file_read` 三个只读工具——这也是它全程零审批的前提：审批判定（`permissions.classify`）不看"当前是不是子 agent"，只要工具要问就一定会问（第 18 轮）。
 - **`todo_write` 的状态存在工具实例上，而实例在 ToolManager 单例里只有一份**。子 agent 一调它就会覆盖主 agent 的待办清单，连状态行提醒都跟着错，且没有任何报错。所以任何子 agent 的白名单都别给 `todo_write`（第 18 轮发现）。
-- **子 agent 只有内置这一种来源**。第 18 轮先做过 `.thinker/agents` + `~/.thinker/agents` 两层目录，后来按需求整套删掉了。加类型要在 `src/tools/subagent/builtin_agents.py` 里加一个 `AgentSpec` 常量；**不要再把目录扫描加回来**——那会带回优先级、同名覆盖、来源标注三个概念，而维护定义的只有一个人。`test_subagent_types.py` 里有一条 `test_project_dir_is_ignored` 专门盯着这件事。
+- **子 agent 只有内置这一种来源**。第 18 轮先做过 `.thinker/agents` + `~/.thinker/agents` 两层目录，后来按需求整套删掉了。加类型要在 `src/tools/subagent/builtin_agents.py` 里加一个 `AgentSpec` 常量；**不要再把目录扫描加回来**——那会带回优先级、同名覆盖、来源标注三个概念，而维护定义的只有一个人。原来有一条 `test_project_dir_is_ignored` 专门盯着这件事，测试已随套件移除——加回去之前先想清楚这条约束还在不在。
 - **技能的元数据是注册期快照，正文才是实时的**。改了 `name` / `description` / 两个布尔要 `/skills reload`（它们进了工具说明书和 `REGISTRY`）；只改正文不用——`skill_spec.render()` 每次都从磁盘现读。别把这两件事混成一句"技能支持热更新"，不然用户会以为改了描述立刻生效。
 - **子 agent 不给 `skill`**，和 `task` 一样是两道闸（`_get_available_tools` 的 exclude + `_is_tool_allowed`）。理由不只是省 token：技能正文是写给主 agent 的，里面常有"用 `todo_write` 记进度"这类话，子 agent 照做会踩掉主 agent 的待办清单（单例实例）。
 - **技能命令要记在 `_skill_command_names` 里**。`REGISTRY` 里同时有内置命令和技能命令，同名冲突检查（`builtin_command_names()`）必须把技能那部分减掉，否则 reload 之后技能会"跟自己的旧命令重名"而被拒载——表现为"能用一次，reload 就消失"。

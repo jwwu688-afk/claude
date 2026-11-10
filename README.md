@@ -45,7 +45,7 @@ Thinker 跑在终端里，能读代码、改文件、执行命令、自己决定
 - [上下文五层压缩](#上下文五层压缩)
 - [接入 MCP 外部工具](#接入-mcp-外部工具)
 - [目录结构](#目录结构)
-- [跑测试](#跑测试)
+- [验证](#验证)
 - [常见问题](#常见问题)
 - [已知限制](#已知限制)
 - [文档索引](#文档索引)
@@ -101,8 +101,8 @@ Thinker 跑在终端里，能读代码、改文件、执行命令、自己决定
 ### 1. 安装
 
 ```bash
-git clone git@github.com:jwwu688-afk/thinker.git
-cd thinker
+git clone git@github.com:jwwu688-afk/claude.git
+cd claude   # 仓库名是 claude，项目本身叫 Thinker
 
 python -m venv .venv
 # Windows
@@ -120,7 +120,7 @@ pip install -e .
 
 ```bash
 thinker --version
-# thinker v0.9.4
+# thinker v0.10.1
 ```
 
 ### 2. 配置
@@ -162,7 +162,7 @@ thinker
 ```
 > 看一下 src/core/conversation.py 的主循环，用三句话讲清楚它每一轮做了什么
 > 给 FileGrep 补一段中文注释，说明 include 参数怎么用
-> 跑 test/test_file_tools.py，挂了的话定位并修掉
+> 跑 node demo/plane/test/game.test.js，挂了的话定位并修掉
 ```
 
 第一次让它改文件时会弹确认，回车即同意；想拒绝就直接输入理由，那句话会带回给模型。
@@ -425,7 +425,7 @@ Thinker 支持标准 [MCP](https://modelcontextprotocol.io)（stdio 传输）。
 │   ├── tools/                  # 内置工具 + MCP 适配 + 子 Agent + 技能（skill/）
 │   ├── ui/                     # 显示与输入（theme 管配色符号，见 ui/README.md）
 │   └── mcp_servers/            # 示例 MCP 服务器（weather / calculator）
-├── test/                       # 27 个独立测试脚本，不是 pytest
+├── demo/plane/                 # 用 Thinker 写的浏览器小游戏（零依赖，含 Node 逻辑回归）
 ├── docs/
 │   ├── ROADMAP.md              # 还有什么没做、为什么这么排
 │   └── 优化记录/                # 35 份逐轮改动记录（含根因分析）
@@ -439,28 +439,33 @@ Thinker 支持标准 [MCP](https://modelcontextprotocol.io)（stdio 传输）。
 
 ---
 
-## 跑测试
+## 验证
 
-**不用 pytest**（刻意保持零测试依赖），每个文件都是独立脚本，跑完打印 `🎉 所有测试通过（N/N）`：
+这个仓库**没有随代码提供测试套件**。早期有 27 个独立脚本（不是 pytest），后来整套移除了——维护成本高于收益，而且脚本式测试容易写成"永远绿"（历史上就出过假绿、以及测试文件被误清空两次）。所以现在只保证三条**可复现**的：
 
-```bash
-python test/test_file_tools.py
-python test/test_commands.py
-python test/test_conversation_loop.py
-python test/test_history_compress.py
-```
-
-一次跑全部：
+**1. 全部模块能编译**
 
 ```bash
-# Windows (Git Bash)
-for f in test/test_*.py; do echo "== $f"; python "$f" || break; done
-
-# PowerShell
-Get-ChildItem test/test_*.py | ForEach-Object { python $_.FullName }
+python -m compileall -q src
 ```
 
-> 测试全部是本地逻辑验证，**不联网、不消耗模型额度**——需要模型的地方都被替身或桩函数换掉了。放心跑。
+**2. 能正常打包安装**（这条抓的是 `pyproject.toml` 的配置错，不是业务逻辑）
+
+```bash
+pip wheel . --no-deps -w dist/
+```
+
+打出来的 wheel 里必须有顶层 `main.py` 和 `core/` 包，否则装完一敲 `thinker` 就 `ModuleNotFoundError`。
+
+**3. demo 的逻辑回归**（仓库里唯一还在跑的自动化测试，15 条规则断言）
+
+```bash
+node demo/plane/test/game.test.js
+```
+
+> 上面三条都**不联网、不消耗模型额度**。
+
+业务逻辑本身（主循环、五层压缩、权限判定）目前靠手动冒烟：改完启动一次，让它读一个文件、改一个文件、跑一条命令，看确认框和状态行对不对。动过 `core/history/` 或 `core/conversation.py` 时，务必聊到上下文过半触发一次压缩再退出。
 
 ---
 
