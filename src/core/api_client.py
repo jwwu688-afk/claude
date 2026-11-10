@@ -192,6 +192,20 @@ class APIClient:
         参数 request_params：一个字典，里面装着 messages（消息列表）、tools（工具清单）等
         返回：一个元组 (模型回复对象, token 用量)
         """
+        # 【Bug 修复 2026-11-10】先复制一份再改，不要动调用方传进来的那个字典。
+        #   为什么：conversation 的流式兜底用的是**同一个** request 对象——
+        #   流式先跑（get_completion_stream 往它里面写了 stream=True / stream_options），
+        #   失败后紧跟着把同一个对象交给本函数做"非流式重试"。
+        #   不复制的话，这次"非流式"请求实际还是流式的，SDK 返回的是 Stream 对象，
+        #   下面 .choices 直接抛 'Stream' object has no attribute 'choices'，
+        #   兜底就变成了"必然二次失败"，比没有兜底更让人困惑。
+        request_params = dict(request_params)
+
+        # 本函数的契约是"一次性拿到完整结果"，所以即使上游残留了流式参数也必须清掉。
+        request_params["stream"] = False
+        # stream_options 只在 stream=True 时有意义；孤零零留着，OpenAI 官方接口会直接 400。
+        request_params.pop("stream_options", None)
+
         # 【第 18 轮】允许调用方在 request 里指定模型（子 agent 的 model 字段走这条路）。
         #   优先级：显式传参 > request 里已有的 model > 全局 self.model。
         #   为什么要读 request_params 里已有的值：改前这里是无条件覆盖，
@@ -220,6 +234,13 @@ class APIClient:
         #   改前这一行是无条件 `= self.model`，等于把"每个子 agent 可以用不同模型"
         #   这条路彻底堵死——不管上层怎么传，发出去的都是全局模型。
         #   这里用 get() 兜底：没有指定就退回全局，行为和改前完全一致。
+        # 【Bug 修复 2026-11-10】只改副本，不污染调用方的字典。
+        #   原来这里是直接往 request_params 里塞 stream=True / stream_options，
+        #   而调用方（conversation）之后还要拿同一个对象去发"非流式重试"，
+        #   于是那条重试请求也变成流式，拿到 Stream 对象后 .choices 崩掉。
+        #   放在函数体第一行（而不是 yield 之后）也有讲究：生成器要等到第一次 next()
+        #   才执行，但那时调用方还没机会改这个字典，复制出来就是调用时的真实参数。
+        request_params = dict(request_params)
         request_params["model"] = request_params.get("model") or self.model  # 填模型名（子 agent 可覆盖）
         request_params["stream"] = True  # 告诉接口：我要流式返回，别憋到最后才给我
         request_params["stream_options"] = {"include_usage": True}
