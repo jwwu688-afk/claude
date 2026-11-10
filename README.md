@@ -14,6 +14,23 @@ Thinker 跑在终端里，能读代码、改文件、执行命令、自己决定
 
 ---
 
+## Thinker 写的 Demo：逐云 · 飞行作战
+
+<img src="demo/plane/preview-play.gif" width="760" alt="逐云 · 飞行作战（实际游玩画面）">
+
+零依赖的浏览器纵向飞机大战。**代码是 Thinker 自己在这个仓库里写出来的**——建文件、写战斗逻辑、改测试、跑回归，人只负责点头。双击 [`demo/plane/index.html`](demo/plane/index.html) 就能开打，不用装、不用构建。
+
+`WASD` / 方向键移动 · 自动开火 · `Space` 放炸弹 · `P` 暂停。战斗逻辑与渲染分离，`node demo/plane/test/game.test.js` 跑规则回归；3 条命、护盾、四种补给、20 秒一个波次，35 秒后出空中堡垒。
+
+<details>
+<summary>展开看开始界面</summary>
+
+<img src="demo/plane/preview-home.png" width="760" alt="逐云 · 飞行作战（开始界面）">
+
+</details>
+
+---
+
 ## 目录
 
 - [它是什么 / 不是什么](#它是什么--不是什么)
