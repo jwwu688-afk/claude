@@ -285,6 +285,26 @@ class Conversation:
         """
         message = normalize_message(message)  # 转成可序列化的纯数据
         self._history_manager.add_message(message)  # 转手交给历史管理器
+
+        # 【2026-11-10 第 21.7 轮】会话文件**懒创建**：第一条"真正发给模型的消息"出现时才落盘。
+        #   改前：启动（或 /clear）就立刻建 JSONL——用户开 thinker 看一眼 /cost 就退出，
+        #   也会留下一个只有 header + system 的空会话文件，/resume 列表被这种空壳填满。
+        #   现在的口径：**系统提示词只进内存**；斜杠命令不进历史、自然也不建文件；
+        #   第一条 user / assistant / tool 消息出现时，才把"header + 系统提示词 +
+        #   到目前为止的全部消息"一次性写进新文件。
+        #   为什么把整页一起补写而不是只写当前这条：文件格式约定是
+        #   "header 行 + 按顺序的消息行"，漏掉 system 行的话 --continue 恢复时
+        #   就少了系统提示词的占位（恢复逻辑会替换 system，但格式上得有这一行）。
+        #   为什么子 agent 不触发创建：它们不落盘（见下面的 is_subagent 判断），
+        #   而且子 agent 运行的前提是主对话已经有用户消息了。
+        session = getattr(self, "_session", None)
+        if session is None and not self.is_subagent and message.get("role") != "system":
+            self._session = SessionStore.create(
+                cwd=os.getcwd(),
+                model=getattr(self._api_client, "model", "") or "",
+                messages=self.messages,  # 当前这页全部消息（含本条），一次补写
+            )
+            return  # 这条消息已经随 create 写进去了，再 append 就重复了
         # 【第 13 轮】用 getattr 兜底而不是直接 self._session：
         #   单例的 __init__ 只在第一次执行，某些测试/子 agent 场景下对象是先 __new__ 出来的，
         #   属性可能还没被赋值。用 getattr 拿默认值，比依赖初始化顺序更稳。
@@ -353,18 +373,19 @@ class Conversation:
         """
         old_path = getattr(getattr(self, "_session", None), "path", None)
 
-        # 用新文件接住后面的对话。cwd 和 model 沿用当前的，
-        # 这样 /resume 里它仍然归在"本项目"下面，而不是跑到别的项目去。
-        self._session = SessionStore.create(
-            cwd=os.getcwd(),
-            model=getattr(self._api_client, "model", "") or "",
-        )
+        # 【第 21.7 轮】不再立刻建新文件，和启动时一样懒创建：
+        #   用户 /clear 之后可能又只敲了个 /cost 就退出，立刻建文件同样会留下空壳。
+        #   self._session 置 None 之后，第一条真正的消息会走 add_message 里的
+        #   懒创建分支，把 system + 那条消息一起写进新文件。
+        self._session = None
 
         self._history_manager.messages_history[-1] = []  # 清空当前这一页
-        self.add_message(self.build_system_message())  # 重新放回系统提示词（同时写进新文件）
+        self.add_message(self.build_system_message())  # 重新放回系统提示词（只进内存）
         self._history_manager.seed_usage_from_messages(self.messages)  # 重算占用
 
-        return old_path, self._session.path
+        # 第二个返回值可能是 None：还没有新文件（懒创建）。
+        #   调用方（cmd_clear）要按 None 单独提示，不能直接 .name。
+        return old_path, None
 
     async def _read_user_input(self) -> str:
         """读一行用户输入；如果是斜杠命令，本地处理完继续等（2026-11-07 第 14 轮新增）
@@ -493,10 +514,15 @@ class Conversation:
                 f"（按字符估算上下文约 {estimated_tokens:,} token）"
             )
         else:
-            self._session = SessionStore.create(
-                cwd=os.getcwd(),
-                model=getattr(self._api_client, "model", "") or "",
-            )
+            # 【第 21.7 轮】启动时**不再立刻建会话文件**（懒创建）。
+            #   改前这里就 SessionStore.create(...)：用户开 thinker 看一眼 /cost 就退出，
+            #   也会留下一个空会话文件，/resume 列表被这种空壳填满。
+            #   现在 self._session 保持 None，第一条真正发给模型的消息
+            #   （add_message 里的懒创建分支）才落盘；系统提示词只进内存。
+            #   为什么 system 也不写：它每轮都由 build_system_message 重新生成
+            #   （日期/目录会变），落盘的意义只在"文件格式上有这一行"，
+            #   那件事由懒创建时的 messages=self.messages 一次性补齐。
+            self._session = None
             self.add_message(system_message)  # 把系统提示词放进消息列表（永远排在最前面）
 
         # 【第 14 轮】走 _read_user_input：斜杠命令在这里被截下，不进历史、不发模型

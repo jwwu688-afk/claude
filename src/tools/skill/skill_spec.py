@@ -204,6 +204,13 @@ def build_spec(path: Path, source: str) -> Tuple[Optional[SkillSpec], List[str]]
     else:
         description = str(raw_description).strip()
 
+    # 【2026-11-10 第 21.3 轮】把所有空白（含换行）压成单个空格。
+    #   为什么必须压：description 的用途是"清单里的一行"，而块写法（`|`）会带真实换行——
+    #   官方 `claude-api` 技能就是这样，压平前它会把 `- 名字：描述` 拆成两行，
+    #   模型看到的是一条断掉的清单项。压平放在这里而不是展示层，是因为
+    #   `/skills` 和工具说明书两处都要用，只改一处还是会漏。
+    description = " ".join(description.split())
+
     # ---- 只剩一个布尔 ----
     # 【第 21.2 轮】disable-model-invocation 现在既不读也不标注：
     #   它和 allowed-tools / model / hooks 一样，解析完就丢。
@@ -242,6 +249,43 @@ def _posix(path) -> str:
     return str(path).replace("\\", "/")
 
 
+def _support_note(spec: SkillSpec) -> str:
+    """加载正文时加在最前面的「技能目录」提示（2026-11-10 第 21.4 轮新增）
+
+    【为什么必须有这一行】
+      技能目录里常带支撑文件（`reference.md`、`examples/*.md`、`scripts/*.py`），
+      而正文里写的通常是**裸相对路径**（"读 examples/3p-updates.md"）。
+      但本项目的文件工具把相对路径解析到**启动时的项目根**，不是技能目录——
+      实测：模型照做会把 `examples/3p-updates.md` 读成
+      `D:/code/thinker/examples/3p-updates.md`，那里当然没有这个文件。
+      模型拿到的报错是"文件不存在"，它不知道这是路径基准错了，
+      只会换个写法乱试，或者干脆放弃这个技能。
+
+      一行提示就能把基准说清楚，成本约 80 字符，而且**只在加载时出现一次**
+      （不像工具说明书那样每轮都发）。
+
+    【什么时候不加】
+      · 单文件形态（`<名字>.md`）：它的 base_dir 是父目录，里面可能是别的技能，
+        指过去反而误导；
+      · 目录里确实只有 SKILL.md：没有支撑文件，加了是噪音。
+    """
+    if spec.path.name != SKILL_FILENAME:
+        return ""
+    try:
+        has_support = any(entry.name != SKILL_FILENAME for entry in spec.base_dir.iterdir())
+    except OSError:  # 目录权限异常：宁可不提示，也不要让加载失败
+        return ""
+    if not has_support:
+        return ""
+
+    directory = _posix(spec.base_dir)
+    return (
+        f"【技能目录】{directory}\n"
+        "正文里提到的相对路径（如 `examples/x.md`、`scripts/y.py`）都相对这个目录。\n"
+        f"读取或执行它们时请用绝对路径（{directory}/...），或先 cd 到该目录再执行。"
+    )
+
+
 def render(spec: SkillSpec, args: str = "") -> str:
     """读出正文，做变量替换与截断，返回交给模型的整段文字
 
@@ -252,6 +296,8 @@ def render(spec: SkillSpec, args: str = "") -> str:
       $ARGUMENTS     调用时传的整串参数
       ${SKILL_DIR}   技能所在目录（单文件形态时是它的父目录）
       ${PROJECT_DIR} 启动时的 cwd
+    另外为了兼容 Claude Code 的技能，也认 `${CLAUDE_SKILL_DIR}` / `${CLAUDE_PROJECT_DIR}`
+    （第 21.3 轮加，见下面的替换处）。
 
     为什么不做 $0 / $1：要做就得处理"引号怎么切、`$1.00` 里的 $1 要不要替换、
     参数缺失时占位符原样保留还是清空"这一整套，收益远小于成本——
@@ -280,6 +326,11 @@ def render(spec: SkillSpec, args: str = "") -> str:
     # 先展开路径变量、再替换 $ARGUMENTS。
     # 顺序不能反：参数是用户写的内容，如果先替换它，用户碰巧写了个
     # `${SKILL_DIR}` 就会被二次展开——那种"我的参数被吃掉了"的问题极难查。
+    # 【第 21.3 轮】同时认 Claude Code 的两个变量名，为了能直接导入公开技能：
+    #   `${CLAUDE_SKILL_DIR}` / `${CLAUDE_PROJECT_DIR}` 是那边的写法，
+    #   不认的话它们会以字面量留在正文里，模型会照着去执行一条带 `${...}` 的假路径。
+    body = body.replace("${CLAUDE_SKILL_DIR}", _posix(spec.base_dir))
+    body = body.replace("${CLAUDE_PROJECT_DIR}", _posix(os.getcwd()))
     body = body.replace("${SKILL_DIR}", _posix(spec.base_dir))
     body = body.replace("${PROJECT_DIR}", _posix(os.getcwd()))
 
@@ -294,6 +345,13 @@ def render(spec: SkillSpec, args: str = "") -> str:
         # 会去反问"你要处理哪个文件"，看起来就像命令没生效。
         body += f"\n\nARGUMENTS: {args}"
 
+    # 【第 21.4 轮】技能目录提示放在最前面：模型读正文之前先知道"相对路径相对谁"。
+    #   放在变量替换之后、截断之前：提示里没有占位符，但截断必须把它算进长度，
+    #   否则"正文 20000 + 提示 80"会超过上限，兜底那一刀就白设了。
+    note = _support_note(spec)
+    if note:
+        body = f"{note}\n\n{body}"
+
     if len(body) > MAX_SKILL_BODY_CHARS:
         # 截断并注明总长度：模型知道"后面还有"，可以让用户分段加载；
         # 不注明的话它会以为技能就这么多，然后按半截规矩干活。
@@ -306,5 +364,24 @@ def render(spec: SkillSpec, args: str = "") -> str:
             + f"\n\n…（正文已截断：只加载了前 {MAX_SKILL_BODY_CHARS} 字符，"
             f"全文共 {original} 字符）"
         )
+
+    # 【2026-11-10 第 21.8 轮】回复语言约束。
+    #   为什么加在这里而不是只靠系统提示词：
+    #     系统提示词（全局 THINKER.md）确实写了"中文回答"，但导入的技能正文是英文，
+    #     而且常常自带英文的输出模板（"Here's what I understand…"这类）。
+    #     对模型来说，**离内容最近的那条指令最有效**——正文说用英文模板，
+    #     隔着几千字符的系统提示词说用中文，前者会赢。
+    #     所以把约束贴在正文末尾，紧挨着内容本身。
+    #   为什么放在 render()（两条入口共用的函数）：
+    #     斜杠命令和 skill 工具最终都走这里，改一处两条路都覆盖；
+    #     只改斜杠命令的前缀，模型自己调 skill 工具时就会漏。
+    #   为什么放在截断之后：它是约束不是内容，被截断逻辑吃掉就白加了；
+    #     也因此不计入 20000 的正文上限（差这几十字符不改变"该不该截"的判断）。
+    #   为什么不翻译正文本身：翻译 13MB 的第三方技能既会走味，也会让上游更新没法合并；
+    #     要的只是"产出是中文"，把约束贴在产出前一步就够了。
+    body += (
+        "\n\n【回复语言】用中文回复用户；代码、命令、专有名词、文件路径保持原文。"
+        "技能正文是英文不代表要用英文回复。"
+    )
 
     return body

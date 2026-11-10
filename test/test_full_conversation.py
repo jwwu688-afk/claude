@@ -114,6 +114,13 @@ async def test_conversation_integration():
 
 
 if __name__ == "__main__":
+    # 【2026-11-10 第 21.7 轮后补】本测试真的会跑 start_conversation → add_message，
+    #   而懒创建会往 SESSIONS_DIR 写会话文件；不隔离的话每次都在用户真实的
+    #   ~/.thinker/sessions 里留一个空会话（实测踩过）。测完不恢复——进程随即退出。
+    import tempfile
+    from pathlib import Path
+    import core.session as _session_module
+    _session_module.SESSIONS_DIR = Path(tempfile.mkdtemp(prefix="thinker_test_sessions_"))
     success = asyncio.run(test_conversation_integration())
     # asyncio.run 负责启动异步世界，把上面那个 async 函数跑完，拿到它的返回值
     sys.exit(0 if success else 1)

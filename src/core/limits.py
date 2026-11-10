@@ -95,7 +95,9 @@ MAX_SKILL_DESCRIPTION_CHARS = _int_env("MAX_SKILL_DESCRIPTION_CHARS", 300)
 MAX_SKILLS_IN_BLOCK = _int_env("MAX_SKILLS_IN_BLOCK", 50, minimum=1)
 
 # 工具说明书里「可用技能」整块的上限（字符数）。
-#   条数上限挡不住"每条都很长"的情况，所以再加一道总长上限：
-#   300 字符 × 50 条 = 15000，仍然太多。6000 字符约等于 2000 token，
-#   是"够列十几个技能、又不至于失控"的量级。
-MAX_SKILLS_BLOCK_CHARS = _int_env("MAX_SKILLS_BLOCK_CHARS", 6000)
+#   条数上限挡不住"每条都很长"的情况，所以再加一道总长上限。
+#   【第 21.6 轮】6000 → 9000：实测导入 5 个学术技能后共 25 个，
+#   25 × 300 字符 ≈ 7500，6000 的上限会把排在后面的 5 个技能整个挤掉——
+#   "装了但模型看不见"比多花一点 token 更糟。9000 ≈ 3000 token/轮，
+#   是 25 个技能全可见的代价；技能再往上加就该删而不是再调大这个数。
+MAX_SKILLS_BLOCK_CHARS = _int_env("MAX_SKILLS_BLOCK_CHARS", 9000)

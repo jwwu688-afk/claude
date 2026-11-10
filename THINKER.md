@@ -54,7 +54,7 @@ python test/test_p0_fixes.py
 /compact                           立刻压缩一次上下文（不等 80%，会调一次摘要模型）
 /clear                             清空上下文并开一个新会话（旧会话文件保留，可 /resume 回去）
 /agents                            列出子 agent 类型、工具白名单、模型与来源（每次执行都会重扫 .thinker/agents）
-/skills [reload]                   列出已加载的技能、来源与扫描问题；reload 重扫目录
+/skills [reload|install <地址>]    列出技能；reload 重扫；install 从 GitHub 地址/本地目录装新技能
 ```
 
 技能文件放在 `.thinker/skills/` 下的技能会**自动登记成斜杠命令**（`/pdf`、`/release` …），
@@ -96,6 +96,8 @@ argument-hint: [文件路径]
 ```
 
 - 可用变量只有三个：`$ARGUMENTS`、`${SKILL_DIR}`、`${PROJECT_DIR}`（都不支持 `$0/$1`）。
+  为了能直接导入 Claude Code 的技能，也认 `${CLAUDE_SKILL_DIR}` / `${CLAUDE_PROJECT_DIR}`；
+  `description: >-` / `|` 这两种多行写法也能解析。
 - 认得的字段只有四个：`name` / `description` / `user-invocable` / `argument-hint`。
   其余字段（`allowed-tools` / `model` / `hooks` / `disable-model-invocation` …）**一律忽略**，
   不报错也不提示——从别处拷技能过来多写几行是正常事。
@@ -192,4 +194,5 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 - **子 agent 不给 `skill`**，和 `task` 一样是两道闸（`_get_available_tools` 的 exclude + `_is_tool_allowed`）。理由不只是省 token：技能正文是写给主 agent 的，里面常有"用 `todo_write` 记进度"这类话，子 agent 照做会踩掉主 agent 的待办清单（单例实例）。
 - **技能命令要记在 `_skill_command_names` 里**。`REGISTRY` 里同时有内置命令和技能命令，同名冲突检查（`builtin_command_names()`）必须把技能那部分减掉，否则 reload 之后技能会"跟自己的旧命令重名"而被拒载——表现为"能用一次，reload 就消失"。
 - **假 YAML 会把 `argument-hint: [文件路径]` 当成内联列表**。已在 `skill_spec._hint_text()` 里还原成方括号写法；以后再加"看起来像列表"的字段，记得同样处理，别去改解析器——那会变成给每个字段开特例。
+- **会话文件是懒创建的（第 21.7 轮），别"顺手"改回启动即落盘**。启动、/clear、本地斜杠命令都不建 JSONL；第一条真正发给模型的消息（含技能命令）才建，system 行由 `SessionStore.create(messages=...)` 一次补齐。空壳会话文件会把 `/resume` 列表填满，这才是这条规则的动机。
 - **不要再给技能加"模型看不见"的开关，也不要加"未生效字段"的标注**（21.1 / 21.2 各删过一次）。可见性多一维就多一个"我明明写了技能，模型却说不知道"的排查方向；字段标注则要"识别 → 存字段 → 拼展示 → 写测试"四处跟着维护，而它不改变任何行为。现在规则只有一条：**认得就读，不认得就丢**。清单长度靠 `MAX_SKILLS_*` 卡，不靠藏技能。

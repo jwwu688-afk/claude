@@ -767,7 +767,13 @@ async def cmd_clear(conversation, args: str) -> None:
     old_path, new_path = conversation.reset_conversation()
 
     ui.print_success(f"已清空上下文（{before_count} 条 → 1 条系统提示词）。")
-    ui.print_info(f"新会话文件：{new_path.name}")
+    # 【第 21.7 轮】新文件是懒创建的：clear 本身不落盘。
+    #   new_path 为 None 表示"新会话还没建"，要明说什么时候会建——
+    #   不说的话，用户去 ~/.thinker/skills/.. 找新文件找不到，会以为 clear 坏了。
+    if new_path is not None:
+        ui.print_info(f"新会话文件：{new_path.name}")
+    else:
+        ui.print_info("下一次真正提问时会创建新会话文件（斜杠命令不算）。")
     if old_path is not None:
         # 明说旧文件还在：用户可能以为"清空=删除存档"，那样下次想找回就白找了。
         ui.print_info(f"旧会话仍在：{old_path.name}（想回去用 /resume）")
@@ -814,6 +820,50 @@ async def cmd_agents(conversation, args: str) -> None:
 # 技能的正文怎么渲染、同名怎么覆盖、目录在哪，都在 tools/skill/ 里。
 # 命令层不重复实现那些规则，只取"已经扫好的清单"。
 # =============================================================================
+
+def _truncate_by_width(text: str, max_cols: int) -> str:
+    """按「显示列数」截断文本，超宽补省略号（2026-11-10 第 21.11 轮新增）
+
+    为什么必须按列数而不是字符数：
+      中文一个字占 **2 列**。上一版截"46 个字符"，46 个汉字实际占 92 列，
+      加上名字列和标签就超出终端宽度——用户看到的"突然换行"就是这么来的
+      （同一行里 ASCII 多的没折、汉字多的折了，看起来像随机发生）。
+      终端折行只认列数，所以截断也必须只认列数。
+
+    参数 max_cols：允许占用的最大显示列数（含省略号本身占的 1~2 列）。
+    """
+    cols = 0
+    for index, char in enumerate(text):
+        cols += _display_width(char)
+        if cols > max_cols - 1:  # 留出省略号的位置
+            return text[:index] + "…"
+    return text
+
+
+def _skill_summary_text(description: str, max_cols: int = 60) -> str:
+    """把技能描述压成 /skills 列表里的一句话（2026-11-10 第 21.10 轮新增）
+
+    两步：
+      1. 去掉"触发：…"尾巴——触发词是给**模型**挑技能用的，
+         人浏览列表只需要知道"这是干什么的"；留着它，一行能拖出两三屏宽。
+         只认中文"触发：/触发:"和英文 "Triggers:"，且必须出现在前 8 字符之后
+         ——开头就出现的"Use this skill…"是描述本体，不能当成触发词尾巴砍掉。
+      2. 按 max_cols **列**截断（不是字符！见 _truncate_by_width 的说明）。
+         默认 60 列对汉字是 30 个字；调用方按终端宽度动态算这个值。
+
+    参数 max_cols：摘要允许占用的显示列数（中文按 2 列算）。
+    """
+    text = " ".join((description or "").split())
+    for marker in ("触发：", "触发:", "Triggers:"):
+        cut = text.find(marker)
+        if cut >= 8:  # 出现在开头说明没有摘要本体，不能砍
+            text = text[:cut]
+            break
+    text = text.strip().rstrip("。，；;、,")
+    if not text:
+        return "（无描述）"
+    return _truncate_by_width(text, max_cols)
+
 
 def _one_line_summary(description: str) -> str:
     """把技能描述压成 /help 里能放的一行摘要
@@ -921,8 +971,65 @@ def register_skill_commands() -> int:
     return registered
 
 
+async def _install_from_command(conversation, raw: str) -> None:
+    """/skills install 的执行体：下载/拷贝 → 立刻重扫 → 重新登记命令
+
+    参数 raw：`install` 之后的那一段，可能带 --force。
+
+    为什么装完要立刻重扫，而不是提示"请重启"：
+      用户刚装完就会去 /skills 或 /help 里找它。让他重启，等于把"装成功"和
+      "看得见"拆成两步，中间那段时间他只会觉得命令没生效。
+      重扫的代价只是一次几毫秒的目录扫描。
+
+    为什么下载是同步的（没有丢线程池）：
+      命令本身就是"等它做完再回到输入提示"的语义，界面这段时间没有别的事要做；
+      做成可中断（Esc 取消下载）需要把 urllib 拆成流式 + 检查标记，属于另一轮的活。
+      先让它 60 秒超时兜底，不要为了这个把结构复杂化。
+    """
+    from tools.skill.installer import install_from
+
+    ui = conversation._ui_manager
+
+    # 开关位置无所谓：`install --force <地址>` 和 `install <地址> --force` 都认。
+    #   为什么不写成"第一个必须是地址"：用户从别处复制命令时，开关常在前面。
+    parts = raw.split()
+    force = "--force" in parts
+    target = " ".join(piece for piece in parts if piece != "--force").strip()
+
+    if not target:
+        ui.print_error("用法：/skills install <GitHub 地址 | 本地目录> [--force]")
+        ui.print_info("例如：/skills install https://github.com/anthropics/skills")
+        ui.print_info("GitHub 地址会转成 codeload 的 tar.gz 下载（本机 github.com 的 TLS 不通）。")
+        return
+
+    ui.print_info(f"正在安装：{target}")
+    report = install_from(target, force=force)
+
+    # 三种结局分开打印：成功是绿色的、跳过是黄色的、失败是红色的。
+    #   混成一段的话，用户扫一眼分不清"装上了几个"和"坏了几个"。
+    for name, path in report.installed:
+        ui.print_success(f"已安装 {name} → {path}")
+    for name, reason in report.skipped:
+        ui.print_warning(f"跳过 {name}：{reason}")
+    for message in report.errors:
+        ui.print_error(message)
+
+    if not report.total:
+        ui.print_info("没有装上任何技能。")
+        return
+
+    # 装完立刻重扫 + 登记：否则用户要重启才看得到新命令。
+    count = register_skill_commands()
+    tool_manager = getattr(conversation, "_tool_manager", None)
+    added = tool_manager.refresh_skill_tool() if tool_manager is not None else False
+    ui.print_info(f"已重新扫描：现在共 {count} 条技能命令（/skills 查看）。")
+    if added:
+        # 和 /skills reload 同一条提醒：工具清单进了缓存前缀，变了就按原价计费一次。
+        ui.print_info("skill 工具是这次新登记的：下一轮请求的工具清单会变，提示词缓存会失效一次。")
+
+
 async def cmd_skills(conversation, args: str) -> None:
-    """/skills —— 列出已加载的技能；/skills reload 重新扫描
+    """/skills —— 列出已加载的技能；reload 重扫；install 从地址/目录装
 
     为什么这条必须有：
       技能的目录、优先级、哪些字段没生效、扫描时哪一行写坏了……这些信息
@@ -931,15 +1038,25 @@ async def cmd_skills(conversation, args: str) -> None:
       和 /memory 那条命令的理由一模一样（第 14 轮）。
 
     参数 args：
-      "reload" → 重扫目录、重新登记斜杠命令、必要时补登记 skill 工具；
-      其他/空 → 只看不清单，不做任何改动。
+      "reload"             → 重扫目录、重新登记斜杠命令、必要时补登记 skill 工具；
+      "install <地址> [--force]" → 装技能（第 21.5 轮新增，见下面的 _install_from_command）；
+      其他/空              → 只看不清单，不做任何改动。
       为什么区分：重扫会改变 tools 清单（技能从 0 变 1 时），
       那会让提示词缓存失效一次。不该在"我只是想看看"的时候发生。
     """
     from tools.skill.skill_manager import SkillManager, global_skills_dir, project_skills_dir
 
     ui = conversation._ui_manager
-    wants_reload = args.strip().lower() == "reload"
+    raw_args = (args or "").strip()
+    lowered = raw_args.lower()
+
+    # 【第 21.5 轮】install 走独立分支：它会下载文件、改磁盘，
+    #   和"列清单/重扫"完全不是一类操作，混在一个 if 里迟早互相影响。
+    if lowered == "install" or lowered.startswith("install "):
+        await _install_from_command(conversation, raw_args[len("install"):].strip())
+        return
+
+    wants_reload = lowered == "reload"
 
     if wants_reload:
         count = register_skill_commands()  # 内部已经 reload 过，不再多扫一次
@@ -960,6 +1077,21 @@ async def cmd_skills(conversation, args: str) -> None:
         ui.print_info(f"项目目录：{project_skills_dir()}")
         ui.print_info("")
         ui.print_info(f"已加载 {len(specs)} 个技能：")
+        # 【第 21.10 轮】列对齐 + 摘要瘦身，修掉"一行一条缠成一团"的乱象：
+        #   · 名字列按最长的名字补齐（复用 /help 的显示宽度函数，中文按 2 列算），
+        #     视线顺着名字列往下扫，不用在一串字符里找边界；
+        #   · 摘要砍掉"触发：…"尾巴并截到 46 字：触发词是给**模型**挑技能用的，
+        #     人浏览列表只需要知道"这是干什么的"，一条命令一项，基本不折行。
+        name_width = max(_display_width(spec.name) for spec in specs)
+        # 【第 21.11 轮】摘要列宽按**终端实际宽度**动态算，不再写死 46 字符：
+        #   一行的总列数 = 前缀(2) + "/"(1) + 名字列 + 间隔(2) + 标签 + 空格(1) + 摘要。
+        #   用 rich 的 console.width 拿当前终端列数（命令一定跑在终端里，拿得到）；
+        #   再留 2 列余量防边界。终端窄（比如 80 列）时摘要自动变短，宽时自动变长。
+        from ui.theme import console  # 局部导入：commands.py 其余部分不依赖 rich 的宽度
+
+        tag_width = _display_width("[全局]")  # 两种来源标签显示宽度相同（各含 2 个汉字）
+        overhead = 2 + 1 + name_width + 2 + tag_width + 1
+        summary_cols = max(20, console.width - overhead - 2)
         for spec in specs:
             # 标记位拼成一段括号，比每个技能打好几行更省屏幕。
             flags = []
@@ -973,8 +1105,13 @@ async def cmd_skills(conversation, args: str) -> None:
             #   整套 UNSUPPORTED_FIELDS 机制删掉了：不认识的字段直接忽略、不展示。
             #   少一个概念，就少一处"某人改了字段表、忘了改这里"的可能。
             suffix = f"（{'；'.join(flags)}）" if flags else ""
-            description = spec.description or "（无描述）"
-            ui.print_info(f"  /{spec.name}  [{spec.source_text()}] {description}{suffix}")
+            # 标记位占用的列也要从摘要预算里扣：有标记的行摘要短一点，
+            #   换来"有标记也没折行"——整齐比多看几个字重要。
+            summary = _skill_summary_text(
+                spec.description, max_cols=summary_cols - _display_width(suffix)
+            )
+            padding = " " * (name_width - _display_width(spec.name))
+            ui.print_info(f"  /{spec.name}{padding}  [{spec.source_text()}] {summary}{suffix}")
     else:
         ui.print_warning("还没有加载到任何技能。")
         ui.print_info(f"在 {project_skills_dir()} 下建一个 <名字>/SKILL.md 就能用（也可以放 <名字>.md）。")
@@ -1016,4 +1153,9 @@ register(CommandSpec("agents", "/agents", "列出子 agent 类型（同时重新
 # 【2026-11-10 第 21 轮】技能的管理入口。它必须在技能命令之前就登记好：
 #   SkillManager 扫描时拿 builtin_command_names() 拦"和内置命令重名"的技能，
 #   而 skills 自己也是内置命令——不先登记，一个叫 skills 的技能目录就能把 /skills 顶掉。
-register(CommandSpec("skills", "/skills [reload]", "列出已加载的技能；reload 重新扫描", cmd_skills))
+register(CommandSpec(
+    "skills",
+    "/skills [reload|install <地址>]",
+    "列出技能；reload 重扫、install 装新技能",
+    cmd_skills,
+))

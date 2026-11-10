@@ -21,6 +21,10 @@
 #   15 reload 撤命令   删掉技能文件 → 命令消失，内置命令一条不少
 #   16 子 agent 双闸   清单层 exclude 有 skill；执行层 _is_tool_allowed 为 False
 #   17 is_repeatable   必须是 False（防止被 L3 折叠）
+#   18 导入兼容        `description: >-` 折叠块 / `|` 字面块、${CLAUDE_*} 变量名
+#   19 支撑文件        带支撑文件的技能加载时补「技能目录」，裸相对路径才不会指错
+#   20 /skills install 本地安装、同名不覆盖、--force、GitHub 地址改写、zip-slip
+#   21 列表摘要        /skills 一条一行：砍触发尾巴、名字列对齐、截 46 字
 #
 # 这个脚本**全程离线**：
 #   · 不构造真的 ToolManager（它会起后台任务连 MCP，asyncio.run 收尾时会卡住）；
@@ -314,7 +318,9 @@ def test_arguments():
     check("有占位符：原地替换", "a.pdf" in pdf_body and "$ARGUMENTS" not in pdf_body, pdf_body)
 
     appended = render(manager.get("plain"), "x y")
-    check("没占位符：参数追加到末尾", appended.rstrip().endswith("ARGUMENTS: x y"), appended[-30:])
+    # 注意不能断言 endswith：第 21.8 轮起正文末尾固定追加一句回复语言约束，
+    #   ARGUMENTS 在它之前。断言"包含"才是用户视角能观察到的结果。
+    check("没占位符：参数追加到末尾", "ARGUMENTS: x y" in appended, appended[-60:])
 
     no_args = render(manager.get("plain"), "")
     check("没参数：不追加", "ARGUMENTS:" not in no_args, no_args)
@@ -388,6 +394,19 @@ def test_unknown_fields_are_ignored():
     check("无用字段：模型仍可调用", "按步骤做" in loaded, loaded[:30])
     check("无用字段：不产生任何警告", manager.warnings == [], str(manager.warnings))
 
+    # 【第 21.6 轮】嵌套的 metadata 块也要静默：学术技能的 frontmatter 常带
+    #   `metadata:` 下面挂 version/status/related_skills，之前每个缩进行都刷一条
+    #   "不支持嵌套字段"，5 个技能能刷出 31 条，全是噪音。
+    write_skill(
+        GLOBAL_DIR,
+        "with-meta",
+        "name: with-meta\ndescription: 带嵌套元数据\nmetadata:\n  version: \"1.0\"\n  status: active\n  related_skills:\n    - a\n    - b",
+        body="按步骤做",
+    )
+    rescan()
+    check("嵌套 metadata：技能正常加载", manager.get("with-meta") is not None)
+    check("嵌套 metadata：不产生任何警告", manager.warnings == [], str(manager.warnings))
+
     commands.register_skill_commands()
     check("无用字段：斜杠命令照常登记", "pdf" in commands.REGISTRY)
 
@@ -452,6 +471,239 @@ def test_reload_drops_command():
     check("reload 后：/pdf 消失", "pdf" not in commands.REGISTRY, str(sorted(commands.REGISTRY)))
     missing = [name for name in builtin_names if name not in commands.REGISTRY]
     check("reload 后：内置命令一条不少", not missing, str(missing))
+
+
+# -----------------------------------------------------------------------------
+# 18：导入 GitHub 现成技能时的两处兼容（第 21.3 轮）
+# -----------------------------------------------------------------------------
+def test_imported_skill_compat():
+    """公开技能常用的两种写法，必须能读对
+
+    从 GitHub 拷来的技能不会按我们的口味写：
+      · `description: >-`（YAML 折叠块）——不支持的话描述会变空，
+        模型看不到它干什么，导入的人还以为是自己写错了；
+      · `${CLAUDE_SKILL_DIR}` / `${CLAUDE_PROJECT_DIR}`——不支持的话会以字面量
+        留在正文里，模型照着一个带 `${...}` 的假路径去执行。
+    """
+    fresh()
+    write_skill(
+        GLOBAL_DIR,
+        "folded",
+        "name: folded\ndescription: >-\n  第一行说明\n  第二行说明",
+        body="脚本：${CLAUDE_SKILL_DIR}/scripts/a.py\n项目：${CLAUDE_PROJECT_DIR}",
+    )
+    write_skill(
+        GLOBAL_DIR,
+        "literal",
+        "name: literal\ndescription: |\n  保留第一行\n  保留第二行",
+        body="按步骤做",
+    )
+    rescan()
+
+    manager = SkillManager()
+    folded = manager.get("folded")
+    literal = manager.get("literal")
+
+    # 解析层单独验一次：`|` 的语义确实是"保留换行"，把它压成一行是**取 description 时**做的
+    # （见 skill_spec.build_spec），不是解析器自作主张。分开测才能分清是哪一层的责任。
+    from tools.skill.frontmatter import parse_kv
+
+    fields, _ = parse_kv("desc: |\n  保留第一行\n  保留第二行")
+
+    check(
+        "折叠块：多行描述被拼成一行",
+        folded.description == "第一行说明 第二行说明",
+        repr(folded.description),
+    )
+    check(
+        "折叠块：不再报「不支持多行字符串」",
+        not any("多行字符串" in warning for warning in manager.warnings),
+        str(manager.warnings),
+    )
+    check(
+        "字面块：解析层保留换行（描述层会压成一行）",
+        "保留第一行\n保留第二行" in fields["desc"],
+        repr(fields["desc"]),
+    )
+    check(
+        "描述里的换行被压平（清单必须一行一个技能）",
+        "\n" not in literal.description,
+        repr(literal.description),
+    )
+
+    body = render(folded)
+    check(
+        "${CLAUDE_SKILL_DIR}：展开成技能目录",
+        str(folded.base_dir).replace("\\", "/") in body and "${" not in body,
+        body.splitlines()[0],
+    )
+    check(
+        "${CLAUDE_PROJECT_DIR}：展开成当前目录",
+        os.getcwd().replace("\\", "/") in body,
+        body.splitlines()[1],
+    )
+    # 【第 21.8 轮】英文技能正文也会把"用中文回复"一起带进去：
+    #   系统提示词虽然写了中文回答，但技能正文自带英文输出模板时，离内容近的指令会赢。
+    check(
+        "正文末尾带回复语言约束",
+        "【回复语言】用中文回复用户" in body,
+        body[-80:],
+    )
+
+
+# -----------------------------------------------------------------------------
+# 19：带支撑文件的技能要给「技能目录」提示（第 21.4 轮）
+# -----------------------------------------------------------------------------
+def test_support_files_note():
+    """支撑文件在磁盘上，正文里的裸相对路径却会被解析到**项目根**
+
+    实测：`internal-comms` 让模型读 `examples/3p-updates.md`，
+    file_tools 会把它解析成 `<当前项目>/examples/3p-updates.md`，不是技能目录。
+    所以在加载正文时补一行"技能目录"，把相对基准说清楚。三条边界：
+      · 目录形态 + 有支撑文件 → 加提示；
+      · 目录形态 + 只有 SKILL.md → 不加（没东西可指，加了是噪音）；
+      · 单文件形态 → 不加（它的父目录里可能是别的技能）。
+    """
+    fresh()
+    write_skill(GLOBAL_DIR, "with-files", "description: 带支撑文件", body="读 examples/a.md")
+    (GLOBAL_DIR / "with-files" / "examples").mkdir()
+    (GLOBAL_DIR / "with-files" / "examples" / "a.md").write_text("示例", encoding="utf-8")
+    write_skill(GLOBAL_DIR, "bare", "description: 只有正文", body="按步骤做")
+    write_skill(GLOBAL_DIR, "single", "description: 单文件", body="按步骤做", single=True)
+    rescan()
+
+    manager = SkillManager()
+    with_note = render(manager.get("with-files"))
+    check("有支撑文件：加技能目录提示", "【技能目录】" in with_note, with_note.splitlines()[0])
+    check(
+        "提示里给的是绝对路径",
+        str(manager.get("with-files").base_dir).replace("\\", "/") in with_note,
+        with_note.splitlines()[0],
+    )
+    check("只有 SKILL.md：不加提示", "【技能目录】" not in render(manager.get("bare")))
+    check("单文件形态：不加提示", "【技能目录】" not in render(manager.get("single")))
+
+
+# -----------------------------------------------------------------------------
+# 20：/skills install —— 本地目录安装、冲突、--force、地址改写、zip-slip
+# -----------------------------------------------------------------------------
+def test_skill_install():
+    """安装器的四条边界（第 21.5 轮）
+
+    网络部分不测（离线脚本），但"地址怎么改写成 codeload"是纯函数，必须钉住：
+    本机 github.com 的 TLS 不通，改错这一行就等于安装功能整体不可用。
+
+    zip-slip 是这类功能的经典漏洞：压缩包里放一个 `../evil.txt`，
+    天真的 extractall 就会写到目标目录外。这里断言我们挡得住。
+    """
+    import io
+    import tarfile
+
+    import tools.skill.installer as installer
+
+    fresh()
+    source_root = TMP / "download"
+    shutil.rmtree(source_root, ignore_errors=True)
+    (source_root / "good").mkdir(parents=True)
+    (source_root / "good" / "SKILL.md").write_text(
+        "---\nname: imported\ndescription: 从目录装进来的\n---\n正文 v1", encoding="utf-8"
+    )
+    (source_root / "bad name").mkdir()
+    (source_root / "bad name" / "SKILL.md").write_text(
+        "---\nname: bad name\ndescription: 名字不合法\n---\n正文", encoding="utf-8"
+    )
+
+    # installer 模块在导入时就绑定了 global_skills_dir，所以这里要单独替换，
+    # 否则测试会写到用户真实的 ~/.thinker/skills。
+    installer.global_skills_dir = lambda: GLOBAL_DIR
+
+    report = installer.install_from(str(source_root))
+    check("本地安装：装上 1 个", len(report.installed) == 1, str(report.installed))
+    check("本地安装：非法名的被跳过并说明原因",
+          len(report.skipped) == 1 and "不合法" in report.skipped[0][1], str(report.skipped))
+    target = GLOBAL_DIR / "imported" / "SKILL.md"
+    check("本地安装：文件真的落到了 ~/.thinker/skills/<name>/", target.is_file(), str(target))
+
+    again = installer.install_from(str(source_root))
+    # 注意 skipped 里同时会有"名字不合法"那一条（源目录没变），所以按原因找，不能取第 0 项。
+    check("重复安装：不覆盖，记为跳过",
+          not again.installed and any("已存在" in reason for _, reason in again.skipped),
+          str(again.skipped))
+
+    # 改了源内容再强制覆盖：目标文件应该跟着变
+    (source_root / "good" / "SKILL.md").write_text(
+        "---\nname: imported\ndescription: 第二版\n---\n正文 v2", encoding="utf-8"
+    )
+    forced = installer.install_from(str(source_root), force=True)
+    check("--force：覆盖成功且内容更新",
+          len(forced.installed) == 1 and "正文 v2" in target.read_text(encoding="utf-8"),
+          str(forced.installed))
+
+    # 地址改写：三种 github 写法都要落到 codeload，别的站点原样放行
+    urls = [
+        "https://github.com/anthropics/skills",
+        "https://github.com/anthropics/skills.git",
+        "https://github.com/anthropics/skills/tree/dev",
+    ]
+    mapped = [installer._github_archive_url(u) for u in urls]
+    check(
+        "GitHub 地址改写成 codeload",
+        mapped[0] == "https://codeload.github.com/anthropics/skills/tar.gz/refs/heads/main"
+        and mapped[1] == mapped[0]
+        and mapped[2].endswith("/refs/heads/dev"),
+        " | ".join(str(m) for m in mapped),
+    )
+    check("非 GitHub 地址不改写", installer._github_archive_url("https://example.com/a.tar.gz") is None)
+
+    # zip-slip：压缩包里的 ../ 不能写到目标目录之外
+    evil_tar = TMP / "evil.tar.gz"
+    payload = b"pwned"
+    with tarfile.open(evil_tar, "w:gz") as bundle:
+        bad = tarfile.TarInfo("../evil.txt")
+        bad.size = len(payload)
+        bundle.addfile(bad, io.BytesIO(payload))
+        good = tarfile.TarInfo("ok.txt")
+        good.size = len(payload)
+        bundle.addfile(good, io.BytesIO(payload))
+    extract_to = TMP / "extract"
+    extract_to.mkdir()
+    installer._safe_extract(evil_tar, extract_to)
+    check("zip-slip：../ 的成员被拒绝", not (TMP / "evil.txt").exists())
+    check("zip-slip：正常成员照常解出", (extract_to / "ok.txt").is_file())
+
+
+# -----------------------------------------------------------------------------
+# 21：/skills 列表的摘要函数（第 21.10 轮）
+# -----------------------------------------------------------------------------
+def test_skills_listing_summary():
+    """列表摘要 = 砍触发词尾巴 + 截 46 字
+
+    用户反馈 /skills"太乱"：名字和上千字的描述挤一行，还带"触发：…"尾巴。
+    触发词是给模型挑技能用的，人浏览只需要"这是干什么的"。
+    这四条钉住摘要函数的行为边界。
+    """
+    from core.commands import _skill_summary_text
+
+    check(
+        "触发尾巴被砍掉",
+        _skill_summary_text("按学术规范写论文：全文与修订。触发：写论文。") == "按学术规范写论文：全文与修订",
+        _skill_summary_text("按学术规范写论文：全文与修订。触发：写论文。"),
+    )
+    check(
+        "开头就在的英文描述不被误砍（它本身就是摘要）",
+        _skill_summary_text("Use this skill any time a spreadsheet file is the primary input.").startswith(
+            "Use this skill"
+        ),
+    )
+    check("空描述给占位", _skill_summary_text("") == "（无描述）")
+    # 第 21.11 轮：截断单位从"字符"改成"显示列"——中文一字占 2 列，
+    #   按字符截 46 个汉字实际占 92 列，超出终端宽度就会突然折行（用户截图抓到的）。
+    from core.commands import _display_width
+
+    long_cn = _skill_summary_text("长" * 60)
+    check("按显示列截断：60 列内", _display_width(long_cn) <= 60 and long_cn.endswith("…"),
+          f"{long_cn}（{_display_width(long_cn)} 列）")
+    check("短描述原样保留", _skill_summary_text("只有一句话") == "只有一句话")
 
 
 # -----------------------------------------------------------------------------
@@ -528,6 +780,14 @@ def main():
         test_slash_invocation()
         print()
         test_reload_drops_command()
+        print()
+        test_imported_skill_compat()
+        print()
+        test_support_files_note()
+        print()
+        test_skill_install()
+        print()
+        test_skills_listing_summary()
         print()
         test_subagent_gates()
         print()

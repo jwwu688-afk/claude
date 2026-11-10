@@ -247,6 +247,14 @@ def test_bad_json_not_batched():
 
 if __name__ == "__main__":
     print("🧪 只读工具并发\n")
+    # 【2026-11-10 第 21.7 轮后补】本测试会调 add_message，而 add_message 现在会
+    #   懒创建会话文件；不把 SESSIONS_DIR 指到临时目录的话，每跑一次就往
+    #   真实的 ~/.thinker/sessions 写 5 个空会话（实测踩过：用户 /resume 里
+    #   多出一排"没有用户消息"的记录）。测完不恢复——进程马上就退出了。
+    import tempfile
+    from pathlib import Path
+    import core.session as _session_module
+    _session_module.SESSIONS_DIR = Path(tempfile.mkdtemp(prefix="thinker_test_sessions_"))
     # get_reminder 会去构造 ToolManager 单例（连 MCP 服务器），测试里换成空串
     conversation_module.get_reminder = lambda: ""
 

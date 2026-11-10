@@ -411,11 +411,18 @@ def test_clear(tmp_root):
         after = hm.messages_history[-1]
         check("清空前确实有多条", before_count == 3, str(before_count))
         check("只剩系统提示词", len(after) == 1 and after[0]["role"] == "system")
-        check("换了新的会话文件", conv._session.path != old_path, conv._session.path.name)
+        check("清空后不立刻建新文件（懒创建，第 21.7 轮）", conv._session is None)
         check("旧文件仍保留（能 /resume 回去）", old_path.is_file())
-        check("新文件只有 header + system 两行",
-              len(conv._session.path.read_text(encoding="utf-8").strip().splitlines()) == 2)
+        check("提示下次提问时才创建", "下一次真正提问" in ui.text())
         check("提示旧会话还在", "旧会话仍在" in ui.text())
+        # 懒创建的另一半：clear 之后第一条真正的消息要建出新文件，
+        #   内容 = header + system + 这条消息（system 由 create 的 messages 参数补写）。
+        conv.add_message({"role": "user", "content": [{"type": "text", "text": "clear 之后的第一句"}]})
+        check("clear 后第一条消息触发建新文件",
+              conv._session is not None and conv._session.path != old_path,
+              conv._session.path.name if conv._session else "None")
+        new_lines = conv._session.path.read_text(encoding="utf-8").strip().splitlines()
+        check("新文件 = header + system + 第一条消息", len(new_lines) == 3, str(len(new_lines)))
         check("账本重算成新占用", hm.history_token_usage[-1].total_tokens > 0)
     finally:
         session_module.SESSIONS_DIR = old_sessions_dir

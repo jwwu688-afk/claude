@@ -176,8 +176,13 @@ def parse_kv(raw: str) -> Tuple[Dict[str, object], List[str]]:
                     index += 1
                     continue
                 if nxt[:1] in (" ", "\t"):
-                    # 缩进但不是列表项 → 嵌套 map。本版不解释，吞掉并留说明。
-                    problems.append(f"不支持嵌套字段（第 {index + 1} 行），已忽略：{nxt_stripped}")
+                    # 缩进但不是列表项 → 嵌套 map（比如 `metadata:` 下面挂 version/status）。
+                    # 【第 21.6 轮】从"记警告"改成**静默跳过**：
+                    #   21.2 定的口径是"认得就读，不认得就丢"，而这里记警告违背了它——
+                    #   实测导入 5 个学术技能后 /skills 刷出 31 条"不支持嵌套字段"，
+                    #   每一条都不影响任何行为，纯粹是噪音。
+                    #   保留吞行的逻辑不能删：不吞的话，嵌套里的 `version: x` 会被
+                    #   当成顶层键解析进 fields，等于替用户编造了几个不存在的字段。
                     index += 1
                     continue
                 break  # 回到顶层，交给外层继续解析
@@ -190,10 +195,30 @@ def parse_kv(raw: str) -> Tuple[Dict[str, object], List[str]]:
             continue
 
         if value[0] in "|>":
-            # 多行字符串。吞掉后面所有缩进行，免得它们的 `xxx:` 被当成顶层键。
-            problems.append(f"不支持多行字符串（{key}: {value[0]}），已忽略这一段")
-            while index < len(lines) and lines[index][:1] in (" ", "\t") and lines[index].strip():
-                index += 1
+            # 【2026-11-10 第 21.3 轮】多行字符串从"不支持"改成"支持"。
+            #   为什么改：从 GitHub 拷来的技能里 `description: >-` 这种折叠写法很常见，
+            #   不支持的话描述会变成空——技能照样加载，但模型看不到它干什么，
+            #   在清单里只剩一句"未写描述"，导入方完全不知道是解析器的锅。
+            #
+            #   两种风格（YAML 语义，这里只实现最常用的部分）：
+            #     >  折叠：相邻行用空格连成一行，空行保留为换行
+            #     |  字面：原样保留换行
+            #   末尾的 `-` / `+`（chomping 指示符）不区分，统一去掉首尾空白。
+            #   为什么可以偷这个懒：这些字段（description / argument-hint）都是"一句话"，
+            #   末尾多一个换行或少一个换行不影响任何判断，为此写三种裁剪规则不值。
+            block: List[str] = []
+            while index < len(lines):
+                nxt = lines[index]
+                if not nxt.strip():
+                    block.append("")  # 块中间的空行：属于块内容（折叠时变成换行）
+                    index += 1
+                    continue
+                if nxt[:1] in (" ", "\t"):
+                    block.append(nxt.strip())
+                    index += 1
+                    continue
+                break  # 出现不缩进的行，说明块结束，交回外层
+            fields[key] = _fold_block(block, value[0])
             continue
 
         if value.startswith("["):
@@ -205,6 +230,40 @@ def parse_kv(raw: str) -> Tuple[Dict[str, object], List[str]]:
         fields[key] = _scalar(value)
 
     return fields, problems
+
+
+def _fold_block(lines: List[str], style: str) -> str:
+    """把多行字符串块拼成一段文字（`>` 折叠 / `|` 保留换行）
+
+    参数 lines：已经去掉缩进的各行内容，可能带空字符串（源自块内的空行）。
+    参数 style：`>` 或 `|`，取自原值第一个字符。
+
+    为什么两种风格都要实现：
+      GitHub 上的技能两种写法都有——`description: >-` 是想表达"这是一段话"，
+      `description: |` 是想表达"这里刻意要换行"。都当空格拼会毁掉后者，
+      都保留换行会让前者在清单里变成多行、撑坏 `- name：描述` 的单行格式。
+    """
+    # 去掉首尾空行：它们的来源是"key: >-" 后面紧跟的空行、以及块末尾贴着下一条分隔线。
+    while lines and not lines[0].strip():
+        lines.pop(0)
+    while lines and not lines[-1].strip():
+        lines.pop()
+    if not lines:
+        return ""
+
+    if style == "|":
+        return "\n".join(lines)
+
+    # 折叠：连续非空行用单个空格连接；空行代表一个真正的换行。
+    parts = []
+    for line in lines:
+        if not line:
+            parts.append("\n")
+        elif parts and parts[-1] != "\n":
+            parts[-1] = parts[-1] + " " + line
+        else:
+            parts.append(line)
+    return "".join(parts).strip()
 
 
 def _scalar(value: str) -> str:
