@@ -70,18 +70,21 @@ MAX_NAME_CHARS = 64
 class SkillSpec:
     """一份技能的元数据（元数据 = 启动时就要知道的那部分）
 
-    frozen=True 的理由和 AgentSpec 一样：这份数据会被工具说明书、斜杠命令表、
-    /skills 三处同时引用。谁都能改的话，某处顺手改掉 user_invocable，
-    就会让一条斜杠命令凭空出现或消失，而这种 bug 运行时看不出来。
+    frozen=True 的理由和 AgentSpec 一样：这份数据会被工具说明书和 /skills
+    同时引用。谁都能改的话，某处顺手改掉 description，模型看到的说明
+    和用户看到的清单就对不上了，而这种 bug 运行时很难看出来。
 
     字段：
-      name            技能名，同时是斜杠命令名。合法性在 build_spec 里校验。
+      name            技能名。合法性在 build_spec 里校验。
       description     一句话说明（进工具说明书，模型靠它决定用不用）。
       path            SKILL.md 或 <名字>.md 的绝对路径。正文每次现读它。
       base_dir        ${SKILL_DIR} 要替换成的目录（单文件形态时是它的父目录）。
       source          "global" 还是 "project"，/skills 里要标来源。
-      user_invocable  False = 不出现在斜杠命令里（模型仍可调用）。
-      argument_hint   只影响 /help 里的用法显示，比如 "[文件路径]"。
+      user_invocable  【第 24 轮起不再影响任何行为】原本控制"是否登记成 /名字 命令"。
+                      字段保留只为兼容已有的技能文件：frontmatter 里写了也不会报错，
+                      读进来放着不用。技能现在一律只由模型通过 skill 工具调用。
+      argument_hint   【第 24 轮起不再影响任何行为】原本是 /help 里的用法提示。
+                      同上，保留解析、不再展示。
     """
 
     name: str

@@ -47,7 +47,7 @@ from rich.text import Text  # 富文本：可以给一段文字的不同部分�
 # 【2026-11-10 第 21.7 轮】0.10.0 → 0.10.1：会话文件懒创建——启动不再立刻落盘，
 #   第一条真正发给模型的消息（含技能斜杠命令，不含本地斜杠命令）才建新 JSONL。
 #   末位进位理由：不新增能力，只是把第 13 轮"何时建文件"的时机改对。
-VERSION = "0.10.1"  # 【第 21.7 轮】会话懒创建；启动时 banner 会显示，便于确认真机跑的是新代码
+VERSION = "0.10.2"  # 【第 21.7 轮】会话懒创建；启动时 banner 会显示，便于确认真机跑的是新代码
 
 
 def _readable_dir(path: str) -> str:
@@ -205,16 +205,13 @@ def cli():
     if "--continue" in argv or "-c" in argv:
         resume_path = run_continue()
 
-    # 【第 21 轮】把 .thinker/skills 下的技能登记成斜杠命令。
-    #   为什么必须在进对话之前：/help 和 Tab 补全都读 REGISTRY，
-    #   晚一步登记，用户在第一个输入提示符上就看不到技能命令——
-    #   而"第一个提示符"正是他唯一会去按 Tab 试试的时候。
-    #   为什么不用 try：登记失败通常意味着技能目录读不了，那种情况下
-    #   少几条命令不影响对话；但吞掉异常就没人知道技能失效了。
-    #   所以只在真正扫描/登记的地方兜异常（见 _print_skill_hint 的注释），这里不包。
-    from core.commands import register_skill_commands
-
-    register_skill_commands()
+    # 【第 24 轮】这里原来调 register_skill_commands()，把技能登记成 /名字 命令。
+    #   现在技能只由模型按需调用，启动期不需要碰磁盘：
+    #     · 命令表是静态的，进入对话前就已经完整（内置命令在 import 时就登记好了）；
+    #     · 技能清单由 SkillManager._ensure_scanned() 懒加载，第一次被查询
+    #       （模型要工具清单、用户敲 /skills）时才扫目录。
+    #   顺带的好处：启动不再因为技能目录读不了而变慢或报错，
+    #   坏掉的技能文件也只在真正用到时以一行告警出现，而不是挡在启动路径上。
 
     try:
         asyncio.run(main(resume_path))

@@ -30,17 +30,16 @@
 #   两件事长得像，目的不同。
 #
 # 【一次启动的时间线（这就是整个机制）】
-#   1. main.cli() → register_skill_commands()
-#   2.   → SkillManager().reload()：扫两个目录，每个文件只读前 4KB
-#   3.   → 每个 spec 登记一条 /名字 命令（REGISTRY，供 /help 与 Tab 补全用）
-#   4. main() → Conversation() → ToolManager.__init__()
-#   5.   → refresh_skill_tool()：count() > 0 才登记 skill 工具
-#   6. 模型要工具清单 → skill_tool.json_schema() → available_block()
-#   7.   → 只把 name + description 放进 tools 字段（每轮都发，所以要卡上限）
-#   8. 模型调 skill("pdf") → load_body() → render()：这时才读正文
+#   1. main.cli() → 进入对话。第 24 轮起启动期**不扫技能目录**（技能不再占用命令名）
+#   2. main() → Conversation() → ToolManager.__init__()
+#   3.   → refresh_skill_tool() → count() → _ensure_scanned()：第一次触发懒扫描
+#   4.   → SkillManager().reload()：扫两个目录，每个文件只读前 4KB
+#   5. 模型要工具清单 → skill_tool.json_schema() → available_block()
+#   6.   → 只把 name + description 放进 tools 字段（每轮都发，所以要卡上限）
+#   7. 模型调 skill("pdf") → load_body() → render()：这时才读正文
 #
-#   注意第 2 步和第 7 步之间隔了一次"快照"：扫描结果是存在 self._specs 里的。
-#   所以改 frontmatter 要 reload，改正文不用（第 8 步每次都读盘）。
+#   注意第 4 步和第 6 步之间隔了一次"快照"：扫描结果是存在 self._specs 里的。
+#   所以改 frontmatter 要 reload，改正文不用（第 7 步每次都读盘）。
 # =============================================================================
 
 import os  # 取启动时的 cwd（项目级技能目录的基准）
@@ -81,25 +80,11 @@ def project_skills_dir(cwd: Optional[str] = None) -> Path:
     return Path(cwd or os.getcwd()) / ".thinker" / "skills"
 
 
-def _reserved_command_names() -> set:
-    """内置斜杠命令名（技能不能和它们重名）
-
-    为什么要"现问"一遍而不是在本文件写死一份清单：
-      commands.REGISTRY 才是内置命令的唯一来源。这里手写一份，
-      下次往 commands.py 加命令时必然漏更新，然后某天一个叫 `cost` 的技能
-      静默把 `/cost` 顶掉，用户只会觉得"花钱统计坏了"。
-
-    为什么要 try/except：
-      这是模块间的**惰性**依赖（函数内 import），极端情况下
-      （比如 commands 正在导入中就被调用）可能拿不到。拿不到就当成"没有保留名"，
-      代价是极小概率漏拦一个重名技能，收益是绝不在启动期抛异常。
-    """
-    try:
-        from core.commands import builtin_command_names  # 定义见 core/commands.py
-
-        return builtin_command_names()
-    except Exception:  # pragma: no cover - 只在导入期极端时序下发生
-        return set()
+# 【第 24 轮】这里原来有个 _reserved_command_names()，用来拦"技能和内置命令重名"
+# （比如一个叫 cost 的技能会把 /cost 顶掉）。
+# 技能不再登记成斜杠命令之后，这个冲突面直接消失了：技能名和命令名是两个独立命名空间，
+# 同时存在也不会互相影响。所以整个函数删掉——留着它反而会让一个叫 cost 的技能被静默拒载，
+# 而用户完全看不出为什么要跳过它。
 
 
 class SkillManager:
@@ -154,7 +139,6 @@ class SkillManager:
         specs: Dict[str, SkillSpec] = {}
         shadowed: List[Tuple[str, Path]] = []
         warnings: List[str] = []
-        reserved = _reserved_command_names()
 
         # 全局在前、项目在后：后面的同名项覆盖前面的。
         #   这个顺序就是"项目赢"的全部实现——没有额外的优先级比较逻辑，
@@ -179,14 +163,6 @@ class SkillManager:
                 warnings.extend(problems)
                 if spec is None:
                     continue  # 名字不合法等原因被拒载，原因已经在 problems 里
-
-                if spec.name in reserved:
-                    # 与内置命令重名：拒载。静默替换会让用户以为 /cost 坏了，
-                    # 而"内置命令优先"这条规则必须能被看见，所以留一条警告。
-                    warnings.append(
-                        f"技能 '{spec.name}' 与内置命令 /{spec.name} 重名，已跳过（{target}）"
-                    )
-                    continue
 
                 previous = specs.get(spec.name)
                 if previous is not None:

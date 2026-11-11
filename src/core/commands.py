@@ -125,28 +125,21 @@ def register(spec: CommandSpec) -> None:
     REGISTRY[spec.name] = spec
 
 
-# 【2026-11-10 第 21 轮】技能命令名台账。
-#   为什么要记：技能是磁盘上的文件，会增会删。/skills reload 时如果只"补登记新的"，
-#   已经删掉的那个技能仍留在 REGISTRY 里——用户敲 /old-name 会得到
-#   "技能已经不在了"，看起来像 reload 根本没生效。
-#   所以重新登记前，先按这个集合把上一轮登记的技能命令整体撤掉。
+# 【第 24 轮】技能不再登记成斜杠命令。
+#   第 21 轮曾把每个技能变成一条 /名字 命令，用户可以在输入框里直接敲。
+#   现在取消了：技能只由模型按需调用（skill 工具），命令表只留内置的那些。
 #
-#   为什么不用"扫一遍 REGISTRY，凡是 handler 是技能的就删"：
-#     那要靠函数的 __name__ 或某种标记来认人，脆弱且难读。
-#     一份显式的名字集合，读代码的人一眼就知道它管什么。
-_skill_command_names: set = set()
-
-
-def builtin_command_names() -> set:
-    """内置命令名（= 注册表里除去技能登记的那些）
-
-    谁在问：SkillManager 扫描时用来拦"技能和内置命令重名"（比如一个叫 cost 的技能）。
-    为什么要减掉 _skill_command_names：
-      否则同名判断会把"上一轮自己登记过的技能命令"当成内置命令，
-      于是 reload 之后一个技能会因为跟它自己的旧命令重名而被拒载——
-      表现为"第一次能用，reload 一次就消失了"。
-    """
-    return {name for name in REGISTRY if name not in _skill_command_names}
+#   为什么取消——两条口径混在一张表里，会让人对"花不花钱"判断错：
+#     · 斜杠命令的定义是"本地百分之百能答、不发给模型、不占上下文"（第 14 轮）；
+#     · 而技能恰恰相反，它是"把一段正文当成你说的话发出去"，按输入计费。
+#   两者在 /help 里并排列着，用户自然以为敲 /pdf 是本地操作。
+#   与其在列表底下补一句"技能命令例外"，不如干脆不让它出现在这里：
+#   技能看清单位置是 /skills，模型自己判断何时加载。
+#
+#   顺带删掉的两样东西：
+#     · _skill_command_names（登记台账）：没有登记，就不需要撤销；
+#     · builtin_command_names()（给技能查重名用的）：技能不再占用命令名，
+#       一个叫 cost 的技能不会和 /cost 冲突，这条限制没有存在意义了。
 
 
 def is_command(text: str) -> bool:
@@ -320,19 +313,15 @@ def _print_help(conversation) -> None:
     ui.print_info("")
     # 这句不是装饰：用户第一次看到斜杠命令，最想知道的是
     # "它会不会也被记进对话、也被计费"。直接说清楚，省得他去试探。
+    # 【第 24 轮】去掉"技能命令例外"那句：技能已经不在这张表里了（见前面
+    # _skill_command_names 删除处的说明），现在这句话对表里每一条都成立。
     ui.print_info("斜杠命令在本地处理，不会发给模型，也不占上下文。")
-    # 【2026-11-10 第 21 轮】技能命令是**唯一**的例外，上面那句话对它不成立。
-    #   必须写出来：用户看到 /pdf 以为"本地处理不花钱"，结果它把两千字正文
-    #   当成用户消息发出去、还按输入计费——不说清楚，这是最容易被当成 bug 的地方。
-    #   只在真的登记了技能命令时才提这一句，没技能的用户不该被这个概念打扰。
-    if _skill_command_names:
-        # 【第 21.13 轮】这句刻意很短：说明文字也会折行，顶到终端宽度时
-        #   续行顶格、和命令列表混在一起，看起来像"格式乱了"（用户截图的观感）。
-        #   哪些命令是技能，列表本身已经体现了；这里只留最关键的一句例外说明。
-        ui.print_info("技能命令例外：它把技能正文当成你说的这句话发给模型。")
     # 【第 16 轮】Tab 补全是个"隐形的功能"：不写在任何地方，用户永远不会发现。
     # 而 help 恰好是他会主动打开的地方，放在这里最省事。
     ui.print_info("输入 / 开头之后按 Tab，可以补全命令名（唯一匹配会直接补上）。")
+    # 技能从命令表里消失之后，用户唯一的困惑会是"那我怎么用技能"。
+    # 与其让他去猜，不如在这里直接说明入口在模型那边。
+    ui.print_info("技能不占用斜杠命令：直接说要做什么，模型会自己判断要不要加载（清单见 /skills）。")
 
 
 async def cmd_help(conversation, args: str) -> None:
@@ -726,7 +715,8 @@ async def cmd_compact(conversation, args: str) -> None:
       这也是项目一贯的取舍：凡是会花钱的动作，先在界面上说一声。
 
     参数 args：暂时不用。将来可能支持 "/compact 0.5" 指定压掉多少比例，
-      现在先只做一个"压一轮"的版本，少一条没人验证的路径。
+      现在先只做一个"压到边界"的版本（保留最近 N 条、前面整段压完），
+      少一条没人验证的路径。
     """
     ui = conversation._ui_manager
     history = conversation._history_manager
@@ -740,6 +730,19 @@ async def cmd_compact(conversation, args: str) -> None:
 
     ui.print_info("正在压缩上下文…（会调用一次摘要模型，产生一次请求）")
     stats = await history.compact_now()
+
+    # 【2026-11-11 第 25 轮】先看"到底压没压"，再看"省了多少"。
+    #   原来只有后者，于是"没有可压内容"和"摘要失败"都会被说成
+    #   "摘要太长不划算"——把用户往错误的方向带（他会以为多聊几句再压就行，
+    #   实际是再压一百次也不会有效果）。
+    if not stats["compressed"]:
+        if stats["reason"] == "summarize_failed":
+            ui.print_warning("摘要没有拿到，历史原样保留（一条都没删）。稍后再试一次。")
+        elif stats["reason"] == "only_previous_summary":
+            ui.print_warning("能压的内容已经压完了（剩下的只是上次的摘要）。建议用 /clear 开新会话。")
+        else:  # nothing_to_compress
+            ui.print_warning("没有可压缩的较早对话（剩下的都是最近内容）。建议用 /clear 开新会话。")
+        return
 
     # 为什么用 token 而不是"条数"判断有没有效果：
     #   压缩不是纯删除——它会在原位置插一条"历史已压缩 + 摘要"的公告。
@@ -831,11 +834,14 @@ async def cmd_agents(conversation, args: str) -> None:
 
 
 # =============================================================================
-# 九、技能（2026-11-10 第 21 轮）
+# 九、技能（2026-11-10 第 21 轮；第 24 轮去掉命令登记）
 #
-# 这一节只做两件事：
-#   1. 把磁盘上的技能登记成斜杠命令（register_skill_commands）；
-#   2. /skills —— 看清楚现在加载了什么、哪些字段没生效、扫描时出了什么问题。
+# 这一节只做一件事：
+#   /skills —— 看清楚现在加载了什么、哪些字段没生效、扫描时出了什么问题。
+#
+# 【第 24 轮】原来还有第二件事：把每个技能登记成 /名字 命令。
+#   现已取消，理由写在前面（"技能不再登记成斜杠命令"那段）。
+#   技能的唯一调用方是模型自己（skill 工具），用户侧只有 /skills 这一个入口。
 #
 # 技能的正文怎么渲染、同名怎么覆盖、目录在哪，都在 tools/skill/ 里。
 # 命令层不重复实现那些规则，只取"已经扫好的清单"。
@@ -885,121 +891,25 @@ def _skill_summary_text(description: str, max_cols: int = 60) -> str:
     return _truncate_by_width(text, max_cols)
 
 
-def _one_line_summary(description: str) -> str:
-    """把技能描述压成单行文本（存进 CommandSpec.summary，2026-11-10 第 21 轮新增）
-
-    【第 21.12 轮】这里**不再截 40 字**，只负责把换行/连续空格压平——
-      截断挪到了 _print_help 的显示层按「列数」算。
-      为什么挪：40 个汉字占 80 列，加上用法列就超出终端宽度（用户截图抓到的：
-      /frontend-design 的摘要整段折到第二行）。字符数和显示宽度不是一回事，
-      这条教训 21.11 在 /skills 上已经付过一次学费，/help 不能再犯。
-      为什么保留"压平"：description 可能是多行块（`|`），不压平的话
-      一条命令会占好几行，列对齐全毁。
-    """
-    text = " ".join((description or "").split())  # 换行、连续空格压成单个空格
-    if not text:
-        # 没写描述不是错误（技能仍能用 /名字 手动调用），但摘要位不能空着，
-        # 否则 /help 那一行看起来像渲染坏了。
-        return "（技能没有写描述）"
-    return text
-
-
-def _make_skill_handler(name: str):
-    """造一条技能命令的处理函数
-
-    参数 name：技能名。用闭包固定住，而不是从 args 里解析——
-      args 是"用户给的参数"（文件路径之类），技能名是"用户点了哪条命令"，
-      两者在 parse() 里已经分开了，再混回去等于把命令名当成参数。
-
-    这个 handler 只做三件事：
-      1. 现取一次 spec（可能在扫描之后被删了，所以要判空）；
-      2. 渲染正文（现读文件 + 变量替换 + 截断，和 skill 工具走同一个函数）；
-      3. 把正文放进 Conversation 的"待发消息"槽位。
-    它**不打印正文、不直接调模型**——正文由主循环当用户这一句发出去，
-    这样它才会进历史、下一轮模型还记得自己读过。
-    """
-
-    async def handler(conversation, args: str) -> None:
-        # 局部 import：和本文件其它命令一样，避免命令模块在导入期就拖进工具子包
-        # （tools/skill 会读 core.limits，将来也可能反向引用提示词）。
-        from tools.skill.skill_manager import SkillManager
-
-        manager = SkillManager()
-        ui = conversation._ui_manager
-        spec = manager.get(name)
-
-        if spec is None:
-            # 扫描之后文件被删掉的情况。不自动 reload：用户可能正在整理技能目录，
-            # 悄悄重扫会让"我刚删了它却又能用"更难理解。给一句明确的下一步即可。
-            ui.print_error(f"技能 '{name}' 已经不在了（可能刚被删除）。执行 /skills reload 刷新。")
-            return
-
-        body = manager.load_body(spec, args)
-        # 前缀标一行来源：模型看到这段文字时能区分"这是技能正文"和"这是用户自己写的"，
-        # 排查上下文时也一眼能找到技能是从哪一轮进来的。
-        conversation.set_pending_input(f"[技能已加载：{name}]\n{body}")
-
-        # 给用户一行回执。为什么不打印正文：正文动辄上千字，刷满屏幕之后
-        # 用户既看不到自己的输入，也不知道到底加载成功没有。一行长度就是最好的确认。
-        ui.print_info(f"已加载技能 /{name}（正文 {len(body):,} 字符），下面按它的步骤做。")
-
-    return handler
-
-
-def register_skill_commands() -> int:
-    """把磁盘上的技能登记成斜杠命令，返回本次登记了几条
-
-    什么时候调：
-      · main.cli() 启动时一次；
-      · /skills reload 时再一次。
-    两处都走这个函数，是为了避免"启动时和 reload 时行为不一致"——
-    那类问题最典型的表现是"重启好了、reload 没好"，而两者本该是同一件事。
-
-    为什么整批撤掉再登记，而不是只补新的：
-      技能文件会被删。只补不撤的话，删掉的 /old-name 还在 REGISTRY 里，
-      一敲就报"技能不存在"，看起来像 reload 没生效（见 _skill_command_names 的说明）。
-
-    为什么 user-invocable: false 的技能也加载、但不登记：
-      它是"只给模型用"的技能（比如一段自动生效的编码约定）。
-      出现在斜杠命令里会让用户以为要手动敲它，而它本来就是被模型按需加载的。
-    """
-    from tools.skill.skill_manager import SkillManager
-
-    manager = SkillManager()
-    manager.reload()  # 登记前必须拿到最新清单；重扫的代价是几十个 4KB 读，可以忽略
-
-    for name in list(_skill_command_names):
-        REGISTRY.pop(name, None)
-    _skill_command_names.clear()
-
-    registered = 0
-    for spec in manager.list_specs():
-        if not spec.user_invocable:
-            continue  # 不进斜杠命令（模型仍能通过 skill 工具调用）
-        usage = f"/{spec.name}"
-        if spec.argument_hint:
-            # 参数提示只影响 /help 的用法显示。没有就不加，免得每行都拖一个空的 [参数]。
-            usage += f" {spec.argument_hint}"
-        register(
-            CommandSpec(
-                name=spec.name,
-                usage=usage,
-                summary=_one_line_summary(spec.description),
-                handler=_make_skill_handler(spec.name),
-            )
-        )
-        _skill_command_names.add(spec.name)
-        registered += 1
-    return registered
+# 【第 24 轮】这里原来有三个函数，负责把技能登记成 /名字 命令（第 21 轮引入）：
+#   _one_line_summary / _make_skill_handler / register_skill_commands。
+# 技能改成"只由模型调用"之后，它们整个失去了服务对象：
+#   · 没有命令表项 → 不需要把描述压成一行摘要；
+#   · 没有命令入口 → 不需要用闭包造 handler；
+#   · 没有登记动作 → 不需要名字台账、也不需要"重扫时整批撤销"。
+# 现在技能的唯一出口是两处，都在 tools/skill 里：
+#   · skill 工具（模型按需加载正文）；
+#   · /skills 命令（用户看清单、reload、install）。
+# 留这段注释而不是直接删干净，是因为将来有人翻历史会问"技能命令哪去了"。
 
 
 async def _install_from_command(conversation, raw: str) -> None:
-    """/skills install 的执行体：下载/拷贝 → 立刻重扫 → 重新登记命令
+    """/skills install 的执行体：下载/拷贝 → 立刻重扫技能表
 
     参数 raw：`install` 之后的那一段，可能带 --force。
 
     为什么装完要立刻重扫，而不是提示"请重启"：
-      用户刚装完就会去 /skills 或 /help 里找它。让他重启，等于把"装成功"和
+      用户刚装完就会去 /skills 里找它。让他重启，等于把"装成功"和
       "看得见"拆成两步，中间那段时间他只会觉得命令没生效。
       重扫的代价只是一次几毫秒的目录扫描。
 
@@ -1009,6 +919,7 @@ async def _install_from_command(conversation, raw: str) -> None:
       先让它 60 秒超时兜底，不要为了这个把结构复杂化。
     """
     from tools.skill.installer import install_from
+    from tools.skill.skill_manager import SkillManager  # 【第 24 轮】装完要重扫技能表
 
     ui = conversation._ui_manager
 
@@ -1040,11 +951,14 @@ async def _install_from_command(conversation, raw: str) -> None:
         ui.print_info("没有装上任何技能。")
         return
 
-    # 装完立刻重扫 + 登记：否则用户要重启才看得到新命令。
-    count = register_skill_commands()
+    # 装完立刻重扫：否则用户要重启才看得到新技能。
+    # 【第 24 轮】这里原来调 register_skill_commands()，现在技能不再登记成命令，
+    #   只需要让技能表重扫一遍（SkillManager.reload），再补登记 skill 工具本身。
+    SkillManager().reload()
     tool_manager = getattr(conversation, "_tool_manager", None)
     added = tool_manager.refresh_skill_tool() if tool_manager is not None else False
-    ui.print_info(f"已重新扫描：现在共 {count} 条技能命令（/skills 查看）。")
+    # 计数从技能表拿，不自己攒：list_specs() 是权威来源，另算一遍迟早对不上。
+    ui.print_info(f"已重新扫描：现在共 {len(SkillManager().list_specs())} 个技能（/skills 查看）。")
     if added:
         # 和 /skills reload 同一条提醒：工具清单进了缓存前缀，变了就按原价计费一次。
         ui.print_info("skill 工具是这次新登记的：下一轮请求的工具清单会变，提示词缓存会失效一次。")
@@ -1060,7 +974,7 @@ async def cmd_skills(conversation, args: str) -> None:
       和 /memory 那条命令的理由一模一样（第 14 轮）。
 
     参数 args：
-      "reload"             → 重扫目录、重新登记斜杠命令、必要时补登记 skill 工具；
+      "reload"             → 重扫目录、必要时补登记 skill 工具；
       "install <地址> [--force]" → 装技能（第 21.5 轮新增，见下面的 _install_from_command）；
       其他/空              → 只看不清单，不做任何改动。
       为什么区分：重扫会改变 tools 清单（技能从 0 变 1 时），
@@ -1078,20 +992,23 @@ async def cmd_skills(conversation, args: str) -> None:
         await _install_from_command(conversation, raw_args[len("install"):].strip())
         return
 
+    manager = SkillManager()  # 提前建：reload 和下面的清单展示用的是同一个实例
+
     wants_reload = lowered == "reload"
 
     if wants_reload:
-        count = register_skill_commands()  # 内部已经 reload 过，不再多扫一次
+        # 【第 24 轮】技能不再登记成命令，reload 只剩两件事：重扫技能表、补登记 skill 工具。
+        manager.reload()
         # 技能从 0 变 1 时，工具表里还没有 skill，需要补登记（见 ToolManager.refresh_skill_tool）。
         tool_manager = getattr(conversation, "_tool_manager", None)
         added = tool_manager.refresh_skill_tool() if tool_manager is not None else False
-        ui.print_success(f"已重新扫描技能目录，登记 {count} 条技能命令。")
+        # 数量直接问技能表：它是唯一权威来源，另外攒一个计数迟早对不上。
+        ui.print_success(f"已重新扫描技能目录，共 {len(manager.list_specs())} 个技能。")
         if added:
             # 必须提醒：工具清单在缓存前缀里，变了就会让下一轮缓存命中归零、按原价计费一次。
             # 不说的话，用户过一会儿看 /cost 发现贵了一下，会以为是 reload 的 bug。
             ui.print_info("skill 工具是这次新登记的：下一轮请求的工具清单会变，提示词缓存会失效一次。")
 
-    manager = SkillManager()
     specs = sorted(manager.list_specs(), key=lambda spec: spec.name)  # 按名字排，稳定
     if specs:
         # 顺序固定成"全局在前、项目在后"：和扫描顺序一致，用户容易对上。
@@ -1377,18 +1294,18 @@ register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cm
 register(CommandSpec("compact", "/compact", "立刻压缩上下文（不等 80%）", cmd_compact))
 register(CommandSpec("clear", "/clear", "清空上下文并开一个新会话", cmd_clear))
 register(CommandSpec("agents", "/agents", "列出子 agent 类型（同时重新扫描目录）", cmd_agents))
-# 【第 22 轮】换模型。放在技能登记之前，理由同下面 skills：
-#   builtin_command_names() 是技能重名拦截的依据，一个叫 model 的技能目录
-#   必须被挡住，否则 /model 会被它顶掉。内置命令先登记，拦截才有效。
+# 【第 22 轮】换模型。
+# 【第 24 轮】去掉了原来"必须先于技能命令登记"的说明：技能不再占用命令名，
+#   登记顺序与它无关了。现在这里只是一个普通的内置命令。
 register(CommandSpec(
     "model",
     "/model",
     "换模型：列出清单让你选",
     cmd_model,
 ))
-# 【2026-11-10 第 21 轮】技能的管理入口。它必须在技能命令之前就登记好：
-#   SkillManager 扫描时拿 builtin_command_names() 拦"和内置命令重名"的技能，
-#   而 skills 自己也是内置命令——不先登记，一个叫 skills 的技能目录就能把 /skills 顶掉。
+# 【2026-11-10 第 21 轮】技能的管理入口。
+# 【第 24 轮】不再是"技能命令的先驱"：技能已不登记成命令，不需要抢在内置命令前占位。
+#   留着它是因为清单、reload、install 三个动作仍然只有这一个用户入口。
 register(CommandSpec(
     "skills",
     "/skills [reload|install <地址>]",

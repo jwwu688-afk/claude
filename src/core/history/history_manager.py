@@ -84,7 +84,7 @@ def message_text(message) -> str:
 #     - 留下 tool 结果却删掉它的 assistant → 400：
 #       "messages with role 'tool' must be a response to a preceding message with 'tool_calls'"
 #   而原来的裁剪是"按下标硬切"：crop_message 直接 messages[crop_amount:]，
-#   _compress_single_session 直接 user_index+1+3，都可能正好切在一对中间。
+#   早期的 _compress_single_session 直接 user_index+1+3，都可能正好切在一对中间。
 #   结果是：上下文一到阈值、一裁剪，下一次请求就 400，整个对话直接结束。
 #
 # 解法：切之前把刀口"挪"到安全位置。挪的方向永远是多保留一点，
@@ -222,6 +222,16 @@ def align_bottom_cut(messages: list, index: int) -> int:
     while 0 < index <= len(messages) and _tool_calls(messages[index - 1]):
         index -= 1
     return index
+
+
+# 【2026-11-11 第 25 轮】压缩公告的文本前缀，用来识别「这条消息是上次压缩留下的」。
+#   为什么需要识别：压过一次之后历史开头就是一条公告，如果下次压缩又把它当原料送去摘要，
+#   就会「摘要的摘要」——花一次调用、条数和 token 都不降（实测能稳定复现）。
+#   取值必须和 _create_compression_notice() 里两种开头完全一致：
+#     有摘要 → "[为节省上下文空间，之前的对话已被压缩。以下是被压缩部分的摘要：]"
+#     没摘要 → "[之前的对话历史已被压缩，以节省上下文空间]"
+#   两处任一改动都要同步，否则防套娃判断会失效（失效的表现是"压了没效果"，不会报错）。
+_COMPRESSION_NOTICE_PREFIXES = ("[为节省上下文空间", "[之前的对话历史已被压缩")
 
 
 def make_note_message(text: str) -> dict:
@@ -400,6 +410,17 @@ class HistoryManager(BaseHistoryManager):
             self._snip_threshold = float(os.getenv("SNIP_THRESHOLD", 0.85))
             self._micro_threshold = float(os.getenv("MICRO_THRESHOLD", 0.90))
             self._collapse_threshold = float(os.getenv("COLLAPSE_THRESHOLD", 0.95))
+            # 【2026-11-11 第 25 轮】L5 摘要压缩时，最近多少条消息必须原样保留。
+            #   默认 10，对齐 Claude Code 的 KEEP_RECENT=10。
+            #   为什么是"条数"而不是"轮数"：
+            #     一轮对话可能只有 2 条（一问一答），也可能有 80 条（反复调工具）。
+            #     按轮数保留时，最后"3 轮"可能是 240 条，等于没压；按条数保留才可控。
+            #   为什么不能太小（比如 2）：
+            #     最近几条里往往有"当前正在改的那个函数"的上下文，压掉它，
+            #     模型会立刻把同一个文件再读一遍——省下的 token 又花回去了。
+            #   为什么不能太大（比如 50）：
+            #     保留区越大，能压掉的比例越小，95% 压完可能还在 90%，下一轮又触发。
+            self._compact_keep_recent = int(os.getenv("COMPACT_KEEP_RECENT", 10))
             self._initialized = True  # 打标记
 
     def set_summarizer(self, summarizer):
@@ -737,7 +758,7 @@ class HistoryManager(BaseHistoryManager):
           - 「中间」整段删掉，替换成一条本地占位公告，**不调任何模型**。
         这样既快速减少消息数量，又不丢"任务目标"和"最近进展"这两样最关键的东西。
 
-        和原来自家 _compress_multiple_sessions 的区别：
+        和早期「压最老一轮」那个做法的区别：
           那个方法删最老一轮后紧接着调 _summarize_if_possible（一次 API、花钱）。
           这一层是纯删除 + 固定占位文案，零 API 成本——先用便宜手段，够用就停。
 
@@ -880,10 +901,10 @@ class HistoryManager(BaseHistoryManager):
                 self.history_token_usage.append(remaining_usage)
         return changed
 
-    # if there is more than one  session, compress the oldest chat session
-    # else compress the current roll assistant output
-    # tell the model we have compressed the messages
-    async def _compress_current_message(self, announce: bool = True) -> None:
+    # 【2026-11-11 第 25 轮】原来这里是「有多个会话就压最老一轮，只有一个就删 3 条」。
+    #   现在统一交给 _compress_by_boundary：保 system + 最近 N 条，边界之前整段压。
+    #   方法名保留（调用方和 /compact 都按这个名字找），语义变成「按边界压一次」。
+    async def _compress_current_message(self, announce: bool = True) -> dict:
         """Compress current message history to save context window space（真正执行压缩）
 
         参数 announce（2026-11-08 第 14.5 轮新增）：
@@ -891,20 +912,48 @@ class HistoryManager(BaseHistoryManager):
                         这是自动压缩的路径，用户没主动要求，需要知道发生了什么；
           False       → 不打这句。/compact 是用户点名的，提示语由命令层统一说，
                         再说一遍"太长了"既多余、又和用户的心智不符（他本来就嫌长）。
+
+        返回（2026-11-11 第 25 轮新增）：_compress_by_boundary 的统计字典，
+          compressed=False 时里面的 reason 说明为什么没压。调用方靠它选提示语。
         """
         if announce:
             self._ui_manager.print_info("上下文太长了，正在自动压缩…")  # 【第 4 轮】改成暗色提示，不再占据"模型发言"的位置
 
-        current_messages = self.messages_history[-1]  # 拿到当前这一页
-        user_indices = self._get_user_message_indices(current_messages)  # 找出所有"用户消息"的位置
+        # 【2026-11-11 第 25 轮】原来按"几条用户消息"分流成两个方法：
+        #   多条 → 压最老一轮；单条 → 删紧跟其后的 3 条。
+        #   前者第二次起完全失效（把上次的摘要再摘要一遍），后者一次只删 3 条，
+        #   在 95% 水位下杯水车薪。现在统一成一个「边界压缩」：
+        #   保留 system + 最近 N 条，边界之前整段压成一份摘要，一次到位。
+        stats = await self._compress_by_boundary(self.messages_history[-1])
 
-        if len(user_indices) > 1:  # 如果用户已经说过好几轮了
-            await self._compress_multiple_sessions(current_messages, user_indices)  # 就把最老的那一轮整体删掉
-        elif len(user_indices) == 1:  # 如果只有一轮（用户只说过一句，后面全是来回调工具）
-            # delete_message_num is hardcode to 3 right now
-            await self._compress_single_session(current_messages, user_indices[0], 3)  # 就删掉紧跟在它后面的 3 条
-        # 一条用户消息都没有（页面里只有 system）时什么都不做：
-        #   没有"一轮对话"可以压，硬删只会把系统提示词也弄丢。
+        # 压不动时要把原因说清楚。否则用户只看到"正在压缩…"却什么都没发生，
+        # 下一轮照样撞 400，完全不知道为什么。三种原因对应三种不同的下一步动作。
+        #
+        # 【announce=False 时一句话都不打】/compact 走的就是这条路：
+        #   命令层拿 stats 自己会报告"压了多少 / 为什么没压"。
+        #   这里再打一遍，用户会看到两条内容重叠的结果，像是压了两次。
+        if stats["compressed"]:
+            if announce:
+                self._ui_manager.print_info(
+                    f"已压缩 {stats['removed_count']} 条较早的消息"
+                    f"（约 {stats['before_tokens']:,} → {stats['after_tokens']:,} token），"
+                    f"最近 {stats['kept_count']} 条原样保留。"
+                )
+        elif announce:
+            if stats["reason"] == "summarize_failed":
+                self._ui_manager.print_warning(
+                    "摘要没有拿到，历史原样保留（一条都没删）。稍后可以用 /compact 重试。"
+                )
+            elif stats["reason"] == "only_previous_summary":
+                self._ui_manager.print_warning(
+                    "能压的内容已经压完了（剩下的只是上次的摘要）。建议用 /clear 开新会话。"
+                )
+            else:  # nothing_to_compress：只剩一轮对话，后面全是工具调用
+                self._ui_manager.print_warning(
+                    "没有可压缩的较早对话（剩下的都是最近内容）。建议用 /clear 开新会话。"
+                )
+
+        return stats  # 返回统计给调用方（/compact 要据此报告，测试要据此断言）
 
     async def compact_now(self) -> dict:
         """手动压缩一次，不看过没过阈值（2026-11-08 第 14.5 轮新增）
@@ -941,13 +990,18 @@ class HistoryManager(BaseHistoryManager):
         before_tokens = estimate_messages_tokens(before_messages)
 
         # announce=False：提示语交给 /compact 说，这里不要再说"上下文太长了"
-        await self._compress_current_message(announce=False)
+        # 【2026-11-11 第 25 轮】接住返回值：命令层要区分"压了但没省下来"和"根本没压"，
+        #   这两种在界面上是完全不同的两句话。原来只返回前后数字，
+        #   于是"摘要失败/无可压内容"都会被说成"摘要太长不划算"，属于误导。
+        outcome = await self._compress_current_message(announce=False)
 
         after_messages = self.messages_history[-1]
         after_count = len(after_messages)
         after_tokens = estimate_messages_tokens(after_messages)
 
-        if after_count:  # 压完至少还有 system，正常不会是 0；防一手空页
+        # 只在真的压了的时候重算账本。没压成时重算没有意义，
+        # 而且会把"接口返回的真实用量"换成估算值，状态行的百分比会无缘无故跳一下。
+        if outcome["compressed"] and after_count:  # 压完至少还有 system，防一手空页
             usage = TokenUsage(input_tokens=after_tokens, output_tokens=0, total_tokens=after_tokens)
             # output_tokens 记 0：压缩本身不产生"模型的输出"，它只是在整理输入。
             if self.history_token_usage:
@@ -962,6 +1016,8 @@ class HistoryManager(BaseHistoryManager):
             "after_count": after_count,
             "before_tokens": before_tokens,
             "after_tokens": after_tokens,
+            "compressed": outcome["compressed"],  # 是否真的压了（命令层据此选提示语）
+            "reason": outcome["reason"],          # ok / nothing_to_compress / only_previous_summary / summarize_failed
         }
 
     @staticmethod
@@ -984,68 +1040,154 @@ class HistoryManager(BaseHistoryManager):
         # 【2026-11-06 优化】原来写的是 msg.role，但真实消息是字典，会抛 AttributeError。
         #    现在统一走 _role_of()，字典和对象两种形态都能读（细节见该方法）。
 
-    async def _compress_multiple_sessions(self, messages: list, user_indices: list[int]) -> None:
-        """delete the oldest chat session（删掉最老的那一轮对话）
+    @staticmethod
+    def _is_compression_notice(message) -> bool:
+        """判断一条消息是不是「历史已压缩」的公告（第 25 轮新增）
 
-        【2026-11-06 第 2 轮优化】从"直接删"改成"先摘要、再删"：
-          被删掉的那段内容会先交给大模型总结成一段话，
-          再把这段话放进对话里。这样模型不会真的"忘事"。
+        为什么要认这个：压过一次之后，历史开头就是一条公告。
+        如果下一次压缩把「这条公告」当成待压内容再送一次摘要，就会得到
+        「摘要的摘要」——条数不降、token 不降，但每次都真花一次 API 调用。
+        这个坑改之前实测能稳定复现：第二次压缩送进去的原料只有 1 条，就是公告本身。
+
+        为什么用「文本前缀」判断而不是加一个自定义字段：
+          这条消息会被写进会话文件、也会发给模型。多一个自定义字段有被上游接口
+          拒掉的风险（各家对未知字段的兼容性不一），而前缀只用到文本，对接口完全透明。
+          前缀在 _create_compression_notice 里是写死的，两处必须同步改。
         """
-        second_oldest_user_index = user_indices[1]  # 找出"第二老"的那句用户消息的位置
+        return message_text(message).strip().startswith(_COMPRESSION_NOTICE_PREFIXES)
 
-        system_messages = [msg for msg in messages[:second_oldest_user_index] if self._role_of(msg) == Role.SYSTEM]
-        # 从开头到"第二老"之前，把里面的系统消息挑出来（保住规则设定）
-        # 【2026-11-06 优化】同样把 msg.role 改成 _role_of(msg)
+    async def _compress_by_boundary(self, messages: list, keep_recent: int = None) -> dict:
+        """L5 全量摘要：留一条边界，边界之前**一次性**全压成一份摘要（第 25 轮重写）
 
-        removed_messages = [msg for msg in messages[:second_oldest_user_index]
-                            if self._role_of(msg) != Role.SYSTEM]
-        # 【2026-11-06 第 2 轮新增】算清楚"到底要删掉哪些"（不含系统消息），
-        #   这一段就是要送去生成摘要的原料
+        【为什么重写】
+          原来的做法是「只压最老的一轮」（messages[:第二老用户消息下标]）。
+          它的问题不是「压得少」这么简单，而是**第二次开始就完全失效**：
+            第 1 次：41 条 → 压 8 条 → 34 条                    ✓
+            第 2 次：34 条 → 压 1 条（上次的公告）→ 34 条          ✗ 条数不变、token 不变
+            第 3 次：同上                                      ✗
+          第一次压完，最老那一轮已经变成一条公告；第二次再算「第二老用户消息」，
+          它前面的内容就只剩那条公告了。于是反复「摘要摘要」，每次都真花一次模型调用，
+          水位却一点不降，最后照样撞 400。
 
-        recent_messages = messages[second_oldest_user_index:]  # 从"第二老"开始往后的全部内容（保住近期对话）
+        【现在的做法】对齐 Claude Code 的 full compaction：
+          保留 system + 最近 keep_recent 条，**边界之前整段压成一份摘要**。
+          95% 进、40% 出，一次到位，不会再有「没东西可压却还在调模型」的第二次。
 
-        summary = await self._summarize_if_possible(removed_messages)  # 让模型总结这段被删的内容
-        self.messages_history[-1] = system_messages + self._create_compression_notice(messages, summary) + recent_messages
-        # 新的这一页 = 系统消息 + 摘要公告 + 近期对话
+        【边界怎么定】四步，每一步都在挡一类事故：
+          1. 按条数取 total - keep_recent：用条数而不是轮数，因为一轮可能 2 条也可能 80 条；
+          2. align_top_cut 对齐到工具调用的安全位置：刀口落在 tool 结果上时，
+             会把 assistant(tool_calls) 和它的结果拆开，下一次请求直接 400（第 9 轮踩过）；
+          3. 再夹到「最后一条用户消息」之前：用户最新那句指令永远不能进压缩区，
+             否则模型会忘了当前要做什么；
+          4. 刀口必须落在第一条非 system 消息之后，否则没有实质内容可压。
 
-    async def _compress_single_session(self, messages: list, user_index: int, delete_message_num: int) -> None:
-        """delete assistant messages and tool message close to user input（删掉紧跟用户发言后的若干条）"""
-        system_messages = [msg for msg in messages[:user_index] if self._role_of(msg) == Role.SYSTEM]  # 保住系统消息
-        # 【2026-11-06 优化】同样把 msg.role 改成 _role_of(msg)
+        【为什么失败就不压】
+          原实现在摘要失败时会插一条「没有摘要的公告」，等于直接把一大段历史删掉。
+          以前每次只删一轮，损失有限；现在一次删掉几十条，静默删除的代价太大。
+          所以这里宁可不压，把原因返回给调用方，由它决定怎么告诉用户。
 
-        start_index = min(user_index + 1 + delete_message_num, len(messages))
-        # 计算"从第几条开始保留"：用户消息后面跳过 delete_message_num 条
-        # min(..., len(messages)) 是防止算出来的位置超出列表长度
+        参数 keep_recent：本次保留多少条；None 表示用配置值（_compact_keep_recent）。
+        参数 messages：要压的那一页。注意结果**总是写回 self.messages_history[-1]**，
+          不是写回这个参数——和原实现保持一致（调用方传的都是当前页）。
+          传别的列表进来只会算出边界，然后把当前页换掉，这是历史遗留的耦合，
+          真要改成"就地替换参数"得连带改所有调用点，不在这一轮范围内。
+        返回：dict，至少含 compressed(bool) / reason(str) 与条数、token 统计。
+              返回 dict 而不是 None，是因为调用方要据此决定提示什么——
+              「压了但没压下去」和「根本没压」对用户是两种完全不同的事。
+        """
+        total = len(messages)
+        before_tokens = estimate_messages_tokens(messages)
+        keep = max(1, int(keep_recent or self._compact_keep_recent))
 
-        # 【2026-11-06 第 9 轮修复】如果刀口正好落在一条 tool 消息上，
-        #   说明它上面那条 assistant(tool_calls) 会被删掉，而结果却被留下——
-        #   下一次请求就会 400（role=tool 找不到对应的 tool_calls）。
-        #   这里把刀口往后推到这一组工具结果之后，整组一起删。
-        while start_index < len(messages) and _role(messages[start_index]) == Role.TOOL:
-            start_index += 1
+        # 第 1 步：按条数取刀口
+        cut = total - keep
+        # 第 2 步：对齐到工具调用的安全位置（可能往前挪，挪完保留区更大，只会更安全）
+        cut = align_top_cut(messages, cut)
+        # 第 3 步：用户最新指令不能进压缩区（夹小 cut = 保留得更多）
+        user_indices = self._get_user_message_indices(messages)
+        if user_indices:
+            cut = min(cut, user_indices[-1])
 
-        removed_messages = messages[user_index + 1:start_index]  # 【2026-11-06 第 2 轮新增】要删掉的那几条
-        summary = await self._summarize_if_possible(removed_messages)  # 先总结
+        # 第 4 步：刀口之前必须有非 system 的实质内容，否则压了等于没压
+        first_content = next(
+            (i for i, m in enumerate(messages) if self._role_of(m) != Role.SYSTEM), None
+        )
+        if first_content is None or cut <= first_content:
+            # 典型场景：只有一轮对话，后面全是工具调用。这时该用 L3 折叠工具结果，
+            # 而不是摘要——把唯一的用户指令压掉就等于把任务弄丢了。
+            return {
+                "compressed": False, "reason": "nothing_to_compress",
+                "before_count": total, "after_count": total,
+                "before_tokens": before_tokens, "after_tokens": before_tokens,
+            }
 
-        user_message = [messages[user_index]] + self._create_compression_notice(messages, summary) + messages[start_index:]
-        # 新的内容 = 用户那句话 + 摘要公告 + 剩下的内容
+        system_messages = [m for m in messages[:cut] if self._role_of(m) == Role.SYSTEM]
+        to_compress = [m for m in messages[:cut] if self._role_of(m) != Role.SYSTEM]
+        to_keep = messages[cut:]
 
-        self.messages_history[-1] = system_messages + user_message  # 拼成新的这一页
+        # 防套娃：待压内容里如果只有「上次的公告」，压它等于把摘要再摘要一遍。
+        # 只在「完全没有实质内容」时拦；如果公告后面又攒了新内容，
+        # 就该连公告带新内容一起重压——旧摘要里的信息不能丢。
+        if not any(not self._is_compression_notice(m) for m in to_compress):
+            return {
+                "compressed": False, "reason": "only_previous_summary",
+                "before_count": total, "after_count": total,
+                "before_tokens": before_tokens, "after_tokens": before_tokens,
+            }
+
+        summary = await self._summarize_if_possible(to_compress)
+        if summary is None:
+            # 摘要没拿到：一条都不动。见上面「为什么失败就不压」。
+            return {
+                "compressed": False, "reason": "summarize_failed",
+                "before_count": total, "after_count": total,
+                "before_tokens": before_tokens, "after_tokens": before_tokens,
+            }
+
+        # 重组：system + 一条公告（含摘要）+ 保留区
+        new_messages = system_messages + self._create_compression_notice(messages, summary) + to_keep
+        self.messages_history[-1] = new_messages
+
+        # 账本重算成「压缩后的估值」。不重算的话，状态行和 /cost 还显示压缩前的占用，
+        # 用户会以为压缩没生效；下一层「是否还超阈值」的判断也会继续用旧数字。
+        after_tokens = estimate_messages_tokens(new_messages)
+        usage = TokenUsage(input_tokens=after_tokens, output_tokens=0, total_tokens=after_tokens)
+        if self.history_token_usage:
+            self.history_token_usage[-1] = usage
+        else:
+            self.history_token_usage.append(usage)
+
+        return {
+            "compressed": True,
+            "reason": "ok",
+            "before_count": total,
+            "after_count": len(new_messages),
+            "removed_count": total - len(new_messages),
+            "kept_count": len(to_keep),  # 原样保留了几条（给提示语用，别让用户自己减）
+            "cut": cut,
+            "before_tokens": before_tokens,
+            "after_tokens": after_tokens,
+        }
 
     async def _summarize_if_possible(self, messages: list):
         """尝试把一段消息总结成摘要；做不到就返回 None（2026-11-06 第 2 轮新增）
 
-        三种情况会返回 None（也就是退回"直接删除"的老做法）：
+        三种情况会返回 None：
           1. 没有注入摘要器（比如单元测试环境）
           2. 要删的消息是空的
-          3. 调模型失败（没网、没额度、超时……）——这种情况不能卡死对话，必须降级
+          3. 调模型失败（没网、没额度、超时……）——这种情况不能卡死对话
+
+        【2026-11-11 第 25 轮】返回 None 的含义变了：
+          以前是"退回直接删除旧消息"（静默删掉一大段），
+          现在调用方（_compress_by_boundary）会**一条都不动**，把原因报给用户。
+          一次删几十条的代价太大，宁可这次不压，也不能悄悄丢掉上下文。
         """
         if not messages or self._summarizer is None:  # 情况 1、2
             return None
         try:
             summary = await self._summarizer(messages)  # 调用外部注入的摘要函数
         except Exception as e:  # 情况 3
-            print(f"[压缩] 生成摘要失败（{e}），本次退回为直接删除旧消息")
+            print(f"[压缩] 生成摘要失败（{e}），本次不压缩、历史原样保留")
             return None
         if not summary or not summary.strip():  # 模型返回了空内容
             return None
@@ -1088,8 +1230,7 @@ class HistoryManager(BaseHistoryManager):
 # 备注（这段代码里有两个需要注意的地方）
 #
 # 1. 【2026-11-06 已修复】属性访问的 bug：
-#    原来 _get_user_message_indices、_compress_multiple_sessions、
-#    _compress_single_session 里都写的是 msg.role，但真实消息是字典，
+#    原来的 _compress_* 系列方法里都写的是 msg.role，但真实消息是字典，
 #    所以 token 一超过 80% 触发压缩就会抛 AttributeError 崩掉。
 #    现在统一改用 _role_of() 读取，字典和对象两种形态都能用。
 #
