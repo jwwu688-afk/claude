@@ -1161,7 +1161,209 @@ async def cmd_skills(conversation, args: str) -> None:
 
 
 # =============================================================================
+# 十、/model —— 在会话里换一个模型（2026-11-11 第 22 轮）
+#
+# 【为什么这条命令值得存在】
+#   模型名写在 .env 的 OPENAI_MODEL 里，改它要：退出 → 打开编辑器 → 改一行 → 重启。
+#   而人换模型的时机往往是"这句话太简单，不想用贵的"或者"这个模型答得不好，换一个"——
+#   都发生在对话中间。为了换模型丢掉上下文，是这条命令要解决的第一个问题。
+#   第二个问题是"我到底能有哪几个可选"：中转站的模型多到记不住，
+#   问接口比翻文档靠谱，所以这条命令只做一件事：**把清单列出来让你选**。
+#
+# 【为什么只有一种用法：/model，不带任何参数】
+#   一条"选择"命令的正确形态就是"给你选项、你按数字"。
+#   一旦加出 /model list、/model <名字> 这类变体，用户就得先记住语法分支；
+#   而其中最容易被用到的是"直接打名字"，它有个绕不开的坑——名字打错时，
+#   要么得联网校验（把最该快的路径变慢，还把清单不全的中转站误伤），
+#   要么不校验（打错了下一条消息直接 400，报错跟"换模型"看起来毫无关系）。
+#   把入口收成一条，这个坑就不存在了：能选的名字一定是清单里真实存在的。
+#
+# 【为什么切换只影响本进程，不写回 .env】
+#   写 .env 是改用户的配置文件，格式、注释、顺序都得原样保住，否则一次切换
+#   可能把用户手写的几十行注释搞乱。而"临时试试另一个模型"是高频动作，
+#   "以后固定用它"是低频动作——后者本来就该手动改一次 .env，
+#   那才是唯一权威的地方。命令只负责前者。
+# =============================================================================
+
+
+# 判断"像不像对话模型"的关键词，**只用于排序，不做任何校验**。
+# 为什么需要它：中转站动辄返回上百个名字（含 embedding、whisper、dall-e、
+# 各种日期快照），按字母序排的话前 12 个很可能全是 tts-1 / text-embedding-3-small
+# 这类根本不能聊天的东西，用户会觉得"列表没用"。
+# 顺序本身有意义：靠前的先显示，gpt / claude 是绝大多数人真正要找的。
+_DIALOG_MODEL_HINTS = (
+    "gpt", "claude", "gemini", "deepseek", "qwen", "glm", "kimi",
+    "llama", "mistral", "grok", "o1", "o3",
+)
+
+# 【这里故意不截断清单，全部列出来】
+#   本来可以只显示前 12 条防刷屏，但那会让排在后面的模型**永远切不到**：
+#   用户看不到就不敢输编号，输了越界也只会被当成取消。
+#   而"能切到想要的模型"是这条命令唯一的功能，功能完整优先于观感。
+#   代价是模型特别多（上百个）时要滚一屏——但那是一次性输出，滚过去就没了；
+#   相比之下"有一个模型你永远选不了"是硬伤。
+
+
+def _model_rank(name: str) -> tuple:
+    """给模型名算排序权重，小的排前面
+
+    返回二元组 (分组, 组内序号, 名字小写)：
+      第一维：0 = 命中对话模型关键词（更可能是用户要找的），1 = 其他
+      第二维：命中第几个关键词——"gpt" 排在 "o3" 前面，因为常见程度不同
+      第三维：名字本身，保证同一组内顺序稳定（不稳定的排序每次 /model 都变，
+             用户会以为自己看错了）
+
+    为什么用子串匹配而不是前缀匹配：
+      模型名的前缀五花八门（"anthropic/claude-3.5-sonnet"、"us.anthropic..."、
+      "accounts/fireworks/models/llama..."），中转站会加各种前缀。
+      子串匹配能全部命中，代价是偶尔误判（某个叫 "grok-embedding" 的排前面），
+      但那只是排序位置差一点，不影响正确性。
+    """
+    lowered = name.lower()
+    for index, hint in enumerate(_DIALOG_MODEL_HINTS):
+        if hint in lowered:
+            return (0, index, lowered)
+    return (1, 0, lowered)
+
+
+def _order_models(names, current: str):
+    """把模型名排成"当前模型在最前，其余按像不像对话模型"的顺序
+
+    参数 names  ：接口或 env 给的原始名字列表
+    参数 current：当前正在用的模型名
+
+    为什么要把当前模型顶到第一位：
+      用户敲 /model 很可能是想"确认我现在用的是哪个"，或者"切回去刚才那个"。
+      在 100 个名字里找一行看不出区别的字符串，是最没必要的工作。
+      返回的列表里它仍然只出现一次（先按名字剔掉，再拼到最前面）。
+    """
+    others = [name for name in names if name != current]
+    others.sort(key=_model_rank)
+    return ([current] if current in names else []) + others
+
+
+def _apply_model_switch(conversation, name: str) -> None:
+    """执行切换并打回执
+
+    为什么单独成一个函数（虽然现在只有一个调用点）：
+      "怎么选到这个名字"和"选完之后要做什么"是两件事。前者是交互
+      （列清单、读编号、取消），以后可能变；后者是语义
+      （摘要模型跟不跟、缓存标记变不变、历史还在不在），不该跟着交互一起改。
+      混在一个函数里，改交互的人很容易顺手删掉一行回执，
+      而那行回执往往是用户唯一的解释来源。
+
+    参数 name：目标模型名，取自清单，必然非空
+      （get_numbered_choice 只会返回有效下标）。这里仍然兜了一次空值，
+      因为它同时是 APIClient.switch_model 的调用方，不该假设上游永远正确。
+    """
+    ui = conversation._ui_manager
+    api = conversation._api_client
+
+    if name == api.model:
+        # 不当作错误：用户从列表里点了当前这个，是很正常的操作
+        ui.print_info(f"当前已经是 {name}，没有变化。")
+        return
+
+    try:
+        previous, summary_changed, cache_changed = api.switch_model(name)
+    except ValueError as exc:  # 只可能是空名字，switch_model 里唯一的显式校验
+        ui.print_error(str(exc))
+        return
+
+    ui.print_success(f"模型已切换：{previous} → {name}")
+
+    # 摘要模型这条必须说清楚是哪种情况，否则用户下次 /compact 时会疑惑
+    # "怎么压缩用的还是老模型"（或反过来"我没配它怎么跟着变了"）。
+    if summary_changed:
+        ui.print_info(f"摘要模型跟着换成 {name}（.env 里没单独配 OPENAI_SUMMARY_MODEL）。")
+    else:
+        ui.print_info(f"摘要模型保持 {api.summary_model}（.env 里单独配的，不跟着换）。")
+
+    if cache_changed:
+        # 这条不是废话：从 claude 切到 gpt 会**关掉**缓存标记（继续发会被 400），
+        # 反过来会打开。两种情况用户都可能遇到"怎么缓存命中突然变了"。
+        state = "开启" if api.prompt_cache_enabled else "关闭"
+        ui.print_warning(f"提示词缓存标记已{state}（按新模型的接口类型重算）。")
+
+    # 下面两句是"换模型之后会发生什么"的预告，各解决一个具体的困惑：
+    #   1. 上下文还在不在 —— 在，不用重开，这是最常被问的；
+    #   2. 下一轮为什么贵了一下 —— 不同模型的缓存不通用，前缀要重新建。
+    ui.print_info("对话历史保留，下一条消息就用新模型。")
+    ui.print_info("注意：不同模型的缓存不通用，下一次请求的输入按原价计费。")
+
+    # 子 agent 和上下文窗口这两条只在真的可能造成误解时才提：
+    #   子 agent 的 model 字段为 None 表示"继承"，继承的就是这里刚改的值；
+    #   写死模型的那几个不受影响（用户会在 /agents 里看到各自写死的名字）。
+    ui.print_info("标「继承」的子 agent 也会跟着用新模型；写死模型的不会变。")
+
+
+async def cmd_model(conversation, args: str) -> None:
+    """/model —— 列出接口支持的模型，输编号切换
+
+    唯一用法就是 /model，没有其它参数形式。
+
+    【为什么 handler 还在收 args】
+      命令框架统一传 (conversation, args)，签名改不了。
+      但传了参数不能一声不响地无视：用户凭直觉敲 /model gpt-4o 是很自然的，
+      界面毫无反应他会以为命令坏了。所以给一句用法提示，
+      然后**继续往下走**——不 return，让他照样能从清单里选，
+      省掉"再敲一次 /model"这一步无谓操作。
+
+    【清单拉不到时为什么不让人直接打名字】
+      那是被明确砍掉的用法（见本节开头）。这里给的是能长期成立的解法：
+      把候选写进 .env 的 OPENAI_MODELS，它是接口不可用时的唯一来源。
+    """
+    ui = conversation._ui_manager
+    api = conversation._api_client
+
+    # 子 agent 和 /resume 一样拒绝：它没有自己的输入循环，跑到这里只可能是
+    # 上层误调。让它改主对话的模型是危险的——子 agent 本来只该管自己那一段。
+    if getattr(conversation, "is_subagent", False):
+        ui.print_error("子 agent 里不能用 /model。")
+        return
+
+    if (args or "").strip():
+        ui.print_info("/model 不带参数，直接从下面的清单里选。")
+
+    # 先报当前状态：用户敲 /model 的动机里，"确认我在用哪个"占很大一部分。
+    # 摘要模型顺带一起显示，因为它经常和主模型不一样，而用户看不到别的地方。
+    current = api.model
+    ui.print_info(f"当前模型：{current}｜摘要模型：{api.summary_model}")
+    ui.print_info("正在读取接口支持的模型列表…（最多等 10 秒）")
+
+    names, source, error = api.list_models()
+
+    if error:
+        # 一定要说"为什么没有接口那份"，否则用户会以为接口真的只支持兜底那几个。
+        # 放在 warning 而不是 error：命令仍然可用，只是清单的来源降级了。
+        ui.print_warning(f"接口列表没拿到（{error}）")
+        if names:
+            ui.print_info(f"以下是 {source} 里的模型。")
+
+    if not names:
+        # 唯一真正"做不到"的情况：没有候选可列，选择器无从谈起。
+        # 给出的解法必须是长期有效的，而不是"这次先这样"。
+        ui.print_error("拿不到任何模型清单，没法列出候选。")
+        ui.print_info("在 .env 里加一行 OPENAI_MODELS=a,b,c 当固定清单，再敲一次 /model。")
+        ui.print_info("（或者直接改 OPENAI_MODEL 后重启，那个值启动时才会读）")
+        return
+
+    # 排序：当前模型第一，其余把 gpt/claude 这类聊天模型排前面。
+    # 理由和"为什么只排序不过滤"见 _model_rank / _order_models。
+    ordered = _order_models(names, current)
+    labels = [f"{name}  ← 当前" if name == current else name for name in ordered]
+
+    idx = await ui.get_numbered_choice("选择要使用的模型：", labels)
+    if idx is None:  # 回车 / 非数字 / 越界，统一当取消（和 /resume 一个口径）
+        ui.print_info("已取消，模型没有变化。")
+        return
+
+    _apply_model_switch(conversation, ordered[idx])
+
+
+# =============================================================================
 # 命令注册（放在文件末尾，理由见本节开头）
+
 # 为什么放在文件末尾，而不是每条命令定义完就注册：
 #   读代码的人按"头部说明 → 数据结构 → 工具函数 → 各命令 → 注册表"的顺序看下来，
 #   最后一屏就能看到"到底有哪些命令"。散落在中间的话，得来回翻。
@@ -1175,6 +1377,15 @@ register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cm
 register(CommandSpec("compact", "/compact", "立刻压缩上下文（不等 80%）", cmd_compact))
 register(CommandSpec("clear", "/clear", "清空上下文并开一个新会话", cmd_clear))
 register(CommandSpec("agents", "/agents", "列出子 agent 类型（同时重新扫描目录）", cmd_agents))
+# 【第 22 轮】换模型。放在技能登记之前，理由同下面 skills：
+#   builtin_command_names() 是技能重名拦截的依据，一个叫 model 的技能目录
+#   必须被挡住，否则 /model 会被它顶掉。内置命令先登记，拦截才有效。
+register(CommandSpec(
+    "model",
+    "/model",
+    "换模型：列出清单让你选",
+    cmd_model,
+))
 # 【2026-11-10 第 21 轮】技能的管理入口。它必须在技能命令之前就登记好：
 #   SkillManager 扫描时拿 builtin_command_names() 拦"和内置命令重名"的技能，
 #   而 skills 自己也是内置命令——不先登记，一个叫 skills 的技能目录就能把 /skills 顶掉。

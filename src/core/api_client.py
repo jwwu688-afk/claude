@@ -13,7 +13,7 @@
 # =============================================================================
 
 from openai import OpenAI  # 导入 OpenAI 官方 SDK，用它来发请求（兼容任何 OpenAI 格式的接口）
-from typing import Dict, Any, Optional, Generator, Tuple  # 导入类型标注工具，只为让代码更易读
+from typing import Dict, Any, Optional, Generator, List, Tuple  # 导入类型标注工具，只为让代码更易读
 import json  # 导入 json 库，用来处理 JSON 格式的数据（大模型返回的东西就是 JSON）
 import os  # 导入 os 库，用来读取环境变量（比如 API 密钥）
 from dotenv import load_dotenv  # 导入工具函数：把 .env 文件里的配置读进环境变量
@@ -92,6 +92,15 @@ class APIClient:
             # 【第 6 轮】生成摘要单独用一个模型：摘要不需要太聪明，用小模型能省不少钱。
             #   没配 OPENAI_SUMMARY_MODEL 就退回主模型，行为和以前一样。
             self.summary_model = os.getenv("OPENAI_SUMMARY_MODEL") or self.model
+            # 【第 22 轮】记下摘要模型到底是"自己配的"还是"跟着主模型走的"。
+            #   为什么必须记：/model 切换主模型时，两者要区别对待——
+            #     继承来的摘要模型应该跟着换（否则主模型换了、摘要还在用旧的，
+            #     用户会看到"压缩用的是另一个模型"，而且旧模型可能已经不可用）；
+            #     用户在 .env 里显式配的那个必须原样保留（他配它是为了省钱，
+            #     切换主模型不该把他的省钱配置悄悄改掉）。
+            #   判断依据只能是"启动时 OPENAI_SUMMARY_MODEL 是不是空的"：
+            #   一旦合并成 self.summary_model，就再也分不出它来自哪里了。
+            self._summary_inherits = not (os.getenv("OPENAI_SUMMARY_MODEL") or "").strip()
             # 【第 6 轮】是否给消息打"提示词缓存"标记。见 _detect_prompt_cache()。
             self.prompt_cache_enabled = self._detect_prompt_cache()
 
@@ -130,6 +139,96 @@ class APIClient:
         base = (self.base_url or "").lower()
         model = (self.model or "").lower()
         return "anthropic" in base or "claude" in model
+
+    # -------------------------------------------------------------------------
+    # 运行时切换模型（2026-11-11 第 22 轮，配合 /model 命令）
+    # -------------------------------------------------------------------------
+    def switch_model(self, name: str) -> Tuple[str, bool, bool]:
+        """把主模型换成 name，返回 (换之前的模型名, 摘要模型是否跟着换, 缓存标记是否变化)
+
+        【为什么不让命令层直接写 self.model = xxx】
+          切模型不是改一个字段，有三件连带的事必须同时做，漏一件都会变成"看起来切了、其实没切"：
+            1. 摘要模型可能跟着换（见 _summary_inherits 的说明）；
+            2. prompt_cache_enabled 要重算——它是按"地址 / 模型名里有没有 anthropic/claude"
+               推出来的，从 claude 切到 gpt 之后还打着 cache_control 标记，
+               OpenAI 官方接口会直接 400；
+            3. 得把换之前的名字告诉用户，否则他看不到自己是从哪个切过来的。
+          这些规则放在这里，命令层就只是"调一下、打印结果"，不会各写一遍。
+
+        参数 name：新的模型名。允许带首尾空格（用户从文档里复制常带），这里统一 strip。
+                  不做"模型是否存在"的校验——那要联网查一次 /models，而很多中转站的
+                  列表并不全（返回 200 但只列了几十个），校验反而会挡住能用的模型。
+                  名字真写错，代价是下一次请求返回 400，界面上说清楚就行。
+
+        边界：空串直接抛 ValueError。为什么不在命令层拦：这里是最后一道门，
+              任何调用方（以后可能有 /model 之外的地方）传空串都应该立刻炸，而不是
+              把 self.model 悄悄设成 "" ——那会让后面每个请求都 400，且看不出原因。
+        """
+        name = (name or "").strip()
+        if not name:
+            raise ValueError("模型名不能为空")
+
+        previous = self.model
+        cache_before = self.prompt_cache_enabled
+
+        self.model = name
+        summary_changed = False
+        if self._summary_inherits:
+            # 只有"继承"的才跟着换；显式配置的摘要模型保持不动
+            self.summary_model = name
+            summary_changed = True
+
+        # 必须在改完 self.model 之后重算：_detect_prompt_cache() 读的就是 self.model
+        self.prompt_cache_enabled = self._detect_prompt_cache()
+
+        return previous, summary_changed, cache_before != self.prompt_cache_enabled
+
+    def list_models(self, timeout: float = 10.0) -> Tuple[List[str], str, Optional[str]]:
+        """问接口"你支持哪些模型"，返回 (模型名列表, 来源, 出错原因)
+
+        参数 timeout：这次查询最多等几秒，默认 10 秒。
+          为什么要显式限时：SDK 默认超时是 10 分钟，某些中转站的 /models
+          会长时间挂住不返回。用户只是敲了个 /model，界面卡十分钟，他只会以为程序死了。
+          用 with_options(timeout=...) 临时覆盖，不改全局 client（改全局会影响对话请求）。
+
+        三个返回值：
+          models：排好序、去重后的模型名。为空表示"接口没给、也没配兜底"。
+          source：这批名字从哪来的，直接显示给用户——
+                  "接口 /v1/models" 还是 "环境变量 OPENAI_MODELS"。
+                  用户需要知道这份清单可不可信（兜底清单可能是他自己手写的旧名字）。
+          error ：接口失败的原因（成功时为 None）。不吞掉它，是因为"列表是兜底来的"
+                  这件事必须让用户知道，否则他会以为接口真的只支持这几个模型。
+
+        为什么失败要静默降级到 OPENAI_MODELS，而不是直接报错：
+          /v1/models 不是 OpenAI 兼容接口的强制项，不少中转站根本没有这个路由。
+          切模型这件事不能因为"列不出清单"就完全用不了——至少要让手写清单的人能切。
+        """
+        error: Optional[str] = None
+        try:
+            page = self.client.with_options(timeout=timeout).models.list()
+            # 用 set 去重：部分中转站会把同一个模型以不同 owner 重复列好几遍，
+            # 列表里出现两行一样的名字，用户会以为是 bug。
+            names = sorted({
+                str(getattr(item, "id", "") or "").strip()
+                for item in (getattr(page, "data", None) or [])
+            } - {""})
+            if names:
+                return names, "接口 /v1/models", None
+            # 返回 200 但一条都没有：当失败处理，继续往下走兜底清单
+            error = "接口返回了空列表"
+        except Exception as exc:  # 网络、鉴权、404、超时……一律走兜底，不让 /model 崩掉
+            # 带上异常类型：只打 str(exc) 时，超时之类的异常消息可能是空的，
+            # 界面上会显示成"读取失败："，什么线索都没有。
+            error = f"{type(exc).__name__}: {exc}"
+
+        raw = os.getenv("OPENAI_MODELS") or ""
+        # 中文逗号也当分隔符：用户手写 .env 时混进全角逗号太常见，
+        # 而那种情况下的表现是"整个字符串被当成一个模型名"，极难自查。
+        fallback = [piece.strip() for piece in raw.replace("，", ",").split(",") if piece.strip()]
+        if fallback:
+            return sorted(set(fallback)), "环境变量 OPENAI_MODELS", error
+
+        return [], "（没有可用的模型清单）", error
 
     def _record_usage(self, token_usage):
         """把一次请求的用量记到总账上（2026-11-06 第 6 轮新增；第 8.2 轮补了分母）

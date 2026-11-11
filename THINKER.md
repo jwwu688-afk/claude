@@ -54,6 +54,7 @@ python -m compileall -q src
 /compact                           立刻压缩一次上下文（不等 80%，会调一次摘要模型）
 /clear                             清空上下文并开一个新会话（旧会话文件保留，可 /resume 回去）
 /agents                            列出子 agent 类型、工具白名单、模型与来源（每次执行都会重扫 .thinker/agents）
+/model                            列出可选模型并切换（只影响本次进程，不写回 .env）
 /skills [reload|install <地址>]    列出技能；reload 重扫；install 从 GitHub 地址/本地目录装新技能
 ```
 
