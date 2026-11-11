@@ -22,4 +22,10 @@ test('炸弹清除敌弹并重创Boss', () => { const g = game(); const e = P.en
 test('暂停与空库存不能投弹', () => { const g = game(); g.pause(); assert.equal(g.bomb(), false); g.pause(); g.p.bombs = 0; assert.equal(g.bomb(), false); });
 test('Boss不重复出现且击落后延时刷新', () => { const g = game(); g.time = 35; g.update(0); const boss = g.boss; g.update(0); assert.equal(g.enemies.filter(e => e.type === 'boss').length, 1); g.kill(boss); assert.equal(g.nextBoss, 70); g.update(0); assert.equal(g.boss, null); });
 test('重新开始清空旧弹幕和强化', () => { const g = game(); g.score = 900; g.p.weapon = 3; g.update(0.05); g.reset(); assert.equal(g.score, 0); assert.equal(g.shots.length, 0); assert.equal(g.p.weapon, 1); });
+test('连击计数正确递增', () => { const g = game(); const e1 = P.enemy('scout', 1, () => 0.5); g.kill(e1); assert.equal(g.combo, 1); const e2 = P.enemy('scout', 1, () => 0.5); g.kill(e2); assert.equal(g.combo, 2); });
+test('连击倍率正确计算', () => { const g = game(); for (let i = 0; i < 10; i++) g.kill(P.enemy('scout', 1, () => 0.5)); assert.equal(g.combo, 10); assert.equal(g.comboMul, 2); for (let i = 0; i < 10; i++) g.kill(P.enemy('scout', 1, () => 0.5)); assert.equal(g.combo, 20); assert.equal(g.comboMul, 3); });
+test('受伤时连击清零', () => { const g = game(); g.kill(P.enemy('scout', 1, () => 0.5)); g.kill(P.enemy('scout', 1, () => 0.5)); assert.equal(g.combo, 2); g.p.inv = 0; g.damage(); assert.equal(g.combo, 0); });
+test('超时后连击清零', () => { const g = game(); g.kill(P.enemy('scout', 1, () => 0.5)); g.p.fire = 1000; for (let i = 0; i < 60; i++) g.update(0.05); assert.equal(g.combo, 0); });
+test('暂停时连击不清零', () => { const g = game(); g.kill(P.enemy('scout', 1, () => 0.5)); g.pause(); g.update(10); assert.equal(g.combo, 1); });
+test('连击倍率影响分数', () => { const g = game(); const e = P.enemy('scout', 1, () => 0.5); for (let i = 0; i < 10; i++) g.kill(P.enemy('scout', 1, () => 0.5)); const hp = e.hp; const before = g.score; g.kill(e); assert.equal(g.score - before, 200); });
 console.log(`所有测试通过（${passed}/${passed}）`);

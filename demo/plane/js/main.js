@@ -14,7 +14,7 @@
   /** 开始或继续由同一按钮触发，只有重新开局才重建核心状态。 */
   function start() {
     effects.unlock(); clearInput();
-    if (game.state === 'paused') game.pause(); else { game.reset(); effects.particles = []; }
+    if (game.state === 'paused') game.pause(); else { game.reset(); effects.particles = []; effects.floaters = []; }
     canvas.focus(); sync();
   }
   /** 结算时才写存储；每帧只刷新数字，状态变化才改遮罩。 */

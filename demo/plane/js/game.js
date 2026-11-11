@@ -1,6 +1,8 @@
 /* ===== 战斗核心：固定逻辑坐标与秒制时间，不依赖 DOM。 =====
  * 【2026-11-10】输入交给 main，画面交给 effects；测试可直接推进时间。
  * 死亡标记在本帧立即生效，帧末统一回收，避免多发子弹重复计分。
+ * 【2026-11-11】连击：comboTimer 从 2.5 秒倒计时，击杀续满；
+ * 倍率 = 1 + floor(combo / 10)，分数 = baseScore × 倍率；受伤与超时清零。
  */
 (function (root) {
   'use strict';
@@ -8,10 +10,18 @@
   class Game {
     /** rng 可注入确定性随机源；emit 接收音效和爆炸事件。 */
     constructor(rng = Math.random, emit = () => {}) { this.rng = rng; this.emit = emit; this.reset(); this.state = 'ready'; }
-    /** 每次开局重建所有数组，避免上局弹幕和强化残留。 */
+    /** 每次开局重建所有数组，避免上局弹幕和强化残留。连击也清零。 */
     reset() {
       this.p = P.player(); this.enemies = []; this.shots = []; this.bullets = []; this.items = [];
       this.score = 0; this.time = 0; this.level = 1; this.spawn = 0.7; this.nextBoss = 35; this.boss = null; this.state = 'playing';
+      this.combo = 0; this.comboTimer = 0;
+    }
+    /** 连击倍率：0-9 = 1x，10-19 = 2x，20-29 = 3x… */
+    get comboMul() { return 1 + Math.floor(this.combo / 10); }
+    /** 连击结束（超时或受伤）时触发；仅在有连击时清零。 */
+    _resetCombo() {
+      if (this.combo === 0) return;
+      this.combo = 0; this.comboTimer = 0;
     }
     /** 只在游玩与暂停之间切换，结算不会被误恢复。 */
     pause() { if (this.state === 'playing') this.state = 'paused'; else if (this.state === 'paused') this.state = 'playing'; }
@@ -22,20 +32,28 @@
       for (const e of [...this.enemies]) { e.hp -= 45; e.flash = 0.2; if (e.hp <= 0) this.kill(e); }
       this.emit('bomb', this.p); return true;
     }
-    /** dead 是幂等锁；Boss 保证补给，其余按概率掉落。 */
+    /** dead 是幂等锁；Boss 保证补给，其余按概率掉落。击杀计入连击。 */
     kill(e) {
       if (e.dead) return;
-      e.dead = true; this.score += e.score; this.emit('explosion', e);
+      e.dead = true;
+      // 连击先递增再算分：1 杀=1x，10 杀=2x，但首杀不能先算 1x 再晋级。
+      this.combo++; this.comboTimer = 2.5;
+      const gained = e.score * this.comboMul;
+      this.score += gained;
+      this.emit('explosion', e);
+      this.emit('score', { x: e.x, y: e.y, value: gained });
+      if (this.combo > 0 && this.combo % 10 === 0) this.emit('combo', { combo: this.combo });
       if (e === this.boss) { this.boss = null; this.nextBoss = this.time + 35; }
       if (e.type === 'boss' || this.rng() < 0.2) {
         const kinds = ['power', 'shield', 'heal', 'bomb'];
         this.items.push(P.pickup(e.x, e.y, kinds[Math.floor(this.rng() * kinds.length)]));
       }
     }
-    /** 护盾先吸收一次伤害；无敌期不消耗生命或护盾。 */
+    /** 护盾先吸收一次伤害；无敌期不消耗生命或护盾。受伤清零连击。 */
     damage() {
       const p = this.p;
       if (p.inv > 0) return;
+      this._resetCombo();
       if (p.shield > 0) p.shield = 0; else p.lives--;
       p.inv = 2; this.emit('hurt', p);
       if (p.lives <= 0) { this.state = 'over'; this.emit('over', p); }
@@ -54,6 +72,8 @@
       if (this.state !== 'playing') return;
       dt = P.clamp(Number.isFinite(dt) ? dt : 0, 0, 0.05);
       this.time += dt; this.level = 1 + Math.floor(this.time / 20);
+      // 连击倒计时：暂停时由上方 state 检查拦截，不会偷偷清零。
+      if (this.comboTimer > 0) { this.comboTimer -= dt; if (this.comboTimer <= 0) this._resetCombo(); }
       const p = this.p;
       for (const key of ['inv', 'shield', 'power']) p[key] = Math.max(0, p[key] - dt);
       if (!p.power) p.weapon = 1;

@@ -24,7 +24,7 @@ import asyncio  # 【2026-11-06 第 2 轮新增】摘要生成要把同步的接
 import json  # json 库：把模型给的"参数字符串"解析成真正的 Python 字典
 import os  # 【第 13 轮】取当前目录，写进会话文件的 header
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
-from core.api_client import APIClient  # 导入 API 客户端：真正发请求给大模型的家伙
+from core.api_client import APIClient, ThinkingChunk  # 导入 API 客户端：真正发请求给大模型的家伙；ThinkingChunk 是"模型在思考"的心跳
 from core.commands import REGISTRY, handle_command, is_command  # 【第 14 轮】斜杠命令：在消息进历史之前截下来；【第 16 轮】REGISTRY 供 Tab 补全
 from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各处各写一个数
 from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
@@ -61,6 +61,73 @@ __all__ = ["Conversation", "READ_ONLY_TOOLS"]
 #   但它是"对外导出的名字"——test/test_conversation_loop.py 就是从这个模块 import 它的。
 #   不声明 __all__ 的话，PyCharm / flake8 会把它标成"导入后未使用"（黄色波浪线）。
 #   写进 __all__ 等于告诉静态检查：这是我故意留着给外面用的，别报。
+
+
+# =============================================================================
+# 【2026-11-11 第 26 轮】判断"这次失败要不要打一整屏 traceback"
+#
+# 背景：上游代理（.env 里的 OPENAI_BASE_URL）经常在读流到一半时断开，httpx 抛
+#   RemoteProtocolError: peer closed connection without sending complete message
+#   body (incomplete chunked read)。
+#
+#   这**不是** thinker 的代码有问题——下面 _run_one_iteration 的 except 里本来就有
+#   "改用非流式重试"的兜底，实测几乎每次都能立刻拿到完整回答。但原来的写法是
+#   不分青红皂白 print_exc()：屏幕上先一片红叉，再刷二十行 httpx 调用栈，
+#   然后模型正常把答案说完。用户记住的只有"它又报错了"。
+#
+# 所以按异常链分类：
+#   网络类（连不上 / 读超时 / 上游断流 / 5xx）→ 一行暗灰提示，安静重试；
+#   其他（TypeError、KeyError、解析失败……）→ 保持原样打完整现场，那是真 bug。
+# =============================================================================
+
+# 用「类名集合」而不是 isinstance 判断，两个原因：
+#   1. httpx / openai 的异常类在本项目里没有别的用处，为了判断类型去顶层 import
+#      它们，等于让"只想读历史/跑测试"的场景也被 SDK 绑架；
+#   2. 上游 SDK 迭代快（openai 的 APIConnectionError 就是继承 httpx 的），
+#      类可能搬家/改名，按名字匹配对版本漂移更宽容。
+_TRANSIENT_REASONS = (
+    # 顺序有讲究：先匹配越具体的（连接/断流），再匹配泛化的超时。
+    (("RemoteProtocolError", "ProtocolError", "ReadError", "NetworkError"), "上游断开连接"),
+    (("ConnectError", "ConnectTimeout", "APIConnectionError"), "连不上服务器"),
+    (("ReadTimeout", "WriteTimeout", "TimeoutException", "APITimeoutError"), "读取超时"),
+    (("InternalServerError",), "服务端 5xx"),
+    (("RateLimitError",), "触发限流（429）"),
+)
+
+
+def _iter_exception_chain(exc):
+    """从外层异常开始，沿 __cause__ / __context__ 一路吐到最内层（2026-11-11 第 26 轮新增）
+
+    为什么要走到底：api_client 把真正的异常包成了 StreamReadError，
+    外面看到的 type(e).__name__ 永远是 "StreamReadError"，只有顺着 __cause__
+    才能摸到 httpx.RemoteProtocolError。
+
+    用 id() 去重防环：raise A from B、B 又 from A 这种构造虽然少见，
+    但一旦成环，没去重的 while 会直接死循环——错误处理代码本身卡死最难查。
+    """
+    seen = set()
+    current = exc
+    while current is not None and id(current) not in seen:
+        seen.add(id(current))
+        yield current
+        current = current.__cause__ or current.__context__
+
+
+def _classify_transient(exc):
+    """这次异常能不能靠重试自愈（2026-11-11 第 26 轮新增）
+
+    返回 (是否网络类, 一行中文原因)。不是网络类时返回 (False, "")，
+    调用方据此决定"安静重试"还是"打完整 traceback"。
+
+    判断方式：把整条异常链上每一层的类名收进一个集合，再和关键词表求交集。
+    只看最内层是不够的——有些代理库会在外面再包一层自己的异常。
+    """
+    names = {type(e).__name__ for e in _iter_exception_chain(exc)}
+    for keywords, reason in _TRANSIENT_REASONS:
+        if names & set(keywords):
+            return True, reason
+    return False, ""
+
 
 # =============================================================================
 # 【2026-11-08 第 14.2 轮】把 SDK 的 tool_calls 对象转成普通字典
@@ -679,6 +746,12 @@ class Conversation:
         # 这样模型"只调工具不说话"时，屏幕上不会多出一个空圆点。
 
         # Use streaming API for response
+        # 【第 26 轮】在 try 之前先把"已经显示到屏幕上的半截内容"初始化掉。
+        #   原来它只写在 try 内部（下面的 full_content = ""）。如果
+        #   get_completion_stream() 在**建立连接**时就抛异常——上游断流最常见的
+        #   形态——except 里那句 `if full_content.strip()` 会直接 NameError，
+        #   把一次本可自动重试的网络抖动升级成真正的崩溃。
+        full_content = ""
         try:  # 开始试：这一段是"收流式回复"
             stream_generator = self._api_client.get_completion_stream(request)  # 拿到数据流
 
@@ -717,6 +790,16 @@ class Conversation:
                 #   改前是 `for chunk in iterator` + 循环体内检查 Esc——模型思考时
                 #   （首字节还没到）循环体一次都不执行，那 11 秒里按 Esc 完全没反应。
                 for chunk in iter_stream_with_esc(iterator, esc):  # 一段一段收
+                    # 【第 28 轮】先处理"思考心跳"。
+                    #   推理模型在开口前可能想几分钟，这期间 content 一直是空的。
+                    #   原来这类 chunk 在 api_client 里被静默丢掉，界面完全不知道
+                    #   网络还在传数据，只能干等——用户看到的就是"光标在闪、像死机"。
+                    #   现在把字数转给界面，让 spinner 那行的数字持续上涨。
+                    #   注意它不能进 full_content：思考内容一旦被当成"模型说过的话"
+                    #   存进历史，下一轮会连内心独白一起发回去，上下文暴涨。
+                    if isinstance(chunk, ThinkingChunk):
+                        self._ui_manager.note_thinking(chunk.chars)
+                        continue
                     if isinstance(chunk, str):  # 情况一：这是一小段文字
                         # This is content chunk
                         full_content += chunk  # 拼到总文字上
@@ -779,13 +862,26 @@ class Conversation:
             #   解析出错时会直接跳到 except，spinner 线程就一直活着——
             #   下一轮再启动一个，两个线程往同一行写，屏幕剧烈闪烁。
             self._ui_manager.stop_stream_display(show_done=False)
-            self._ui_manager.print_error(f"处理流式响应时出错：{e}")  # 报错
-            self._ui_manager.print_info(f"错误类型：{type(e).__name__}")  # 打印错误类型
-            traceback.print_exc()  # 打印完整现场
+
+            # 【第 26 轮】先把异常分成"网络抖动"和"真 bug"两类，再决定怎么报。
+            #   网络类不打 traceback：它不是用户要处理的事，而且下面马上就会重试成功；
+            #   在这里刷二十行 httpx 调用栈，只会让人以为 CLI 崩了。
+            transient, reason = _classify_transient(e)
+            if transient:
+                self._ui_manager.print_info(f"流式响应被中断（{reason}），自动改用非流式重试……")
+                # 断在回答中途时，屏幕上已经有半截内容；非流式重试会再完整输出一遍，
+                # 用户看到"两段一模一样的开头"会以为程序抽风。提前说一句，避免误会。
+                if full_content.strip():
+                    self._ui_manager.print_info("上面已输出的半截作废，下面这条是完整回答。")
+            else:
+                self._ui_manager.print_error(f"处理流式响应时出错：{e}")  # 报错
+                self._ui_manager.print_info(f"错误类型：{type(e).__name__}")  # 打印错误类型
+                traceback.print_exc()  # 打印完整现场（只有非网络错误才值得看调用栈）
 
             # Fallback to non-streaming mode
             try:  # 再试：退一步，用"非流式"方式重发一次（不要逐字效果了，能拿到结果就行）
-                self._ui_manager.print_info("正在改用非流式模式重试……")
+                if not transient:  # 网络类在上面已经把"自动重试"说过了，别重复同一句话
+                    self._ui_manager.print_info("正在改用非流式模式重试……")
                 response_message, token_usage = self._api_client.get_completion(request)  # 一次性拿完整结果
                 self._ui_manager.print_assistant_message(response_message.content)  # 把内容显示出来
 

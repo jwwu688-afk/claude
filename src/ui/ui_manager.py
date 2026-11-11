@@ -161,6 +161,14 @@ class UIManager:
         """Print streaming content chunk.（显示一小段流式内容）"""
         self.display_manager.print_streaming_content(chunk)
 
+    def note_thinking(self, chars: int) -> None:
+        """告诉界面"模型又思考了一段"（2026-11-11 第 28 轮新增）
+
+        只传字数、不传内容：界面要的是"它还在动"这个信号，
+        思考原文既不进屏幕也不进历史。
+        """
+        self.display_manager.note_thinking(chars)
+
     def get_stream_buffer(self) -> str:
         """Get current stream buffer content.（取出缓冲区内容）"""
         return self.display_manager.get_stream_buffer()
@@ -192,7 +200,11 @@ class UIManager:
               ⎿  a.py b.py         ← 这里只打印结果
         参数不再重复显示（上面那行已经带过了）。
         """
-        result_preview = self.display_manager.preview_lines(result, 3, 70)  # 只取前 3 行做预览
+        # 只取前 3 行做预览。
+        # 【第 26 轮】第三个参数不再传死值 70：行宽由 preview_lines 按当前终端宽度
+        #   自动计算（控制台列数 - 7），窗口宽窄变化时不会再出现"预览比屏幕还宽、
+        #   被终端硬折行、行号散架"的情况。
+        result_preview = self.display_manager.preview_lines(result, 3)
         self.display_manager.tool_result(result_preview, success=success)
 
     def show_preparing_tool(self, tool_name: str, tool_args: dict) -> None:

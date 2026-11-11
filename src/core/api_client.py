@@ -16,6 +16,7 @@ from openai import OpenAI  # 导入 OpenAI 官方 SDK，用它来发请求（兼
 from typing import Dict, Any, Optional, Generator, List, Tuple  # 导入类型标注工具，只为让代码更易读
 import json  # 导入 json 库，用来处理 JSON 格式的数据（大模型返回的东西就是 JSON）
 import os  # 导入 os 库，用来读取环境变量（比如 API 密钥）
+import httpx  # 【第 27 轮】自建 HTTP 客户端，用来关掉"读取系统代理"这个默认行为
 from dotenv import load_dotenv  # 导入工具函数：把 .env 文件里的配置读进环境变量
 from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageFunctionToolCall
 # 上面这行导入两个"类型"：前者代表"模型的一条完整回复"，后者代表"一次工具调用申请"
@@ -25,6 +26,41 @@ from openai.types.chat.chat_completion_message_function_tool_call import Functio
 
 # Load environment variables
 load_dotenv()  # 立刻执行：把项目根目录 .env 文件里的 OPENAI_API_KEY 等配置加载到内存
+
+
+class StreamReadError(Exception):
+    """读流式响应时网络断了（2026-11-11 第 26 轮新增）
+
+    为什么单独定义一个类型，而不是继续 `raise Exception("Streaming API request failed: ...")`：
+      原写法把"网络抖动"和"代码 bug"统一成同一种 Exception，上层分不出来，
+      只能一视同仁地打一整屏 traceback。实际遇到的上游断流（peer closed connection
+      without sending complete message body）几乎都能靠非流式重试自愈，
+      给用户看二十行 httpx 调用栈纯属噪音。
+
+      用 `from e` 挂上原始异常后，上层可以顺着 `__cause__` 判断到底是
+      网络类（可自动重试、只需一行提示）还是真的代码出错（该打完整现场）。
+    """
+
+
+class ThinkingChunk:
+    """模型"思考"阶段的一小段（reasoning_content）（2026-11-11 第 28 轮新增）
+
+    为什么要单独定一个类型，而不是当普通字符串 yield：
+      1. **思考内容绝不能拼进 full_content**。拼进去的话下一次请求会把模型的内心
+         独白当成"它自己说过的话"发回去——上下文暴涨，模型还会被自己的思考带偏。
+      2. **但它必须让界面知道"网络还在动、模型还在想"**。推理模型（spark-x2.6、
+         GLM、DeepSeek-R1 这类）一次思考可能几分钟，这期间一个正文字都没有；
+         界面如果只等正文，屏幕上就只剩一个光标在闪，用户只能判断为死机。
+    所以用类型区分：调用方看到它就知道"这是心跳，不是要说的话"。
+
+    chars 只带长度、不带内容：界面只需要"想了多少字"，不需要原文；
+    不把原文传上去，也就没有"哪天不小心把它打进历史"的风险。
+    """
+
+    __slots__ = ("chars",)
+
+    def __init__(self, chars: int):
+        self.chars = chars
 
 
 class APIClient:
@@ -115,9 +151,43 @@ class APIClient:
             self.client = OpenAI(
                 # 创建真正的 HTTP 客户端对象，后面的请求都靠它发
                 api_key=self.api_key,  # 把密钥传进去
-                base_url=self.base_url  # 把接口地址传进去（换成 openrouter 之类的中转站）
+                base_url=self.base_url,  # 把接口地址传进去（换成 openrouter 之类的中转站）
+                http_client=self._build_http_client(),  # 【第 27 轮】自己造 HTTP 层，见方法说明
             )
             self._initialized = True  # 标记"已经初始化完成"，下次再创建就跳过这一段
+
+    def _build_http_client(self) -> "httpx.Client":
+        """造一个"默认不走系统代理"的 HTTP 客户端（2026-11-11 第 27 轮新增）
+
+        【为什么必须自己造一个】
+          用户环境里开着本地代理（Windows 注册表 ProxyServer = 127.0.0.1:65532），
+          而 httpx 的 `trust_env=True`（openai SDK 的默认值）在 Windows 上会通过
+          `urllib.request.getproxies()` **直接读注册表**——不是只读环境变量。
+          实测：把 HTTP_PROXY 等环境变量全部清空后，
+          `getproxies()` 仍然返回 {'https': 'http://127.0.0.1:65532'}，
+          httpx 也就照样把请求塞进这个代理。
+
+          结果就是：所有发往国内大模型接口（讯飞 MaaS 等）的请求都绕了一层本地代理，
+          而流式响应的连接寿命很长（模型边想边吐，可能几十秒），
+          代理在转发这种长 chunked 响应时提前关闭连接，客户端读到的就是
+          httpx.RemoteProtocolError: peer closed connection without sending
+          complete message body (incomplete chunked read)。
+          非流式请求是一次性返回、不会长时间开着，所以同一个代理下它反而能成功——
+          "流式必挂、非流式正常"这个特征就是这么来的。
+
+        【默认直连，需要代理时显式打开】
+          在 .env 里设 OPENAI_USE_PROXY=1 就回到旧行为（trust_env=True，走系统/环境代理）。
+          什么时候需要它：接口在墙外（api.openai.com、openrouter 等），
+          必须靠代理才能连通。国内接口一律建议直连——多绕一层只会更慢更容易断。
+
+        【为什么不干脆改环境变量】
+          改 os.environ 只影响本进程，但用户可能是从任何终端启动的，
+          而且 urllib 读注册表这条路根本不受 NO_PROXY 之外的环境变量控制；
+          传一个 trust_env=False 的 Client 是最精确、最难被外部环境翻掉的做法。
+        """
+        use_proxy = (os.getenv("OPENAI_USE_PROXY") or "").strip().lower() in ("1", "true", "yes", "on")
+        # trust_env=False：不去读 HTTP_PROXY / HTTPS_PROXY / ALL_PROXY，也不读注册表代理
+        return httpx.Client(trust_env=use_proxy)
 
     def _detect_prompt_cache(self) -> bool:
         """判断当前接口要不要打提示词缓存标记（2026-11-06 第 6 轮新增）
@@ -361,17 +431,33 @@ class APIClient:
                     self._record_usage(token_usage)  # 【第 6 轮】统一记账
                     continue  # 这一片只有用量、没有文字，直接跳过，处理下一片
 
-                if chunk.choices[0].delta.content:
+                # 【第 28 轮】先把"空 choices"挡掉。
+                #   流式末尾那个 usage chunk 常常是 choices: []，原来直接
+                #   chunk.choices[0] 会 IndexError；现在先取变量、再判断。
+                if not chunk.choices:
+                    continue
+                delta = chunk.choices[0].delta
+
+                # 【第 28 轮】推理模型的思考过程在 reasoning_content 里。
+                #   它不是 OpenAI 标准字段，SDK 不认，会被塞进 model_extra；
+                #   拿不到就是普通模型（gpt-4o 等），走原来的逻辑。
+                #   只把"字数"交给界面当心跳，内容一个字都不向上传（见 ThinkingChunk）。
+                extra = getattr(delta, "model_extra", None) or {}
+                reasoning = extra.get("reasoning_content") or ""
+                if reasoning:
+                    yield ThinkingChunk(len(reasoning))
+
+                if delta.content:
                     # delta 是"增量"的意思：这一片里新增的那点文字
                     # 如果这篇有文字，才进这个分支
-                    content_chunk = chunk.choices[0].delta.content  # 取出这一小段文字
+                    content_chunk = delta.content  # 取出这一小段文字
                     full_content += content_chunk  # 拼到大字符串上
                     yield content_chunk  # 立刻把它交出去（界面收到就能马上显示出来）
 
                 # Handle tool calls
-                if hasattr(chunk.choices[0].delta, 'tool_calls') and chunk.choices[0].delta.tool_calls:
+                if hasattr(delta, 'tool_calls') and delta.tool_calls:
                     # 如果这一片里带着"工具调用申请"（申请也是一点一点传过来的）
-                    for tool_call_delta in chunk.choices[0].delta.tool_calls:  # 一次可能有多个申请
+                    for tool_call_delta in delta.tool_calls:  # 一次可能有多个申请
                         if tool_call_delta.index is not None:  # index 表示"这是第几个申请"
                             # Ensure enough tool_calls slots
                             while len(tool_calls) <= tool_call_delta.index:
@@ -432,4 +518,10 @@ class APIClient:
 
             yield message  # 最后把这一整条消息交出去（这是流里的最后一片）
         except Exception as e:  # 出错就捕获
-            raise Exception(f"Streaming API request failed: {str(e)}")  # 包一层提示再抛出
+            # 【第 26 轮】从裸 Exception 改成 StreamReadError，并把原始异常挂在 __cause__ 上。
+            #   上层（conversation._run_one_iteration）靠 __cause__ 的类型链判断
+            #   "这是网络断了，还是代码写错了"：前者一行提示 + 静默重试，后者才打 traceback。
+            #   用 `raise ... from e` 而不是 `raise ...` 的原因：不带 from 时 Python 会把
+            #   原异常塞进 __context__，但它和"处理另一个异常时又出错"共用一个字段，
+            #   语义上会被 when=True 的链式打印混在一起，显式 from 更清楚。
+            raise StreamReadError(f"Streaming API request failed: {str(e)}") from e

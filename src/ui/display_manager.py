@@ -30,6 +30,7 @@ from rich.table import Table  # 【第 7 轮】用来做「圆点 + 正文」的
 from typing import Optional  # 类型标注：表示"可能是这个，也可能是 None"
 import atexit  # 【第 19 轮】进程退出时兜底恢复光标（等待动画期间光标是隐藏的）
 import os  # 【第 10 轮】读取 THINKER_NO_SPINNER 开关
+import re  # 【第 29 轮】识别 markdown 表格的分隔行（| --- | --- |）
 import sys  # 【第 10 轮】等待动画直接往 stdout 写，需要它
 import threading  # 【第 10 轮】单行 spinner 跑在后台线程里
 import time  # 【第 7 轮】计算"已经等了多久"给 spinner 用
@@ -37,7 +38,30 @@ import time  # 【第 7 轮】计算"已经等了多久"给 spinner 用
 from . import theme  # 本项目统一的配色和符号（见 theme.py）
 
 
-def build_spinner_frame(elapsed: float):
+def _human_seconds(elapsed: float) -> str:
+    """把秒数变成人读得懂的写法（2026-11-11 第 28 轮新增）
+
+    191 秒这个数字，用户得自己换算成"三分多钟"，而换算这件事本该由程序做。
+    超过一分钟就显示 3m11s，一小时内够用。
+    """
+    total = int(elapsed)
+    if total < 60:
+        return f"{total}s"
+    return f"{total // 60}m{total % 60:02d}s"
+
+
+def _human_chars(count: int) -> str:
+    """把"思考了多少字"压成短写法（2026-11-11 第 28 轮新增）
+
+    为什么用 k：推理模型一次能想几千上万 token，写全四个数字会把 spinner
+    撑得很宽，而宽度一变就得靠空格补齐——补得越多，那一行的闪烁越明显。
+    """
+    if count < 1000:
+        return f"{count}"
+    return f"{count / 1000:.1f}k"
+
+
+def build_spinner_frame(elapsed: float, thinking_chars: int = 0):
     """按等待秒数算出这一帧的（纯文本, 带颜色的文本）（2026-11-09 第 19 轮新增）
 
     为什么抽成模块级纯函数：
@@ -45,6 +69,13 @@ def build_spinner_frame(elapsed: float):
       把"这一帧长什么样"抽出来之后，宽度不超标、动词轮换、省略号循环
       这些规则都能离线测（见 test/test_spinner_frame.py）。
       这和 `_render_screen` 的思路一致：把"算"和"写"分开，"算"才可测。
+
+    【第 28 轮】thinking_chars：模型这一轮已经"想"了多少字。
+      推理模型（讯飞 spark-x2.6 等）在真正开口之前会思考很久，实测有过 191 秒。
+      这期间正文一个字都没有，屏幕上只有一个转轮——转轮虽然一直在动，
+      但它传达的信息量等于"不知道在干嘛"。把思考字数实时显示出来之后，
+      数字每秒都在涨，就是"系统活着"最直接的证据。
+      普通模型拿不到 reasoning_content，thinking_chars 恒为 0，文案退回原样。
 
     返回二元组：
       plain  —— 不带转义码的版本，专门用来算显示宽度（cell_len 会忽略 ANSI、
@@ -60,7 +91,12 @@ def build_spinner_frame(elapsed: float):
     frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]
     verb = theme.WAIT_VERBS[int(elapsed // 3) % len(theme.WAIT_VERBS)]
     dots = "." * (int(elapsed * 2) % 4)  # 0/1/2/3 个点
-    tail = f"{verb}{dots} ({int(elapsed)}s)"
+    secs = _human_seconds(elapsed)
+    if thinking_chars > 0:
+        # 有思考字数时不再挂动词：数字本身在变，就是最有力的"还在动"
+        tail = f"正在推理 {_human_chars(thinking_chars)} 字 · {secs}"
+    else:
+        tail = f"{verb}{dots} ({secs})"
 
     plain = f"{frame} {tail}"
     styled = (
@@ -70,13 +106,96 @@ def build_spinner_frame(elapsed: float):
     return plain, styled
 
 
+def _is_table_row(line: str) -> bool:
+    """这一行是不是 markdown 表格的一行（2026-11-11 第 29 轮新增）
+
+    判定放宽到"以 | 开头、且至少两个 |"：
+      真正的表格行是 `| a | b |`，但流还没收完时可能只有 `| a | b`（结尾的 |
+      还在路上）。宽松判定的代价是把少数以 | 开头的普通文本也当成表格，
+      而那种行被重新对齐一次也无伤大雅；反过来（漏判）就会让表格错位，
+      正是用户截图里抱怨的问题。
+    """
+    stripped = line.strip()
+    return stripped.startswith("|") and stripped.count("|") >= 2
+
+
+def _split_cells(line: str) -> list:
+    """把 `| a | b |` 拆成 ['a', 'b']（2026-11-11 第 29 轮新增）
+
+    只去掉最外层的两个竖线，中间的空格也一并 strip：
+    留着空格会导致同一列里有的格子多一格、有的少一格，还没对齐就先错位了。
+    """
+    stripped = line.strip()
+    if stripped.startswith("|"):
+        stripped = stripped[1:]
+    if stripped.endswith("|"):
+        stripped = stripped[:-1]
+    return [cell.strip() for cell in stripped.split("|")]
+
+
+def _render_markdown_table(rows: list) -> str:
+    """把几行原始 markdown 表格重新排成"等宽对齐"的文本（2026-11-11 第 29 轮新增）
+
+    【为什么需要它】
+      流式正文走的是 plain 模式（不做 markdown 渲染，见第 11 轮的取舍），
+      所以模型吐出来的 `| 改动文件 | 内容 |` 是原样打到屏幕上的。
+      而原始 markdown 的列宽是"随手写的"，中文字符又占两列，
+      于是 `| --- | --- |` 和内容行永远对不齐——用户看到的就是截图里那种锯齿。
+
+    【怎么做】
+      1. 拆单元格；
+      2. 认出分隔行（`| --- | --- |`），它在渲染时固定输出短横线；
+      3. 每一列取"所有格子里最宽的那个"作为列宽，**按显示列算**（中文算 2），
+         不够的补空格；
+      4. 重新拼回 `| a | b |` 的形式。
+
+    为什么按显示列而不是按字符数：
+      `cell_len("改动文件")` 是 8，`len()` 是 4。按字符补空格的话，
+      中文列看上去还是会短一截，对齐等于没做。
+
+    返回带结尾换行的字符串，宽度不够的格子用空格补，绝不截断内容。
+    """
+    parsed = [_split_cells(row) for row in rows]
+    ncols = max(len(cells) for cells in parsed)
+    for cells in parsed:  # 补齐成同样的列数，否则后面按列取宽度会越界
+        cells.extend([""] * (ncols - len(cells)))
+
+    # 找分隔行：每个格子都是 --- / :--- / ---: / :---: 这种
+    separator_index = None
+    for index, cells in enumerate(parsed):
+        if cells and all(re.fullmatch(r":?-{1,}:?", cell) for cell in cells):
+            separator_index = index
+            break
+
+    widths = [3] * ncols  # 最小 3 列，保证 `---` 放得下
+    for index, cells in enumerate(parsed):
+        if index == separator_index:
+            continue  # 分隔行不参与宽度计算，否则全是短横线会把列撑得没意义
+        for col, cell in enumerate(cells):
+            widths[col] = max(widths[col], cell_len(cell))
+
+    lines = []
+    for index, cells in enumerate(parsed):
+        if index == separator_index:
+            lines.append("| " + " | ".join("-" * width for width in widths) + " |")
+        else:
+            padded = [
+                cell + " " * (widths[col] - cell_len(cell))  # 按显示列补空格
+                for col, cell in enumerate(cells)
+            ]
+            lines.append("| " + " | ".join(padded) + " |")
+    return "\n".join(lines) + "\n"
+
+
 class DisplayManager:
     """Manages all display operations including streaming content.（管理所有显示操作，包括流式内容）"""
 
     # 【第 10 轮】spinner 每帧都补齐到这个宽度（终端列数，中文算 2 列）。
     # 为什么固定：秒数从 (9s) 变 (10s) 会多一列，如果这一帧比上一帧短，
     # 右边就会留下上一帧的残影。固定宽度 + 空格填充，覆盖永远干净。
-    _SPINNER_CELLS = 28
+    # 【第 28 轮】28 → 40：加了"正在推理 12.3k 字 · 3m11s"这种更长的文案。
+    #   实际宽度还会和终端列数取小（见 _spin_loop），窄窗口下不会被顶到折行。
+    _SPINNER_CELLS = 40
 
     def __init__(self, console: Optional[Console] = None):
         """
@@ -102,6 +221,18 @@ class DisplayManager:
         #   默认值取 plain + 未开始，让这类调用退化成"逐段打印"，而不是直接崩。
         self._stream_mode: str = "plain"  # plain = 追加式打印（默认）；live = rich Live
         self._body_started: bool = False  # plain 模式下正文是否已开始（● 是否已打印）
+        # 【第 28 轮】模型这一轮"思考"了多少字（只用来显示，不参与任何判断）。
+        #   推理模型在开口前可能思考几分钟，这期间正文一个字都没有；
+        #   把这个数字打在 spinner 上，用户就能看到"它还在想，且想得越来越多"。
+        self._reasoning_chars: int = 0
+        # 【第 29 轮】plain 模式的"表格对齐"状态。
+        #   为什么需要这几项：表格必须等整张收完才能算列宽（见 _render_markdown_table），
+        #   所以遇到以 | 开头的行要先把内容攒起来、不立刻打到屏幕上。
+        self._plain_at_line_start: bool = True  # 下一个字符是不是在行首（判断表格只能从行首认）
+        self._plain_pending: str = ""  # 已经收到、还没决定怎么输出的残段
+        self._in_table: bool = False  # 当前是否正在攒一张表格
+        self._table_rows: list = []  # 攒着的原始表格行
+        self._table_limit: int = 40  # 超过这么多行就不再等，先输出（防止超大表格迟迟不显示）
 
     # -------------------------------------------------------------------------
     # 一、消息类
@@ -222,15 +353,43 @@ class DisplayManager:
         self._console.print(text)
 
     def tool_result(self, result: str, success: bool = True) -> None:
-        """打印工具执行结果（2026-11-06 第 4 轮新增）
+        """打印工具执行结果（2026-11-06 第 4 轮新增，2026-11-11 第 26 轮改成多行对齐）
 
-        样式：    ⎿  hello
+        样式（单行结果，最常见）：
+            ⎿  待办清单已更新，共 5 项。
+        样式（多行结果）：
+            ⎿  1  /** ===== 战斗核心：固定逻辑坐标与秒制时间 ===== */
+               2  * 【2026-11-10】输入交给 main，画面交给 effects
+               3  * 死亡标记在本帧立即生效，帧末统一回收
+               …（共 108 行）
+
+        为什么第 26 轮要改成"多行分别打印"：
+          改前 `preview_lines` 把 3 行结果用 " ⏎ " 拼成**一整行**再交给 rich。
+          rich 的 Text 只会在终端边界处硬折行，而折行的位置是按**显示列**算的，
+          中文占 2 列、行号后面的 \\t 又会跳到下一个 8 列边界——
+          于是"1/**/2/*/3/*"这几段被折成一团，行号跑到悬在半空的地方，
+          终端一屏看下去就是"字全是乱的、读不出哪行属于哪个文件"。
+          现在每行独立成行、续行缩进对齐 ⎿ 之后的位置，行号永远在行首，
+          折行也不会跨行粘连（每行长度在 preview_lines 里已按终端宽度截好）。
+
         失败时整行变红，成功时暗灰——这样一眼就能从满屏输出里找到出问题的那次调用。
         """
+        style = "qs.dim" if success else "qs.err"  # 成功用暗灰，失败用红
+        # 统一换行符后按行拆开：rich 的 Text 支持 "\\n"，但续行会从第 0 列开始，
+        # 所以缩进必须我们自己补进去（补在字符串里，而不是靠 Padding）。
+        body = str(result).replace("\r\n", "\n").replace("\r", "\n").split("\n")
+        # 去掉结尾的空行：结果文本以 "\n" 结尾时 split 会多出一个 ""，
+        # 不去掉的话每次工具结果后面都会拖一个空行，一屏里几次调用就散成一片。
+        while len(body) > 1 and not body[-1]:
+            body.pop()
         text = Text()
         text.append(f"  {theme.RESULT}  ", style="qs.dim")  # 转折符号用暗灰，和 Claude Code 一致
-        style = "qs.dim" if success else "qs.err"  # 成功用暗灰，失败用红
-        text.append(str(result), style=style)
+        text.append(body[0], style=style)
+        # 续行缩进 5 格 = 上面前缀 "  ⎿  " 的显示宽度（2 空格 + ⎿ + 2 空格），
+        # 让多行结果像"从 ⎿ 后面展开"，而不是每行都顶着左边框。
+        for line in body[1:]:
+            text.append("\n", style=style)
+            text.append(f"     {line}" if line else "", style=style)
         self._console.print(text)
 
     # -------------------------------------------------------------------------
@@ -307,6 +466,7 @@ class DisplayManager:
         self._stop_spinner()  # 【第 10 轮】幂等兜底：上一轮若因异常没走到 stop，这里把泄漏的线程收掉
         self._stream_buffer = ""  # 清空缓冲区，准备接收新内容
         self._stream_has_content = False  # 本轮是否已经出现过"真正的文字"
+        self._reasoning_chars = 0  # 【第 28 轮】思考字数从 0 开始数
         self._thought_seconds = 0.0  # 思考耗时先归零
         self._stream_start = time.time()  # 记下开始等待的时刻
         self._live = None  # live 模式的正文 Live，等真有内容了再建
@@ -316,6 +476,11 @@ class DisplayManager:
         # 【第 11 轮】正文输出模式：plain = 追加式打印（默认，稳）；live = rich Live（要好看自行开启）
         self._stream_mode = "live" if os.getenv("THINKER_STREAM") == "live" else "plain"
         self._body_started = False  # 【第 11 轮】plain 模式下正文是否已经开始输出（圆点是否已打印）
+        # 【第 29 轮】表格对齐的缓冲状态，每轮开始时清干净
+        self._plain_at_line_start = True
+        self._plain_pending = ""
+        self._in_table = False
+        self._table_rows = []
         # 【第 10 轮】THINKER_NO_SPINNER=1 可以彻底关掉等待动画。
         #   留这个开关是因为不同终端的 ANSI 支持差异很大（Windows Terminal 正常，
         #   某些 IDE 内置终端对 \r 覆盖的处理不好）。真遇到问题可以一键退回"无动画"。
@@ -364,10 +529,15 @@ class DisplayManager:
             # 藏在延迟之后：短等待连一次光标闪动都不会有。
             sys.stdout.write(theme.CURSOR_HIDE)
             sys.stdout.flush()
+            # 【第 28 轮】补齐宽度取"固定值"和"终端能放下"的较小者。
+            #   文案里带了思考字数（12.3k 这类），长度会变；窗口太窄时如果还按
+            #   40 列补齐，补齐的空格会把这一行顶折，转轮就变成两行残影。
+            width_cap = min(self._SPINNER_CELLS, max(20, self._console.width - 2))
             while not self._spinner_stop.is_set():
                 elapsed = time.time() - self._stream_start
-                plain, styled = build_spinner_frame(elapsed)  # 帧内容抽在模块级，可离线测
-                pad = max(0, self._SPINNER_CELLS - cell_len(plain))  # 补齐到固定宽度
+                # 帧内容抽在模块级，可离线测；第 28 轮起把思考字数一起传进去
+                plain, styled = build_spinner_frame(elapsed, self._reasoning_chars)
+                pad = max(0, width_cap - cell_len(plain))  # 补齐到固定宽度
                 sys.stdout.write("\r" + styled + " " * pad + "\x1b[K")
                 sys.stdout.flush()
                 # 10 帧/秒。之前降成 5 帧是想减少重绘，结果转轮切换得太慢，
@@ -384,6 +554,121 @@ class DisplayManager:
                 sys.stdout.flush()
             except Exception:
                 pass
+
+    def _flush_table(self) -> None:
+        """把攒着的表格对齐后一次性打出去（2026-11-11 第 29 轮新增）"""
+        if not self._table_rows:
+            return
+        text = _render_markdown_table(self._table_rows)
+        self._table_rows = []
+        self._console.file.write(text)
+        self._console.file.flush()
+        self._plain_at_line_start = True
+
+    def _write_plain(self, chunk: str) -> None:
+        """plain 模式的正文输出：普通文字照旧逐字吐，表格先攒齐再对齐（2026-11-11 第 29 轮新增）
+
+        【为什么不能简单地把 chunk 直接写出去】
+          模型写表格是逐行吐的，`| 改动文件 | 内容 |` 这一行本身没有错，
+          错在"每行的竖线位置由模型随手决定 + 中文占两列"。
+          要对齐就必须知道**整张表**每一列最宽是多少，也就是必须等表格结束。
+          所以这里的策略是：普通文本一个字都不攒（保持逐字手感），
+          只有"行首是 |"的时候才切到攒表模式。
+
+        【状态机】
+          行首 + 下一个字符是 |   → 进入表格模式，开始攒行（不输出）
+          表格模式 + 又一行 |     → 继续攒
+          表格模式 + 遇到非 | 行  → 表格结束，先对齐输出整张表，再输出这一行
+          不在表格 + 普通文本       → 原样写出去
+
+        【一个刻意的取舍】
+          表格从第一行到最后一行之间，屏幕上什么都不显示（只等一两秒）。
+          换来的是整张表一次性对齐出现，而不是先歪着出现再跳一下。
+          超过 _table_limit 行就不再等，先输出——防止模型写一张巨表时界面看起来卡住。
+        """
+        self._plain_pending += chunk
+        while self._plain_pending:
+            if self._in_table:
+                newline = self._plain_pending.find("\n")
+                if newline < 0:
+                    return  # 这一行还没收完，继续等
+                line = self._plain_pending[:newline]
+                self._plain_pending = self._plain_pending[newline + 1:]
+                if _is_table_row(line):
+                    self._table_rows.append(line)
+                    if len(self._table_rows) >= self._table_limit:
+                        # 表太大，不再等"结束"信号，先输出已攒的部分
+                        self._flush_table()
+                        self._in_table = False
+                    continue
+                # 遇到第一行非表格：说明表格已经结束，先把它吐出去
+                self._flush_table()
+                self._in_table = False
+                self._console.file.write(line + "\n")
+                self._console.file.flush()
+                self._plain_at_line_start = True
+                continue
+
+            # 不在表格里：行首且以 | 开头，才可能是表格
+            if self._plain_at_line_start and self._plain_pending.startswith("|"):
+                self._in_table = True
+                continue
+
+            newline = self._plain_pending.find("\n")
+            if newline < 0:
+                # 这半行还没结束，又不是表格：立刻写出去，保住逐字效果
+                self._console.file.write(self._plain_pending)
+                self._console.file.flush()
+                self._plain_at_line_start = False
+                self._plain_pending = ""
+                return
+
+            piece = self._plain_pending[:newline + 1]
+            self._plain_pending = self._plain_pending[newline + 1:]
+            self._console.file.write(piece)
+            self._console.file.flush()
+            self._plain_at_line_start = True
+
+    def _flush_plain(self) -> None:
+        """收尾：把还压在缓冲区里的半行/未闭合的表格全部吐出去（2026-11-11 第 29 轮新增）
+
+        为什么必须有这一步：
+          模型完全可能"说完一张表就结束"，没有下一行来触发"表格结束"。
+          不主动 flush 的话，最后那张表就永远留在内存里，屏幕上什么都看不到——
+          用户会以为模型偷懒没写。
+        """
+        if self._in_table:
+            # 表格在半路结束（流断了或者就到此为止）：把最后半行也当表格行处理
+            if self._plain_pending.strip():
+                self._table_rows.append(self._plain_pending)
+            self._plain_pending = ""
+            self._flush_table()
+            self._in_table = False
+            return
+        if self._plain_pending:
+            self._console.file.write(self._plain_pending)
+            self._console.file.flush()
+            self._plain_at_line_start = self._plain_pending.endswith("\n")
+            self._plain_pending = ""
+
+    def note_thinking(self, chars: int) -> None:
+        """记下模型又"想"了多少字（2026-11-11 第 28 轮新增）
+
+        调用方是 conversation 的流式循环：它收到 ThinkingChunk（api_client 从
+        reasoning_content 里剥出来的纯计数）就转手调这里。
+
+        为什么只累加、不保存内容：
+          界面上要的只是"它在动"，不是"它在想什么"——把思考原文写进屏幕，
+          一屏全是内心独白，正文反而找不到了；而且思考内容本来就不该进历史。
+          只要数字在涨，用户就能确认进程没死。
+
+        为什么不用加锁：
+          只有主线程写、spinner 线程按 100ms 读一次；最坏情况是读到上一帧的旧值，
+          下一帧就追上了，对一个"证明我还活着"的计数器来说完全够用。
+          加锁反而会在每 100ms 一帧的热路径上引入争用。
+        """
+        if chars > 0:
+            self._reasoning_chars += chars
 
     def _stop_spinner(self) -> None:
         """停掉等待动画，并把那一行擦干净（2026-11-07 第 10 轮新增）
@@ -470,10 +755,21 @@ class DisplayManager:
         self._stop_spinner()  # 不管有没有正文，先把等待动画擦干净
 
         if self._stream_mode == "plain" and self._body_started:
+            # 【第 29 轮】先把压在缓冲里的内容吐完（尤其是"说完表格就结束"的情况，
+            #   否则最后那张表永远出不来）。这一步必须在补换行之前，
+            #   因为 _flush_plain 自己会把结尾补齐。
+            self._flush_plain()
             # 【第 11 轮】plain 模式收尾：最后一行还没有换行符（chunk 是续着写的），
             #   这里补一个换行把光标送回行首，后面的空行和 Cooked 行才不会粘在正文上。
-            self._console.file.write("\n")
-            self._console.file.flush()
+            # 【第 26 轮】改成"只在需要时补"：
+            #   模型最后一段经常自带结尾的 "\n"（比如以列表/代码块结束），
+            #   原来无条件再写一个，正文和空行之间就白多出一整行，
+            #   一屏里"● 正文 → 两个空行 → Cooked"看着很散。
+            #   判断依据用流式缓冲区，而不是终端光标——缓冲区是我们自己攒的，
+            #   一定能准确反映"最后写出去的字符是什么"。
+            if not self._stream_buffer.endswith("\n"):
+                self._console.file.write("\n")
+                self._console.file.flush()
             self._body_started = False
             self._console.print()  # 正文和 Cooked 之间留一个空行
             if show_done:
@@ -560,8 +856,9 @@ class DisplayManager:
             #   2. 终端原生折行对中文双宽字符的处理最可靠。
             #   写 console.file 而不是直接写 sys.stdout，
             #   是为了让测试可以注入 StringIO 假终端。
-            self._console.file.write(chunk)
-            self._console.file.flush()
+            # 【第 29 轮】改走 _write_plain：它会顺手把 markdown 表格攒齐、
+            #   按显示列对齐后再输出；普通文字仍然是一来就写，手感不变。
+            self._write_plain(chunk)
         # live 模式的后续 chunk 不用手动 update：Live 会按 refresh_per_second 自己重画
 
     def get_stream_buffer(self) -> str:
@@ -575,6 +872,13 @@ class DisplayManager:
         self._stream_has_content = False  # 连同"已有内容"的标记一起复位
         self._thought_seconds = 0.0
         self._body_started = False  # 【第 11 轮】正文输出标记一并复位
+        self._reasoning_chars = 0  # 【第 28 轮】思考字数也清零，下一轮从 0 开始
+        # 【第 29 轮】表格缓冲一并清空：这里不 flush，
+        #   clear 的语义就是"这輪内容不要了"，把半张表打出去反而更奇怪。
+        self._plain_pending = ""
+        self._in_table = False
+        self._table_rows = []
+        self._plain_at_line_start = True
 
     # -------------------------------------------------------------------------
     # 四、待办清单
@@ -610,26 +914,74 @@ class DisplayManager:
     # 五、小工具
     # -------------------------------------------------------------------------
     @staticmethod
-    def preview_lines(text, max_lines: int = 3, max_width: int = 70) -> str:
-        """取结果的前几行做预览（2026-11-06 第 4 轮新增）
+    def _take_cells(text: str, cells: int) -> str:
+        """从开头取不超过 cells 列的内容（2026-11-11 第 26 轮新增）
+
+        和 _clip_to_cells 的区别：这里**不加省略号**，纯粹按列切。
+        给 shorten 用——它要自己拼"……（共 N 字符）"的尾巴，
+        如果先加个省略号再拼，就会变成 "……（共 N 字符）…" 两个结尾。
+        """
+        if cells <= 0:
+            return ""
+        used = 0  # 已经占用的列数
+        kept = []
+        for ch in text:
+            width = cell_len(ch)
+            if used + width > cells:  # 再放一个就超了，直接停（不会把一个宽字符切成半个）
+                break
+            kept.append(ch)
+            used += width
+        return "".join(kept)
+
+    @staticmethod
+    def _clip_to_cells(line: str, max_width: int) -> str:
+        """按"显示列"截断一行（2026-11-11 第 26 轮新增）
+
+        为什么不用 `line[:max_width]`：
+          Python 的 len() 数的是字符个数，中文在终端里占 2 列。
+          "战斗核心：固定逻辑坐标" 只有 12 个字符，屏幕上却占 24 列——
+          按 len 截断会以为够短，实际早就顶出终端边界被硬折行。
+          cell_len 逐字符算列宽（中文 2、ASCII 1、emoji 2），和终端对齐。
+        """
+        if cell_len(line) <= max_width:
+            return line
+        # 留 1 列给结尾的省略号，避免"截断后反而比上限宽"
+        return DisplayManager._take_cells(line, max_width - 1).rstrip() + "…"
+
+    def preview_lines(self, text, max_lines: int = 3, max_width: Optional[int] = None) -> str:
+        """取结果的前几行做预览（2026-11-06 第 4 轮新增，第 26 轮重做）
 
         为什么不用 shorten 那种"整段折成一行"？
           像 dir、git status 这类输出，整段折行会变成一坨没法读的长句。
-          取前 3 行、每行截断到 70 字，既能看出"跑成功了没、大概是什么"，又不会刷屏。
+
+        【第 26 轮】改了三件事，都是"工具结果乱成一团"的直接原因：
+          1. **不再用 " ⏎ " 把几行拼成一行**。拼接后的总长度立刻超过终端宽度，
+             rich/终端只能硬折行，折出来的第二段从第 0 列重新开始，
+             行号和内容错位，"1 2 3" 全散在屏幕各处。现在每行独立成行。
+          2. **\\t 先展开成空格**。file_read 的行号是 f"{n:>6}\\t内容"，
+             终端把 \\t 跳到下一个 8 列边界；行号位数一变（9→10），
+             内容起点就跟着跳一列，看着像"行号在抖"。expandtabs(4) 固定成 8 列。
+          3. **按显示列截断，宽度随终端自适应**。原来是死值 70 个**字符**，
+             中文实际占 140 列，窗口窄一点就折成两行。现在 max_width 默认取
+             `控制台宽度 - 7`（⎿ 前缀 5 列 + 2 列余量），保证一行永远放得下。
+
+        参数：
+          max_lines —— 最多显示几行正文（不含结尾的"共 N 行"提示）
+          max_width —— 每行最多占多少列；None 表示按当前终端宽度自动算
         """
-        text = str(text)  # 保险：可能是字典或数字
-        lines = [line.rstrip() for line in text.replace("\r\n", "\n").split("\n") if line.strip()]
-        # 先统一换行，再滤掉空行
+        raw = str(text).replace("\r\n", "\n").replace("\r", "\n")
+        # 统一换行后展开 tab、去掉行尾空白，并滤掉空行：
+        # 空行占一格却没有任何信息，留着一个空行会让人觉得"结果没打完"。
+        lines = [line.rstrip().expandtabs(4) for line in raw.split("\n") if line.strip()]
         if not lines:  # 没有任何内容
             return "（无输出）"
-        picked = []  # 装挑出来的几行
-        for line in lines[:max_lines]:  # 只看前几行
-            if len(line) > max_width:  # 单行太长就截断
-                line = line[:max_width] + "…"
-            picked.append(line)
-        if len(lines) > max_lines:  # 后面还有，就补一句提示
+        if max_width is None:
+            # 下限 30：终端被压到极窄时，至少还能看出半句话，不至于每行只剩省略号。
+            max_width = max(30, self._console.width - 7)
+        picked = [self._clip_to_cells(line, max_width) for line in lines[:max_lines]]
+        if len(lines) > max_lines:  # 后面还有，就补一句提示（单独一行，不挤在结尾）
             picked.append(f"…（共 {len(lines)} 行）")
-        return " ⏎ ".join(picked)  # 用 ⏎ 把几行连起来，表示"这里换过行"
+        return "\n".join(picked)
 
     @staticmethod
     def shorten(text, limit: int = 600) -> str:
@@ -639,15 +991,28 @@ class DisplayManager:
           工具执行结果可能是一整份 npm install 日志（几千行）。
           原样打印会把屏幕刷满，用户根本看不到自己关心的那几行。
           这里把换行折叠成 ⏎ 符号，超长再截断，一眼就能看出"这行在讲什么"。
+
+        【第 26 轮】limit 的单位从"字符"改成"显示列"：
+          这个函数的输出最终都会拼在工具标题行（● task(描述)）后面，
+          而中文一个字占 2 列。按 60 个字符截，屏幕上其实是 120 列，
+          窗口一窄就被终端硬折成两行，第二行从第 0 列顶出来——
+          工具标题和它的结果预览就此错位，看着就是"排版全乱"。
+          现在按 cell_len 切，60 就是实打实的 60 列。
+
+        注意：`text` 是 dict 之类的兜底情况会先 str() 化，\\r\\n 也一并折叠——
+        `_args_preview` 的最后一行就是靠这个兜底，不能因为"不是字符串"就原样吐出。
         """
         text = str(text)  # 保险：传进来的可能是字典或数字
-        if len(text) <= limit:  # 没超长，原样返回（短内容保留换行更好读）
+        if cell_len(text) <= limit:  # 没超长（按显示列算），原样返回
             return text
+        # 把换行折叠成可见的 ⏎，整段压成一行
         one_line = text.replace("\r\n", " ").replace("\n", " ⏎ ").replace("\r", " ")
-        # 把换行折叠掉，整段压成一行
-        head_length = max(0, limit - 40)  # 留 40 个字符的位置给后面的省略说明
-        preview = one_line[:head_length].rstrip()  # 截取前面一段
-        return f"{preview} …（共 {len(text)} 字符，已省略 {len(text) - head_length}）"
+        # 留 40 列给后面的「……（共 N 字符，已省略 M）」说明。
+        # 用 _take_cells 而不是切片：切片按字符数，中文会被多切一倍宽度。
+        head_budget = max(0, limit - 40)
+        preview = DisplayManager._take_cells(one_line, head_budget).rstrip()
+        omitted = max(0, cell_len(one_line) - cell_len(preview))
+        return f"{preview} …（共 {cell_len(one_line)} 列，已省略 {omitted} 列）"
 
 
 def _restore_cursor_on_exit() -> None:
