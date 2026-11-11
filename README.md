@@ -101,8 +101,8 @@ Thinker 跑在终端里，能读代码、改文件、执行命令、自己决定
 ### 1. 安装
 
 ```bash
-git clone git@github.com:jwwu688-afk/claude.git
-cd claude   # 仓库名是 claude，项目本身叫 Thinker
+git clone git@github.com:jwwu688-afk/thinker.git
+cd thinker   
 
 python -m venv .venv
 # Windows
@@ -142,7 +142,7 @@ OPENAI_MODEL=anthropic/claude-sonnet-4
 `.env.example` 里每个变量都有注释，说明它影响什么、为什么默认值是这个。
 
 > **只认仓库根目录的 `.env`**：`python-dotenv` 是从「代码文件所在目录」向上找的，不是从你当前所在的目录找。
-> 所以你在 A 项目里跑 thinker，读的仍然是 `claude/.env` —— 换项目不用重新配。
+> 所以你在 A 项目里跑 thinker，读的仍然是 `thinker/.env` —— 换项目不用重新配。
 > 反过来说，如果你用 `pip install .`（非 editable）装到了 site-packages，这个 `.env` 就找不到了，得改用系统环境变量。
 
 ### 3. 启动
