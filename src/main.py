@@ -196,7 +196,7 @@ def cli():
         console.print(Text("  `thinker --init` 已移除，请先启动 thinker，再在会话内执行 /init。", style=WARN))
         return
 
-    if "--version" in argv or "-v" in argv:
+    if "--version" in argv or "-V" in argv:
         console.print(f"thinker v{VERSION}")
         return
 
