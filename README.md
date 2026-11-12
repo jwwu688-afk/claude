@@ -173,7 +173,8 @@ thinker
 |---|---|
 | `thinker` | 开新会话 |
 | `thinker --continue` / `-c` | 接着**本项目**最近一次会话聊 |
-| `thinker --version` / `-v` | 打印版本 |
+| `thinker --version` / `-V` | 打印版本 |
+| `thinker mcp add\|remove\|list\|get` | 增删查 MCP 服务器，改完退出（见[接入 MCP 外部工具](#接入-mcp-外部工具)） |
 | `thinker --init` | **已移除**，会提示你改用会话内的 `/init` |
 
 ---
@@ -272,6 +273,7 @@ thinker
 | `/compact` | 立刻压缩一次上下文（不等 80%，会调一次摘要模型，**花钱**） |
 | `/clear` | 清空上下文并开一个新会话（旧会话文件保留，可 `/resume` 回去） |
 | `/agents` | 列出内置子 agent 类型、工具白名单与模型 |
+| `/mcp` | MCP 服务器运行时状态：哪些已连接、各自几个工具、谁失败/被跳过 |
 | `/model` | 换模型：列出接口支持的模型让你选。只影响本次进程，不写回 `.env` |
 | `/skills [reload\|install <地址>]` | 列出已加载的技能、来源与扫描问题；`install` 从 GitHub 地址或本地目录装新技能 |
 
@@ -386,7 +388,20 @@ D:\code\project\THINKER.md 当前目录，优先级最高
 
 ## 接入 MCP 外部工具
 
-Thinker 支持标准 [MCP](https://modelcontextprotocol.io)（stdio 传输）。配置文件是 **`~/.thinker/mcp.json`**：
+Thinker 支持标准 [MCP](https://modelcontextprotocol.io)，**只走 stdio 传输**（服务器是本地子进程）。接一个服务器用一条命令：
+
+```bash
+thinker mcp add 12306 -- npx -y 12306-mcp   # 加一个（已存在就覆盖）
+thinker mcp list                             # 看现在配了哪些
+thinker mcp get 12306                        # 看它的配置原文
+thinker mcp remove 12306                     # 删掉（别名 rm）
+```
+
+用法和 `claude mcp add` 一致：`--` 后面的部分原样交给子进程，所以 `-y`、`--port 8080` 这类参数不会被当成 Thinker 自己的选项吞掉。`--` 也可以省略（`thinker mcp add 12306 npx -y 12306-mcp`），效果一样。
+
+两条安全保证：每次改动前把旧文件备份成 `mcp.json.bak`；文件本来就不是合法 JSON 时**直接中止、一个字都不写**（手写配置最怕的「改一处、丢全部」不会发生）。
+
+也可以手写配置文件 **`~/.thinker/mcp.json`**，和命令完全等价（程序读的就是这个文件）：
 
 ```json
 {
@@ -406,6 +421,10 @@ Thinker 支持标准 [MCP](https://modelcontextprotocol.io)（stdio 传输）。
 - **没有这个文件不影响使用**，程序会打印一行提示然后跳过外部工具，内置工具照常。配置文件写坏了（少个逗号）也只跳过，不会崩。
 - 兼容 `mcp` 库 **1.x（`inputSchema`）和 2.x（`input_schema`）**，不用管版本。
 - 仓库里的 [`src/mcp_servers/mcp.json`](src/mcp_servers/mcp.json) 只是**示例模板**，程序不读它。`src/mcp_servers/weather.py` 和 `calculator.py` 可以直接拿来试。
+- **改完要重启 `thinker`**：命令和手改都只动文件，当前会话里已经建立的连接不会热加载。
+- **启动后敲 `/mcp` 看运行时状态**：哪个连上了、各自几个工具、谁失败、谁被跳过。它看的是当前进程的真实连接，和 `thinker mcp list`（只看配置文件）不是一回事——文件里配了 3 个而 `/mcp` 只显示 2 个连接 + 1 个失败，那个失败的就是要修的问题。
+- **Windows 上直接写 `npx` 就行**（不用写 `npx.cmd`）：启动前客户端会用 `shutil.which` 把裸命令解析成真实路径。不解析会踩一个很闷的坑——CreateProcess 只会自动补 `.exe`，而 npm 装的是 `npx.cmd`，配置一字不差也会报 `FileNotFoundError: [WinError 2]`。
+- `npx` 形式的服务器第一次启动要下载包（落在 npm 缓存 `%LOCALAPPDATA%\npm-cache\_npx\<hash>\node_modules\`，不进全局 node_modules），会明显慢一拍（`thinker` 启动时在后台连，不挡输入；刚启动就敲 `/mcp` 可能显示"连接中…"，再敲一次即可）。
 
 ---
 
@@ -426,13 +445,15 @@ Thinker 支持标准 [MCP](https://modelcontextprotocol.io)（stdio 传输）。
 │   │   ├── limits.py           # 输出上限常量（只在这里定义一次）
 │   │   └── prompt/             # 系统提示词拼装：行为规矩 / 记忆 / 环境信息
 │   ├── tools/                  # 内置工具 + MCP 适配 + 子 Agent + 技能（skill/）
+│   │   ├── mcp_config.py       # MCP 配置文件定位/读写（命令与运行时共用）
+│   │   └── mcp_cli.py          # `thinker mcp add/remove/list/get`
 │   ├── ui/                     # 显示与输入（theme 管配色符号，见 ui/README.md）
 │   └── mcp_servers/            # 示例 MCP 服务器（weather / calculator）
 ├── demo/plane/                 # 用 Thinker 写的浏览器小游戏（零依赖，含 Node 逻辑回归）
-├── test/                       # 脚本式回归（只保留压缩那一份，不是 pytest）
+├── test/                       # 脚本式回归：压缩边界 / mcp 命令（不是 pytest）
 ├── docs/
 │   ├── ROADMAP.md              # 还有什么没做、为什么这么排
-│   └── 优化记录/                # 38 份逐轮改动记录（含根因分析）
+│   └── 优化记录/                # 45 份逐轮改动记录（含根因分析）
 ├── THINKER.md                  # 项目记忆（模型每轮都会读到）
 ├── .env.example                # 配置模板，复制成 .env 后填
 ├── LICENSE
@@ -445,7 +466,7 @@ Thinker 支持标准 [MCP](https://modelcontextprotocol.io)（stdio 传输）。
 
 ## 验证
 
-这个仓库只保留**一个**业务测试：五层压缩的回归脚本（第 3 条）。早期有 27 个独立脚本（不是 pytest），后来整套移除了——维护成本高于收益，而且脚本式测试容易写成"永远绿"（历史上出过假绿、也出现过测试文件被误清空两次）。压缩那块重新加回来，是因为它最容易出隐性故障："压了但没效果"不报错、也不会崩，只是钱白花、上下文卡在高位，靠手点根本验不出来。
+这个仓库只保留**三份**业务测试：五层压缩的回归脚本（第 3 条）、`thinker mcp` 命令回归（第 5 条）、`/mcp` 状态判定（第 6 条）。早期有 27 个独立脚本（不是 pytest），后来整套移除了——维护成本高于收益，而且脚本式测试容易写成"永远绿"（历史上出过假绿、也出现过测试文件被误清空两次）。这几块重新加回来，是因为它们最容易出隐性故障：压缩"压了但没效果"不报错、也不会崩，只是钱白花；MCP 那两块出错则是把用户手写的配置悄悄抹掉、或者把"没连上"显示成"已连接"，同样不报错。这些靠手点都验不出来。
 
 所以现在保证四条**可复现**的：
 
@@ -477,7 +498,23 @@ python test/test_compress_boundary.py
 node demo/plane/test/game.test.js
 ```
 
-> 上面四条都**不联网、不消耗模型额度**。
+**5. `thinker mcp` 命令回归**（49 条断言，不连服务器）
+
+```bash
+python test/test_mcp_cli.py
+```
+
+覆盖四件手点验不出来的事：命令写出来的文件，运行时 `MCPConfig` 必须读得懂；覆盖同名服务器前必须先备份，且备份里是**旧**内容；配置文件不是合法 JSON 时 add/remove 必须中止、原文件字节不变；`--` 前后的参数不能互相串味（`-y` 不能被当成 Thinker 的选项吞掉）。
+
+**6. `/mcp` 状态判定**（20 条断言，不连服务器）
+
+```bash
+python test/test_mcp_status.py
+```
+
+五种状态各钉一条：已连接（带工具数 / 正在取清单 / 取清单失败）、连接失败、连接中、状态未知、配置阶段被跳过。判错的后果比没有这条命令更糟——把失败的显示成"已连接"，用户会照着去查为什么工具不出现。
+
+> 上面六条都**不联网、不消耗模型额度**。
 
 业务逻辑的其余部分（主循环、权限判定）靠手动冒烟：改完启动一次，让它读一个文件、改一个文件、跑一条命令，看确认框和状态行对不对。动过 `core/history/` 或 `core/conversation.py` 时，务必聊到上下文过半触发一次压缩再退出。
 

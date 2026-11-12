@@ -20,6 +20,7 @@ Thinker 是一个用 Python 复刻 Claude Code 的终端编程助手：单层主
 src/
   core/          对话总管、API 客户端、历史/压缩、权限、提示词（含 memory.py）、斜杠命令（commands.py）
   tools/         内置工具 + MCP 适配 + 子 agent + 技能（skill/，见下）
+                 mcp_config.py 管 MCP 配置的定位/读写；mcp_cli.py 管 `thinker mcp` 子命令
   ui/            显示与输入（theme 管配色符号）
   mcp_servers/   示例 MCP 服务器（weather / calculator）
 test/            脚本式测试，不是 pytest
@@ -35,10 +36,21 @@ docs/优化记录/    每轮改动的详细记录
 #   （.env 不受影响：python-dotenv 跟着包所在目录向上找，换目录照样读得到。）
 thinker
 
-# 验证：仓库已不带测试套件（早期的 27 个脚本整套移除了）
-#   现在能自动跑的只有 demo 的 Node 逻辑回归；其余靠人工冒烟。
+# 验证：仓库不带测试套件（早期的 27 个脚本整套移除了）
+#   现在能自动跑的是 demo 的 Node 逻辑回归 + 压缩回归 + mcp 命令回归；其余靠人工冒烟。
 node demo/plane/test/game.test.js
+python test/test_compress_boundary.py
+python test/test_mcp_cli.py
 python -m compileall -q src
+```
+
+MCP 配置走命令行改（第 30 轮），别手写 JSON：
+
+```bash
+thinker mcp add 12306 -- npx -y 12306-mcp   # -- 之后原样交给子进程
+thinker mcp list                             # 名字 / 类型 / 完整命令
+thinker mcp get 12306                        # 该条 JSON 原文
+thinker mcp remove 12306                     # 别名 rm
 ```
 
 项目记忆在会话内用 `/init` 生成（见下）。
@@ -54,6 +66,7 @@ python -m compileall -q src
 /compact                           立刻压缩一次上下文（不等 80%，会调一次摘要模型）
 /clear                             清空上下文并开一个新会话（旧会话文件保留，可 /resume 回去）
 /agents                            列出子 agent 类型、工具白名单、模型与来源（每次执行都会重扫 .thinker/agents）
+/mcp                               MCP 运行时状态：哪些连上了、各自几个工具、谁失败/被跳过
 /model                            列出可选模型并切换（只影响本次进程，不写回 .env）
 /skills [reload|install <地址>]    列出技能；reload 重扫；install 从 GitHub 地址/本地目录装新技能
 ```
@@ -118,7 +131,9 @@ argument-hint: [文件路径]
 - **注释用中文，解释"为什么"而不是"是什么"**。这是项目最重要的风格，每个非平凡的决定都要写清背景和踩过的坑。
 - 每个文件顶部有一段 `# =====` 包围的说明，讲这个文件在整体里负责什么。
 - 改动涉及行为时，注释里标注轮次，例如 `【2026-11-07 第 11 轮】`，方便对照 `docs/优化记录/`。
-- 仓库不再带测试套件（27 个脚本整套移除）。要验证改动，写一次性冒烟脚本放在仓库外（如 `D:/workbuddy/thinker-预览/`），**不要提交进仓库**；demo 的 `node demo/plane/test/game.test.js` 是唯一保留的自动化测试。
+- 仓库里只有三份自动化测试：`demo/plane/test/game.test.js`（Node 逻辑）、`test/test_compress_boundary.py`（压缩边界）、`test/test_mcp_cli.py`（mcp 命令）。第 30 轮加第三份的理由：它出错不是"不好用"，而是把用户手写的配置悄悄抹掉，手点验不出来。**新的**冒烟脚本仍然放在仓库外（如 `D:/workbuddy/thinker-预览/`），不要提交进仓库。
+- **MCP 配置的路径只有一个真源**：`tools/mcp_config.resolve_config_path()`。运行时（`MCPClient`）和命令行（`thinker mcp`）都调它。不要在别处再拼 `~/.thinker/mcp.json`，否则会出现"命令写进 A、程序读 B"。
+- **改配置用"严格读"，运行时用"容错读"，两者不要合并**：`mcp_config.load_config_dict()` 读不懂就抛错（保证不会把用户文件写坏）；`server_config.MCPConfig` 坏一条跳一条（保证程序能启动）。目标不同，混在一起两边都会做错。
 - 界面上的符号和颜色只能从 `ui/theme.py` 取，不要在各处硬编码。
 
 ### 注释标准（每轮优化都必须做到）
@@ -164,6 +179,8 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 ## 已知的坑
 
 - `mcp` 库 1.x 用 `inputSchema`、2.x 用 `input_schema`，`McpTool` 里做了双向回退，改这块要同时考虑两个版本。
+- **Windows 上启动外部命令必须走 `resolve_command()`**（`tools/mcp_client/client.py`）：`CreateProcess` 对裸命令只补 `.exe`，而 npm 装的是 `npx.cmd`，直接传 `"npx"` 会 `FileNotFoundError [WinError 2]`。配置文件里仍然存裸名（可移植），解析放在启动时（第 30.1 轮）。
+- **MCP 的连接结果靠四个字段串起来，改连接逻辑时别漏**：`MCPClient.connections`（连上了）、`failures`（连不上）、`tool_names`/`tool_errors`（连上了但取工具清单的结果，由 `ToolManager._register_mcp_tool` 回填）、`MCPConfig.skipped`（配置阶段就被跳过）。`/mcp` 只读这些字段，不自己去连——漏记一个，命令就会把"已连接"显示成"状态未知"，比没有这条命令更误导。
 - `ToolManager` / `Conversation` / `HistoryManager` 全是单例 + 类属性，一次只能跑一个子 agent。做并行之前必须先去掉单例。
 - 上下文压缩会整体替换消息列表，导致前缀缓存失效；压缩动作应尽量落在缓存断点之后。
 - 斜杠命令只在 `Conversation._read_user_input()` 里拦一次，别在三个调用点各写一遍；拦截必须发生在 `add_message` 之前，否则命令自己会进历史、还会计费。

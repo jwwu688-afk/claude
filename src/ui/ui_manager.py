@@ -169,6 +169,18 @@ class UIManager:
         """
         self.display_manager.note_thinking(chars)
 
+    def note_tool_call(self, chars: int) -> None:
+        """告诉界面"模型正在生成工具参数"（2026-11-11 第 30 轮新增）
+
+        和 note_thinking 是两件事：后者发生在正文出现之前，由等待段那一行
+        spinner 接管；前者发生在正文出现之后，此时 spinner 已被停掉，
+        界面得在正文下方另起一行画心跳，否则那段静默看起来就是死机。
+
+        这里仍然只传字数、不传参数内容——参数里可能有文件内容或路径，
+        既不该上屏，也不该进历史。
+        """
+        self.display_manager.note_tool_call(chars)
+
     def get_stream_buffer(self) -> str:
         """Get current stream buffer content.（取出缓冲区内容）"""
         return self.display_manager.get_stream_buffer()

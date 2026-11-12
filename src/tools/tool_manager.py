@@ -79,13 +79,19 @@ class ToolManager:
 
     async def _register_mcp_tool(self):
         # 这个方法是后台跑的：连上所有 MCP 服务器，把它们提供的工具都登记进来
-        sessions = await self._mcp_client.get_sessions()  # 等所有服务器连接完成，拿到会话列表
-        for session in sessions:  # 一个个服务器
+        # 【2026-11-12 第 31 轮】改用 get_connected()：它返回「名字 → 会话」的映射。
+        #   原来拿的是纯会话列表，循环里不知道当前这条是谁，于是：
+        #     · /mcp 想问"这个服务器提供了几个工具"，答不上来；
+        #     · 下面那句失败提示也没法说出服务器名字，多个服务器时看不出是哪个挂了。
+        connections = await self._mcp_client.get_connected()  # 等所有服务器连接完成，拿到映射
+        for name, session in connections.items():  # 一个个服务器
             try:  # 【2026-11-06 优化】单个服务器"问工具清单"失败时不要连累其他服务器
                 #   比如某个服务器启动成功但 list_tools 报错，
                 #   原来会直接抛出异常，导致整个工具清单都拿不到。
                 response = await session.list_tools()  # 问它："你都有什么工具？"
                 tools = response.tools  # 拿到工具清单
+                # 【第 31 轮】先记回客户端，/mcp 才能显示"几个工具"
+                self._mcp_client.note_tools(name, [tool.name for tool in tools])
                 for tool in tools:  # 遍历每一个工具
                     mcp_tool = McpTool(tool, session)  # 包装成我们内部能用的工具对象
                     self._register_tool(tool.name, mcp_tool)  # 用工具原名登记
@@ -97,7 +103,11 @@ class ToolManager:
                 #   真正的失败也补上异常类型：原来只有 {e}，遇到空消息就完全没线索。
                 if self._mcp_client.is_closing:
                     return
-                print(f"[MCP] 获取工具列表失败：{type(e).__name__}: {e}（已跳过该服务器）")
+                # 【第 31 轮】同样把原因记回客户端：这条服务器"连上了但没工具"，
+                #   /mcp 里要能和"连不上"区分开（两者排查方向完全不同）。
+                reason = f"{type(e).__name__}: {e}" if str(e) else type(e).__name__
+                self._mcp_client.note_tool_error(name, reason)
+                print(f"[MCP] 获取工具列表失败：{reason}（服务器 {name}，已跳过）")
 
     def _register_tool(self, name, tool_instance):
         self.tools[name] = tool_instance  # 就是往字典里塞一条

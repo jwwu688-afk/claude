@@ -24,7 +24,7 @@ import asyncio  # 【2026-11-06 第 2 轮新增】摘要生成要把同步的接
 import json  # json 库：把模型给的"参数字符串"解析成真正的 Python 字典
 import os  # 【第 13 轮】取当前目录，写进会话文件的 header
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
-from core.api_client import APIClient, ThinkingChunk  # 导入 API 客户端：真正发请求给大模型的家伙；ThinkingChunk 是"模型在思考"的心跳
+from core.api_client import APIClient, ThinkingChunk, ToolCallChunk  # 导入 API 客户端：真正发请求给大模型的家伙；后两个是"模型还在动"的心跳
 from core.commands import REGISTRY, handle_command, is_command  # 【第 14 轮】斜杠命令：在消息进历史之前截下来；【第 16 轮】REGISTRY 供 Tab 补全
 from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各处各写一个数
 from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
@@ -799,6 +799,17 @@ class Conversation:
                     #   存进历史，下一轮会连内心独白一起发回去，上下文暴涨。
                     if isinstance(chunk, ThinkingChunk):
                         self._ui_manager.note_thinking(chunk.chars)
+                        continue
+                    # 【第 30 轮】工具参数生成阶段的心跳。
+                    #   模型说完"我继续改 effects.js"之后，可能还要好几秒才把
+                    #   file_edit 的参数吐完；这段时间 api_client 只往本地拼参数、
+                    #   不产出正文，而 spinner 已经在第一个正文字到达时被停掉，
+                    #   屏幕上一动不动，看起来就是卡死。把"参数又长了一截"转给
+                    #   界面，让它在正文下方单独一行画心跳。
+                    #   同样必须 continue：它不是文字，绝不能进 full_content / 历史，
+                    #   否则工具参数会被当成"模型说过的话"，下一轮原样发回去。
+                    if isinstance(chunk, ToolCallChunk):
+                        self._ui_manager.note_tool_call(chunk.chars)
                         continue
                     if isinstance(chunk, str):  # 情况一：这是一小段文字
                         # This is content chunk

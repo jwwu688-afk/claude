@@ -16,6 +16,7 @@ from openai import OpenAI  # 导入 OpenAI 官方 SDK，用它来发请求（兼
 from typing import Dict, Any, Optional, Generator, List, Tuple  # 导入类型标注工具，只为让代码更易读
 import json  # 导入 json 库，用来处理 JSON 格式的数据（大模型返回的东西就是 JSON）
 import os  # 导入 os 库，用来读取环境变量（比如 API 密钥）
+import time  # 【第 30 轮】给"工具参数生成"心跳做节流计时，见 ToolCallChunk
 import httpx  # 【第 27 轮】自建 HTTP 客户端，用来关掉"读取系统代理"这个默认行为
 from dotenv import load_dotenv  # 导入工具函数：把 .env 文件里的配置读进环境变量
 from openai.types.chat import ChatCompletionMessage, ChatCompletionMessageFunctionToolCall
@@ -55,6 +56,45 @@ class ThinkingChunk:
 
     chars 只带长度、不带内容：界面只需要"想了多少字"，不需要原文；
     不把原文传上去，也就没有"哪天不小心把它打进历史"的风险。
+    """
+
+    __slots__ = ("chars",)
+
+    def __init__(self, chars: int):
+        self.chars = chars
+
+
+# 【第 30 轮】工具参数心跳的最小间隔（秒）。
+#   为什么需要节流：tool_call 的 arguments 是按字符分片发的，一段长参数能拆成
+#   几百个 delta；每片都 yield 一次的话，界面每片都要重画一行，反而制造闪烁，
+#   还会把 StreamPump 的队列塞满心跳（真正有用的正文被挤在后面）。
+#   0.4s 是"看得见在动"和"不打扰"的折中：比人眼确认"没死机"所需的节奏略快，
+#   又远低于正文的刷新频率。注意它只是【上限】，分片来得慢时是"来一片就发一次"，
+#   不会因为等满 0.4s 反而让屏幕更空。
+TOOL_HEARTBEAT_INTERVAL = 0.4
+
+
+class ToolCallChunk:
+    """模型正在生成工具调用参数时的一小段心跳（2026-11-11 第 30 轮新增）
+
+    为什么要单独定一个类型：
+      流式协议里 tool_calls 的 arguments 是分片到达的，可能连续好几秒只有
+      delta.tool_calls、一个正文字都没有。改前这段逻辑只往本地列表里拼参数、
+      一个 chunk 都不 yield，于是界面在"模型说完一句话"到"打出 ⏺ 工具名"之间
+      彻底静止（实测 6 秒），用户只能判断为卡死。而此时等待用的 spinner 早已在
+      第一个正文字到达时被 _stop_spinner() 停掉、且不会重启，所以必须另给一个信号。
+
+    为什么不带参数内容、只带字数：
+      参数里可能有文件内容、路径甚至密钥，打上屏幕既不安全也没必要；
+      界面要的只是"它还在动"。和 ThinkingChunk 一样，它绝不能拼进 full_content，
+      否则下一轮请求会把工具参数当成"模型说过的话"发回去。
+
+    chars 是这 0.4 秒里累积到的参数字符数，只用于显示一个递增的数字。
+
+    已知边界：心跳只在「收到分片」时产生。若上游把整段参数攒成一块一次性发回，
+    那之前几秒仍然没有帧——要兜住这种情况得让 StreamPump 在队列空转时产出
+    idle tick，那会改动流的产出契约，留给后续轮次；本次只解决"分片被静默吞掉"
+    这个真实成因（实测 6 秒静止）。
     """
 
     __slots__ = ("chars",)
@@ -423,6 +463,11 @@ class APIClient:
             tool_calls = []  # 攒工具调用申请用的列表
             current_tool_call = None  # 记录"当前正在处理哪一条工具申请"
             token_usage = None  # 记录 token 用量，一开始是空的
+            # 【第 30 轮】工具参数心跳的累积字数与上次发送时刻。
+            #   用 time.monotonic() 而不是 time.time()：前者不受系统时钟被用户/校时
+            #   服务回拨影响，节流窗口不会突然变成负数或好几秒。
+            tool_pending_chars = 0
+            last_tool_heartbeat = time.monotonic()
 
             for chunk in stream:  # 一段一段地读数据流，每个 chunk 就是一小片
                 # Handle token usage information
@@ -458,6 +503,12 @@ class APIClient:
                 if hasattr(delta, 'tool_calls') and delta.tool_calls:
                     # 如果这一片里带着"工具调用申请"（申请也是一点一点传过来的）
                     for tool_call_delta in delta.tool_calls:  # 一次可能有多个申请
+                        # 【第 30 轮】心跳计数：只要这一片带了工具名或参数字符就记账。
+                        #   放在 index 判断外面，是因为少数中转会先发 index=None 的分片，
+                        #   那同样是"网络还在动、模型正在准备工具"的证据，不该漏掉。
+                        fn_delta = getattr(tool_call_delta, "function", None)
+                        if fn_delta:
+                            tool_pending_chars += len(fn_delta.name or "") + len(fn_delta.arguments or "")
                         if tool_call_delta.index is not None:  # index 表示"这是第几个申请"
                             # Ensure enough tool_calls slots
                             while len(tool_calls) <= tool_call_delta.index:
@@ -479,6 +530,17 @@ class APIClient:
                                 if tool_call_delta.function.arguments:  # 带了参数（参数是分片传的，所以要拼接）
                                     current_tool_call['function']['arguments'] += tool_call_delta.function.arguments
                                     # 注意这里是 += 而不是 =，因为参数会被切成好几片陆续传来
+
+                    # 【第 30 轮】按时间节流把心跳交出去，让界面知道这段静默不是死机。
+                    #   判断放在"一个 chunk 收完"而不是"每片 delta"，是为了把同一 chunk
+                    #   里的多片合并成一个心跳；按时间不按字数，是因为参数生成速度不稳定，
+                    #   按字数会出现"半天不亮、忽然连闪几下"。
+                    #   流结束时若还剩下不足一个窗口的字符，不必补发：紧接着就要 yield
+                    #   完整的 ChatCompletionMessage，界面马上会打出工具调用头。
+                    if tool_pending_chars and (time.monotonic() - last_tool_heartbeat) >= TOOL_HEARTBEAT_INTERVAL:
+                        yield ToolCallChunk(tool_pending_chars)
+                        tool_pending_chars = 0
+                        last_tool_heartbeat = time.monotonic()
 
             # Convert tool_calls to OpenAI standard format
             formatted_tool_calls = None  # 准备一个变量，装"整理好格式"的工具申请

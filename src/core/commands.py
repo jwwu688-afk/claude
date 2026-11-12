@@ -834,6 +834,106 @@ async def cmd_agents(conversation, args: str) -> None:
 
 
 # =============================================================================
+# 八点五、MCP 服务器运行时状态（2026-11-12 第 31 轮）
+#
+# 【和 `thinker mcp list` 的分工——这块最容易被问"list 不是也能看吗"】
+#   终端里的 `thinker mcp list` 读的是**配置文件**，回答"我配了什么"；
+#   这里的 /mcp 看的是**当前进程已经建立的连接**，回答"哪些真的连上了"。
+#   两者会不一致，而这不一致本身就是信息：
+#     文件里配了 3 个，/mcp 显示 2 个已连接 + 1 个失败
+#       → 那个失败的就是当前真正要修的问题。光看配置永远发现不了。
+#
+# 【为什么 /mcp 不改配置（不做 /mcp add、/mcp remove）】
+#   会话内的连接是用 AsyncExitStack 挂在后台任务上的（见 client.py 的 _run）。
+#   临时往已建好的连接里插一条、或者摘一条，等于让工具表变成"一半新一半旧"，
+#   而工具清单在提示词前缀里，动一次就废一次缓存。
+#   配置改动统一走终端命令、改完重启——这条边界比"少敲几行"重要。
+#
+# 【为什么状态要分行上色，而不是统一 print_info】
+#   这条命令存在的唯一意义就是"一眼看出哪个不对"。
+#   绿勾=连上、红叉=失败、黄色感叹号=配置阶段就被跳过，
+#   扫一眼就能定位；全部灰字得逐行读，那就退化成又一份日志了。
+# =============================================================================
+
+async def cmd_mcp(conversation, args: str) -> None:
+    """/mcp —— 列出所有 MCP 服务器，标明哪个连上了、各自几个工具（第 31 轮新增）
+
+    参数 args：不接受任何参数。带了参数不报错，而是把用户引到正确的入口——
+      想加服务器的人敲 /mcp add xxx 是最自然的误用，回一句"参数错误"帮不上忙。
+    """
+    args = args.strip()
+    ui = conversation._ui_manager  # 所有输出走门面，不直接 print
+
+    if args:
+        # 用户十有八九是在会话里就想加服务器（/mcp add xxx）。
+        # 把整串原样接到终端命令后面，而不是无脑再补一个 add——
+        # 那样 `/mcp add foo` 会被拼成 "thinker mcp add add foo"，看着像在敷衍。
+        first = args.split()[0].lower()
+        if first in ("add", "remove", "rm", "list", "ls", "get"):
+            hint = f"thinker mcp {args}"
+        else:
+            hint = f"thinker mcp add {args}"  # 只给了名字，按最常见的意图补成 add
+        ui.print_info(f"/mcp 不带参数。要增删服务器，退出后在终端执行：{hint}")
+        return
+
+    # 两跳取客户端：Conversation → ToolManager(类属性) → MCPClient。
+    # 用 getattr 而不是直接点：命令要能在测试里用假 conversation 跑
+    #（第 14 轮立的规矩），假对象没有 _mcp_client，直接点会 AttributeError。
+    tool_manager = getattr(conversation, "_tool_manager", None)
+    client = getattr(tool_manager, "_mcp_client", None)
+    if client is None:
+        # 如实说"读不到"，而不是显示"没有服务器"——后者会让人以为配置丢了
+        ui.print_error("MCP 客户端还没初始化，读不到连接状态。")
+        return
+
+    items = client.status_snapshot()  # 此刻的状态快照（不等待连接，可能含"连接中"）
+
+    if not items:  # 文件不存在或配置为空
+        ui.print_info("还没有配置任何 MCP 服务器。")
+        ui.print_info("在终端里加一个：thinker mcp add 12306 -- npx -y 12306-mcp")
+        ui.print_info(f"配置文件：{client.config.config_path}")
+        return
+
+    # 先算汇总：用户第一眼想知道的是"几个连上了"，逐行细节是第二步
+    counts = {"connected": 0, "failed": 0, "connecting": 0, "skipped": 0, "idle": 0}
+    for item in items:
+        counts[item["state"]] = counts.get(item["state"], 0) + 1  # get 兜住未来新增的状态
+
+    summary_parts = []
+    if counts["connected"]:
+        summary_parts.append(f"已连接 {counts['connected']}")
+    if counts["connecting"]:
+        summary_parts.append(f"连接中 {counts['connecting']}")
+    if counts["failed"]:
+        summary_parts.append(f"失败 {counts['failed']}")
+    if counts["skipped"]:
+        summary_parts.append(f"跳过 {counts['skipped']}")
+    if counts["idle"]:  # 正常流程不该出现，出现了也要显示出来，别静默
+        summary_parts.append(f"状态未知 {counts['idle']}")
+    summary = "，".join(summary_parts)
+    ui.print_info(f"MCP 服务器 {len(items)} 个" + (f"（{summary}）" if summary else ""))
+
+    for item in items:
+        # 顺序就是 status_snapshot 给的顺序：配置里的正常项在前（保持文件顺序），
+        # 被跳过的排最后——它们是"配了但本版本用不了"，混在正常项里会让人以为也在连。
+        name, state, detail = item["name"], item["state"], item["detail"]
+        if state == "connected":
+            # 名字放最前面：多个服务器时，用户是按名字找那一行的，不是按状态找
+            ui.print_success(f"{name} · {detail}")
+        elif state == "failed":
+            ui.print_error(f"{name} · 连接失败 · {detail}")
+        elif state == "skipped":
+            ui.print_warning(f"{name} · 已跳过 · {detail}")
+        elif state == "connecting":
+            ui.print_info(f"{name} · 连接中…")
+        else:  # idle：连完了却既没成功也没失败，属于异常状态，用黄色提示而不是静默跳过
+            ui.print_warning(f"{name} · {detail}")
+
+    ui.print_info(f"配置文件：{client.config.config_path}")
+    ui.print_info("改配置：终端里 thinker mcp add/remove，改完重启 thinker 生效")
+
+
+# =============================================================================
 # 九、技能（2026-11-10 第 21 轮；第 24 轮去掉命令登记）
 #
 # 这一节只做一件事：
@@ -1294,6 +1394,9 @@ register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cm
 register(CommandSpec("compact", "/compact", "立刻压缩上下文（不等 80%）", cmd_compact))
 register(CommandSpec("clear", "/clear", "清空上下文并开一个新会话", cmd_clear))
 register(CommandSpec("agents", "/agents", "列出子 agent 类型（同时重新扫描目录）", cmd_agents))
+# 【第 31 轮】MCP 的运行时视角：哪些连上了、几个工具、谁失败了。
+#   和终端命令 `thinker mcp list`（只看配置文件）互补，不重复。
+register(CommandSpec("mcp", "/mcp", "MCP 服务器：哪些连上了、各自几个工具", cmd_mcp))
 # 【第 22 轮】换模型。
 # 【第 24 轮】去掉了原来"必须先于技能命令登记"的说明：技能不再占用命令名，
 #   登记顺序与它无关了。现在这里只是一个普通的内置命令。

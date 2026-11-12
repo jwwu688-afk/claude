@@ -467,6 +467,11 @@ class DisplayManager:
         self._stream_buffer = ""  # 清空缓冲区，准备接收新内容
         self._stream_has_content = False  # 本轮是否已经出现过"真正的文字"
         self._reasoning_chars = 0  # 【第 28 轮】思考字数从 0 开始数
+        # 【第 30 轮】工具参数心跳行的状态。三个字段每轮都在这里重置，
+        #   保证上一轮异常退出留下的 active=True 不会让新一轮一上来就去清别人的行。
+        self._tool_hint_active = False
+        self._tool_hint_chars = 0
+        self._tool_hint_start = 0.0
         self._thought_seconds = 0.0  # 思考耗时先归零
         self._stream_start = time.time()  # 记下开始等待的时刻
         self._live = None  # live 模式的正文 Live，等真有内容了再建
@@ -670,6 +675,82 @@ class DisplayManager:
         if chars > 0:
             self._reasoning_chars += chars
 
+    def note_tool_call(self, chars: int) -> None:
+        """模型正在生成工具参数：在正文下方单独一行画心跳（2026-11-11 第 30 轮新增）
+
+        为什么需要它：
+          模型说完"我继续改 effects.js"之后，可能还要好几秒才把 file_edit 的
+          参数吐完。这段时间里 api_client 只往本地拼参数、一个正文字都没有，
+          而等待段的 spinner 早在第一个正文字到达时就被 print_streaming_content
+          停掉且不会重启——屏幕上什么也不动，用户只能判断为死机（实测 6 秒）。
+          ToolCallChunk 把"参数又长了一截"送进来，这里就用它刷新一行心跳。
+
+        四条只在同时成立时才画，每一条都是踩过的坑：
+          · 正文已经开始：没开始时等待段 spinner 还在转，再画一行会变成两行动画打架；
+          · plain 模式：live 模式由 rich Live 重绘正文区，往同一片区域写 \\r
+            会覆盖它的帧（第 11 轮把 Live 换成追加式打印就是因为这个）；
+          · 真终端：非 tty 时输出常进文件或管道，ANSI 转义码只会变成乱码；
+          · THINKER_NO_SPINNER 未开：用户明确关了动画就一行都不该多打。
+
+        参数 chars 是本轮累积到的参数字符数，只用来显示一个递增的数字；
+        参数正文一个字都不上屏（里面可能有文件内容或路径）。
+        """
+        if (not self._stream_has_content
+                or self._stream_mode != "plain"
+                or not self._is_tty()
+                or os.getenv("THINKER_NO_SPINNER") == "1"):
+            return
+
+        self._tool_hint_chars += max(0, chars)
+        now = time.time()
+
+        if not self._tool_hint_active:
+            # 正文最后一行没有换行符，光标停在句子中间。先 _flush_plain 把可能
+            # 压着的半行 / 未闭合表格吐完，再写 \n 换到【独立的新行】。
+            # 绝不能直接在当前行用 \r 覆盖——那会把刚说出口的正文整个抹掉，
+            # 正是第 10 轮"spinner 和正文抢同一行"那个坑。
+            self._flush_plain()
+            self._console.file.write("\n")
+            self._console.file.flush()
+            # 镜像进缓冲：stop_stream_display 靠 _stream_buffer 判断"要不要补换行"，
+            # 不记账的话它还会再补一次，正文与 Cooked 之间就白多出一行。
+            self._stream_buffer += "\n"
+            self._tool_hint_active = True
+            self._tool_hint_start = now
+
+        elapsed = max(0.0, now - self._tool_hint_start)
+        frame = theme.SPIN_FRAMES[int(elapsed * 8) % len(theme.SPIN_FRAMES)]
+        tail = f"正在准备工具调用 {_human_chars(self._tool_hint_chars)} 字 · {_human_seconds(elapsed)}"
+        plain = f"{frame} {tail}"
+        styled = (
+            f"{theme.ACCENT_ANSI}{frame}{theme.RESET_ANSI} "
+            f"{theme.DIM_ANSI}{tail}{theme.RESET_ANSI}"
+        )
+        # 和 spinner 同一套宽度口径：补齐到固定列，短帧才不会留下上一帧的残影。
+        width_cap = min(self._SPINNER_CELLS, max(20, self._console.width - 2))
+        pad = max(0, width_cap - cell_len(plain))
+        # \r 只回到【心跳这一行】的行首，正文在上面一行，永远碰不到。
+        self._console.file.write("\r" + styled + " " * pad + "\x1b[K")
+        self._console.file.flush()
+
+    def _stop_tool_hint(self) -> bool:
+        """擦掉工具心跳那一行，返回"本轮确实画过心跳"
+
+        返回值的用途：stop_stream_display 靠它判断"正文与 Cooked 之间的空行
+        已经由这一行腾出来了"，从而跳过原本要补的 \\n 和 print()，避免多出一个空行。
+        """
+        if not getattr(self, "_tool_hint_active", False):
+            return False
+        self._tool_hint_active = False
+        # 空格覆盖而不是只发 2K：第 10 轮实测伪终端里 2K 之后尾巴还在。
+        # 空格数按终端宽度收敛，写死 100 个在窄窗口里会自己折行，反而多出一行。
+        pad = min(100, max(20, self._console.width - 2))
+        # 清完再换行：光标落到下一行行首，被清空的这行正好充当正文与
+        # Cooked 之间的空行，不多不少。
+        self._console.file.write("\r" + " " * pad + "\r" + "\n")
+        self._console.file.flush()
+        return True
+
     def _stop_spinner(self) -> None:
         """停掉等待动画，并把那一行擦干净（2026-11-07 第 10 轮新增）
 
@@ -753,6 +834,9 @@ class DisplayManager:
         原来的写法在这种轮次里不会清掉 spinner 行，它就留在屏幕上变成一条残影。
         """
         self._stop_spinner()  # 不管有没有正文，先把等待动画擦干净
+        # 【第 30 轮】正文下方那行"正在准备工具调用"也要收掉，不能把过程提示
+        #   永久留在屏幕上。返回值告诉下面：正文与 Cooked 之间的空行已经腾出来了。
+        had_tool_hint = self._stop_tool_hint()
 
         if self._stream_mode == "plain" and self._body_started:
             # 【第 29 轮】先把压在缓冲里的内容吐完（尤其是"说完表格就结束"的情况，
@@ -767,11 +851,16 @@ class DisplayManager:
             #   一屏里"● 正文 → 两个空行 → Cooked"看着很散。
             #   判断依据用流式缓冲区，而不是终端光标——缓冲区是我们自己攒的，
             #   一定能准确反映"最后写出去的字符是什么"。
-            if not self._stream_buffer.endswith("\n"):
+            # 【第 30 轮】画过心跳时：note_tool_call 已写过一个 \n 结束正文行，
+            #   _stop_tool_hint 又写过一个 \n 把心跳行清空、腾出一个空行，
+            #   两步合起来正好等于原来的"补换行 + print() 空行"。
+            #   所以这里两步都跳过，否则正文与 Cooked 之间会白多出两行。
+            if not had_tool_hint and not self._stream_buffer.endswith("\n"):
                 self._console.file.write("\n")
                 self._console.file.flush()
             self._body_started = False
-            self._console.print()  # 正文和 Cooked 之间留一个空行
+            if not had_tool_hint:
+                self._console.print()  # 正文和 Cooked 之间留一个空行
             if show_done:
                 self._print_done_line()
                 self._console.print()  # Cooked 之后也留一行，和下一轮内容分开
@@ -820,6 +909,16 @@ class DisplayManager:
         """
         if not hasattr(self, "_stream_buffer"):  # 如果这个属性还不存在（保险措施）
             self._stream_buffer = ""  # 就建一个空的
+
+        # 【第 30 轮】正文与工具参数交错：少数模型 / 中转会在 tool_calls 分片之间
+        #   又吐几个字。心跳行是靠 \r 反复覆盖的，必须先把它"定稿"（补换行、
+        #   关掉标记），否则后续文字会写在同一行上、再被下一次覆盖抹掉，正文就丢了。
+        #   这里不清掉心跳文字、只结束这一行：宁可多留一行过程提示，也不丢内容。
+        if getattr(self, "_tool_hint_active", False):
+            self._console.file.write("\n")
+            self._console.file.flush()
+            self._stream_buffer += "\n"
+            self._tool_hint_active = False
 
         self._stream_buffer += chunk  # 把新来的这一小段接到后面
         # 【第 10 轮】只有"有实义的字"才算内容开始。
@@ -873,6 +972,11 @@ class DisplayManager:
         self._thought_seconds = 0.0
         self._body_started = False  # 【第 11 轮】正文输出标记一并复位
         self._reasoning_chars = 0  # 【第 28 轮】思考字数也清零，下一轮从 0 开始
+        # 【第 30 轮】心跳行若还挂在屏幕上，先擦掉再复位状态；
+        #   不擦的话，下一轮的第一句输出会直接接在那行后面。
+        self._stop_tool_hint()
+        self._tool_hint_chars = 0
+        self._tool_hint_start = 0.0
         # 【第 29 轮】表格缓冲一并清空：这里不 flush，
         #   clear 的语义就是"这輪内容不要了"，把半张表打出去反而更奇怪。
         self._plain_pending = ""

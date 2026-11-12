@@ -183,6 +183,18 @@ def cli():
     # 定义命令行入口函数。pyproject.toml 里配置的 thinker 命令，指向的就是这个函数
     argv = sys.argv[1:]
 
+    # 【2026-11-12 新增】`thinker mcp ...`：在命令行里增删 MCP 服务器
+    #   用法对齐 Claude Code：thinker mcp add 12306 -- npx -y 12306-mcp
+    #   为什么放在最前面、用 argv[0] 判断而不是 "--mcp"：
+    #     ① claude 的写法就是 `claude mcp add`，跟着它，熟悉的人不用查文档；
+    #     ② 这是一条"改完配置就退出"的短命令，不该受下面 --version/--continue
+    #        的判断顺序影响，更不该掉进对话主循环里（进对话就会去连服务器、等模型）。
+    #   延迟 import：不用这条命令的启动路径上，连 mcp_cli 这个模块都不加载。
+    if argv and argv[0] == "mcp":
+        from tools.mcp_cli import run_mcp_cli
+
+        sys.exit(run_mcp_cli(argv[1:]))  # 用它的返回码当进程退出码，脚本里能判断成败
+
     # 【第 11 轮】先处理不进入对话的参数
     # 【2026-11-08 清理】原来这里还有 `--init` 分支，现在已经删掉：
     #   生成项目记忆统一走会话内的 `/init`（core/commands.py）。

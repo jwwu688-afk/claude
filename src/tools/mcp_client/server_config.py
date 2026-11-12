@@ -40,6 +40,12 @@ class MCPConfig:
         # expanduser() 的作用：把路径开头的 ~ 换成你的用户目录
         # 所以 "~/.thinker/mcp.json" 会变成 "C:/Users/23889/.thinker/mcp.json"
         self.servers: Dict[str, MCPServer] = {}  # 存所有服务器，键是名字
+        # 【2026-11-12 第 31 轮】被跳过的服务器 → 跳过原因。
+        #   为什么单独记：这些条目在配置文件里**存在**，但加载阶段就被丢掉了，
+        #   self.servers 里根本没有它们。会话内的 /mcp 要回答"我配的那个怎么没出现"，
+        #   只列 self.servers 会让人以为配置丢了。原因文案和下面 print 的一致，
+        #   免得同一个问题在启动日志和 /mcp 里说法不同。
+        self.skipped: Dict[str, str] = {}
         self._load_config()  # 造对象时就顺便把配置读进来
 
     def _load_config(self):
@@ -78,12 +84,14 @@ class MCPConfig:
                 #   现在改成"跳过这个，继续看下一个"。
                 if not isinstance(info, dict):  # 配置项本身不是对象
                     print(f"[MCP] 服务器 {name} 的配置格式不对，已跳过")
+                    self.skipped[name] = "配置格式不对（应为 { } 包裹的对象）"
                     continue  # 跳过它
 
                 type_ = info.get("type")  # 取连接类型
                 if not (type_ == "stdio" or type_ is None):  # 如果不是 stdio，也没写类型
                     # only handle stdio type
                     print(f"[MCP] 服务器 {name} 的类型是 {type_}，本版本只支持 stdio，已跳过")
+                    self.skipped[name] = f"类型 {type_}（本版本只支持 stdio）"
                     continue  # 就跳过（这意味着 HTTP / SSE 类型的服务器会被忽略）
 
                 command = info.get("command")  # 取启动命令
@@ -91,15 +99,18 @@ class MCPConfig:
                 if not command:  # 【2026-11-06 优化】只要求 command 必填
                     #   原来连 args 为空也会报错，导致"不需要参数的服务器"根本配不了。
                     print(f"[MCP] 服务器 {name} 缺少 command，已跳过")
+                    self.skipped[name] = "缺少 command"
                     continue
                 if not isinstance(args, list):  # 参数必须是列表
                     print(f"[MCP] 服务器 {name} 的 args 应该是列表（用 [ ]），已跳过")
+                    self.skipped[name] = "args 应该是列表（用 [ ]）"
                     continue
 
                 self.servers[name] = MCPServer(name=name, type_=type_, command=command, args=args)
                 # 包装成对象，存进字典
             except Exception as e:  # 兜底：万一还有没想到的情况
                 print(f"[MCP] 服务器 {name} 加载失败（{e}），已跳过")
+                self.skipped[name] = f"加载失败（{e}）"
 
     def get_server(self, name: str) -> Optional[MCPServer]:
         return self.servers.get(name)  # 按名字取，取不到返回 None
