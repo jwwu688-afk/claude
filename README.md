@@ -44,6 +44,7 @@ Thinker 跑在终端里，能读代码、改文件、执行命令、自己决定
 - [记忆系统](#记忆系统)
 - [上下文五层压缩](#上下文五层压缩)
 - [接入 MCP 外部工具](#接入-mcp-外部工具)
+- [生命周期 hook](#生命周期-hook)
 - [目录结构](#目录结构)
 - [验证](#验证)
 - [常见问题](#常见问题)
@@ -428,6 +429,51 @@ thinker mcp remove 12306                     # 删掉（别名 rm）
 
 ---
 
+## 生命周期 hook
+
+在会话的四个点上挂 shell 命令。配置在 **`~/.thinker/settings.json`**（只支持用户级，理由见下）：
+
+```json
+{
+  "hooks": {
+    "SessionStart": [
+      { "hooks": [{ "type": "command", "command": "git status --short" }] }
+    ],
+    "PreToolUse": [
+      { "matcher": "cmd_runner", "hooks": [{ "type": "command", "command": "python C:/hooks/guard.py" }] }
+    ],
+    "PostToolUse": [
+      { "matcher": "file_write|file_edit", "hooks": [{ "type": "command", "command": "echo 改完了" }] }
+    ],
+    "SessionEnd": [
+      { "hooks": [{ "type": "command", "command": "echo bye >> C:/hooks/run.log" }] }
+    ]
+  }
+}
+```
+
+| 事件 | 什么时候跑 | 能拦住吗 | 输出到哪 |
+|---|---|---|---|
+| `SessionStart` | 会话建立后、系统提示词生成前 | 不能 | stdout 拼进系统提示词 |
+| `PreToolUse` | 工具调用前、**权限确认之前** | **能（exit 2）** | 拒绝原因回给模型 |
+| `PostToolUse` | 工具成功执行后 | 半能（工具已跑完） | stdout 追加到工具结果 |
+| `SessionEnd` | 进程退出前（Ctrl+C 也算） | 不能 | 打给用户 |
+
+几个必须知道的：
+
+- **退出码**：`0` 继续；`2` 阻断（stderr 作为原因）；其它当非阻断错误，打一行黄字继续跑。
+- **stdin 是 JSON**，字段和 Claude Code 一致：`session_id` / `cwd` / `hook_event_name` / `tool_name` / `tool_input`。所以现成的 Claude Code hook 脚本基本能直接搬。
+- **`matcher`** 只对 `PreToolUse`/`PostToolUse` 生效：空或 `*` 匹配全部，`file_write|file_edit` 匹配多个，`mcp__.*` 按正则。大小写敏感。
+- **只支持用户级**。项目里的 `.thinker/settings.json` **不会被执行**——克隆一个仓库就能在你机器上跑 shell，这个口子不值得为团队共享开。项目里有配置时，启动会提示一句"已忽略"。
+- **超时默认 30 秒**，上限 300 秒；超时按非阻断处理（杀子进程 + 黄字提示）。
+- **输出上限 4000 字符**：超出部分被截断并注明「已截断 N 字符」。hook 的 stdout 会进上下文，一条 `git log` 就能顶掉预算。
+- **同一个 hook 失败最多提示 3 次**：第 4 次改说「之后不再提示」，再往后彻底安静——否则一条写坏的 hook 会每调一次工具刷一行黄字。
+- **Windows 上是 cmd 语法**，不是 bash：`$(...)`、`&&` 以外的 shell 特性都不认。复杂逻辑写成 `.py` 文件再用 `python xxx.py` 调，跨平台最稳。
+- **改完要重启**：配置文件只在启动时读一次。
+- **多个 hook 串行执行，遇到 exit 2 立即停**（Claude Code 是并行跑完再合并，见[第 32 轮文档](docs/优化记录/32-第32轮-hook机制.md)里的取舍说明）。
+
+---
+
 ## 目录结构
 
 ```
@@ -440,6 +486,7 @@ thinker mcp remove 12306                     # 删掉（别名 rm）
 │   │   ├── history/            # 消息历史 + 五层压缩
 │   │   ├── permissions.py      # 权限判定（危险规则 / 只读白名单 / 其余必问）
 │   │   ├── commands.py         # 斜杠命令注册表与实现
+│   │   ├── hooks.py            # 生命周期 hook：读 settings.json、跑 shell、判阻断
 │   │   ├── session.py          # JSONL 会话存档（--continue / /resume）
 │   │   ├── auto_memory.py      # 自动记忆读写
 │   │   ├── limits.py           # 输出上限常量（只在这里定义一次）
@@ -450,10 +497,10 @@ thinker mcp remove 12306                     # 删掉（别名 rm）
 │   ├── ui/                     # 显示与输入（theme 管配色符号，见 ui/README.md）
 │   └── mcp_servers/            # 示例 MCP 服务器（weather / calculator）
 ├── demo/plane/                 # 用 Thinker 写的浏览器小游戏（零依赖，含 Node 逻辑回归）
-├── test/                       # 脚本式回归：压缩边界 / mcp 命令（不是 pytest）
+├── test/                       # 脚本式回归：压缩 / mcp 命令 / /mcp 状态 / hooks（不是 pytest）
 ├── docs/
 │   ├── ROADMAP.md              # 还有什么没做、为什么这么排
-│   └── 优化记录/                # 45 份逐轮改动记录（含根因分析）
+│   └── 优化记录/                # 46 份逐轮改动记录（含根因分析）
 ├── THINKER.md                  # 项目记忆（模型每轮都会读到）
 ├── .env.example                # 配置模板，复制成 .env 后填
 ├── LICENSE
@@ -514,7 +561,15 @@ python test/test_mcp_status.py
 
 五种状态各钉一条：已连接（带工具数 / 正在取清单 / 取清单失败）、连接失败、连接中、状态未知、配置阶段被跳过。判错的后果比没有这条命令更糟——把失败的显示成"已连接"，用户会照着去查为什么工具不出现。
 
-> 上面六条都**不联网、不消耗模型额度**。
+**7. hook 机制**（42 条断言，不碰真实配置）
+
+```bash
+python test/test_hooks.py
+```
+
+盯的是这类机制最容易坏、又最不报错的地方：坏 JSON 只提示不崩、未知事件名有反馈、`matcher` 的四种写法、`exit 0/1/2` 三种结局、超时不阻断、串行短路（第一个拦下后后面的不执行）、超长输出被截断、失败提示的节流曲线、以及 Windows 上 `cmd echo` 的中文不被解成问号。
+
+> 上面七条都**不联网、不消耗模型额度**。
 
 业务逻辑的其余部分（主循环、权限判定）靠手动冒烟：改完启动一次，让它读一个文件、改一个文件、跑一条命令，看确认框和状态行对不对。动过 `core/history/` 或 `core/conversation.py` 时，务必聊到上下文过半触发一次压缩再退出。
 

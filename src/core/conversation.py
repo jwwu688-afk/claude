@@ -26,6 +26,7 @@ import os  # 【第 13 轮】取当前目录，写进会话文件的 header
 import traceback  # traceback 库：程序出错时，用它把"出错的完整现场"打印出来，方便排查
 from core.api_client import APIClient, ThinkingChunk, ToolCallChunk  # 导入 API 客户端：真正发请求给大模型的家伙；后两个是"模型还在动"的心跳
 from core.commands import REGISTRY, handle_command, is_command  # 【第 14 轮】斜杠命令：在消息进历史之前截下来；【第 16 轮】REGISTRY 供 Tab 补全
+from core.hooks import HookBlocked, HookRunner  # 【第 32 轮】生命周期 hook（SessionStart / PreToolUse / PostToolUse / SessionEnd）
 from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各处各写一个数
 from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
 from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器：负责生成"系统提示词"
@@ -303,6 +304,13 @@ class Conversation:
             #   于是它走正常的 add_message → 发模型流程。普通命令永远是 None。
             self._pending_input = None
             self._esc = EscWatcher()  # 监听 Esc 的后台线程（不支持的平台会自动降级）
+            # 【2026-11-12 第 32 轮】hook 执行器 + SessionStart 的上下文。
+            #   _hook_context 在 start_conversation 里由 SessionStart 的 stdout 填充，
+            #   再由 build_system_message 拼进系统提示词末尾——放属性而不是直接改
+            #   PromptManager，是因为后者是单例、被 /resume 和子 agent 共用，
+            #   往里塞会话级状态会串味。
+            self._hooks = HookRunner()
+            self._hook_context = ""
             self._initialized = True  # 打上标记，下次不再重复创建
 
     @property
@@ -385,12 +393,23 @@ class Conversation:
         为什么抽出来：新建会话、`--continue` 恢复、`/resume` 切会话，三处都要造它。
         原来只有第一处有，另外两处得各自复制一遍字典字面量——
         系统提示词的包装结构一旦变（比如以后要加图片块），复制的那两处必然漏改。
+
+        【2026-11-12 第 32 轮】末尾追加 SessionStart hook 的输出。
+          为什么接在最后、而不是塞进 PromptManager：
+            ① PromptManager 是单例，被 /resume 和子 agent 共用，往里放会话级状态会串味；
+            ② 环境信息本来就该排在提示词尾部（第 11 轮的判断），hook 的 git status /
+               待办列表正好属于同一类"本轮环境"，接在后面读起来是连贯的。
+          没有 hook 输出时（绝大多数人）拼接结果和以前一字不差。
         """
+        prompt = self._prompt_manager.get_system_prompt()
+        if getattr(self, "_hook_context", ""):
+            prompt = f"{prompt}\n\n## 会话启动时注入的信息（hook 生成）\n{self._hook_context}"
+
         return {
             "role": "system",  # system 表示"系统设定"，是给模型看的规则，用户一般看不到
             "content": [
                 # content 用列表而不是字符串：以后可以塞图片、文件等不同类型的内容块
-                {"type": "text", "text": self._prompt_manager.get_system_prompt()}
+                {"type": "text", "text": prompt}
             ],
         }
 
@@ -548,6 +567,118 @@ class Conversation:
             return []
         return ["/" + name for name in sorted(REGISTRY)]
 
+    # =========================================================================
+    # 【第 32 轮】hook 的四个触发点集中在这里，方便对照 settings.json 的事件名。
+    #   刻意不散落在各处：以后加 Stop / UserPromptSubmit 时，
+    #   "一共支持哪些事件"应该能在一屏里数清楚。
+
+    def _hook_payload(self, event: str, tool_name: str = None, tool_input: dict = None) -> dict:
+        """拼出 hook 子进程的 stdin 内容（字段名对齐 Claude Code）
+
+        session_id 可能为空串：第 21.7 轮起会话文件是懒创建的，
+        全新启动、还没发过消息时 self._session 是 None。
+        空串比省略这个键更好——脚本里写 data["session_id"] 不会 KeyError。
+        """
+        session_id = getattr(self._session, "id", "") if self._session is not None else ""
+        payload = {
+            "session_id": session_id or "",
+            "cwd": os.getcwd(),
+            "hook_event_name": event,
+        }
+        if tool_name is not None:
+            payload["tool_name"] = tool_name
+            payload["tool_input"] = tool_input or {}
+        return payload
+
+    def _report_hook_problems(self, outcome) -> None:
+        """把加载期问题和运行期错误打出来（只在不影响流程时用）
+
+        为什么统一走 print_warning 而不是静默：hook 最气人的失败方式就是"配了没生效"。
+        用户没有任何反馈，只能怀疑自己写错了事件名 / 放错了文件。
+        """
+        for note in outcome.errors:
+            self._ui_manager.print_warning(f"[hooks] {note}")
+
+    async def _run_session_start_hooks(self) -> None:
+        """SessionStart：在系统提示词造出来之前跑，stdout 进上下文（第 32 轮新增）
+
+        为什么 SessionStart 不能阻断启动：
+          它的定位是"给模型塞点环境信息"。exit 2 在 Claude Code 里也只是把 stderr
+          给用户看。为一条取 git status 的脚本拒绝启动整个 CLI，是本末倒置。
+        """
+        # 加载期的问题（未知事件名、JSON 写坏）在这里报一次就清掉。
+        # 不清的话，/resume 之后重建系统提示词时会再刷一遍，看起来像新问题。
+        for note in self._hooks.notes:
+            self._ui_manager.print_warning(f"[hooks] {note}")
+        self._hooks.notes.clear()
+
+        # 【第 32 轮】配了 hook 就报一行。hook 是典型的"配了却看不见"的功能：
+        #   SessionStart 的输出进系统提示词（不打印），PreToolUse 平时也不出声，
+        #   用户唯一能感知的时刻是"被拦了一次"。没有这一行，他只能怀疑配置没读到。
+        #   和技能那行提示（_print_skill_hint）是同一个理由：功能做得再好，
+        #   不写在用户会看的地方等于没做。
+        if self._hooks.specs:
+            self._ui_manager.print_info(
+                f"已加载 {len(self._hooks.specs)} 个 hook（{self._hooks.settings_path}）"
+            )
+
+        outcome = await self._hooks.run_event(
+            "SessionStart", self._hook_payload("SessionStart")
+        )
+        self._hook_context = outcome.context  # 由 build_system_message 拼进提示词
+        self._report_hook_problems(outcome)
+        if outcome.blocked:
+            # 脚本写了 exit 2：不拦启动，但要让人知道这句话没被当成"环境信息"
+            self._ui_manager.print_warning(f"[hooks] SessionStart 返回了阻断信号，已忽略：{outcome.reason}")
+
+    async def _pre_tool_hooks(self, tool_name: str, tool_input: dict):
+        """PreToolUse：返回拒绝原因（None 表示放行）（第 32 轮新增）
+
+        调用时机是"权限确认之前"：用户按下同意之后才被告知"hook 不让干"，
+        那一次确认就白点了。放前面还有个好处——被 hook 拦掉的调用
+        根本不会出现高危提示，屏幕上更干净。
+        """
+        outcome = await self._hooks.run_event(
+            "PreToolUse", self._hook_payload("PreToolUse", tool_name, tool_input), tool_name=tool_name
+        )
+        self._report_hook_problems(outcome)
+        if outcome.blocked:
+            return outcome.reason or f"PreToolUse hook 拒绝了 {tool_name}"
+        return None
+
+    async def _post_tool_hooks(self, tool_name: str, tool_input: dict, result):
+        """PostToolUse：工具成功执行之后跑（第 32 轮新增）
+
+        返回"要追加到工具结果末尾的文本"（没有就是空串）。
+        为什么追加而不是替换结果：PostToolUse 的典型用途是格式化 / 记日志 / 提醒，
+        把工具真正返回的内容换掉，模型就看不到它要的数据了。
+        （要让 hook 改写结果，用 Claude Code 的 updatedInput/decision 那套，P3 再说。）
+        """
+        outcome = await self._hooks.run_event(
+            "PostToolUse",
+            self._hook_payload("PostToolUse", tool_name, tool_input),
+            tool_name=tool_name,
+        )
+        self._report_hook_problems(outcome)
+        if outcome.blocked:
+            # PostToolUse 的 exit 2 语义：工具已经跑完了，拦不住，只能把话带给模型
+            return f"\n\n[PostToolUse hook] {outcome.reason}"
+        return f"\n\n[PostToolUse hook] {outcome.context}" if outcome.context else ""
+
+    async def _run_session_end_hooks(self) -> None:
+        """SessionEnd：退出前跑（第 32 轮新增）
+
+        放在 shutdown 的最前面、并且自己兜住异常：
+        后面还要关 MCP 进程，一条清理脚本抛错不能把"关连接"也拖下水。
+        """
+        try:
+            outcome = await self._hooks.run_event(
+                "SessionEnd", self._hook_payload("SessionEnd")
+            )
+            self._report_hook_problems(outcome)
+        except Exception as error:  # 退出路径上任何异常都不该冒泡（已经在 finally 里了）
+            self._ui_manager.print_warning(f"[hooks] SessionEnd 执行异常：{type(error).__name__}: {error}")
+
     async def start_conversation(self, resume_path=None):
         """Start a new conversation.（开始一次全新的对话：这是用户按下回车后的第一步）
 
@@ -562,6 +693,10 @@ class Conversation:
         from core.auto_memory import ensure_dir as ensure_memory_dir
 
         ensure_memory_dir()
+
+        # 【第 32 轮】SessionStart 必须在 build_system_message 之前：
+        #   它的 stdout 要拼进系统提示词，晚一步这一轮就少了那段环境信息。
+        await self._run_session_start_hooks()
 
         # Initialize with system message
         # 【第 14 轮】改成调用 build_system_message()：恢复会话、/resume 切会话也要造它，
@@ -1053,6 +1188,10 @@ class Conversation:
         主要是关掉 MCP 那些外部服务器进程。不关的话它们会变成孤儿进程留在后台，
         而且退出时还会打一段 cancel scope 的报错。
         """
+        # 【第 32 轮】SessionEnd 放在关 MCP 之前：清理脚本可能还要用外部工具，
+        #   先拆连接再跑 hook，脚本看到的就是一个半拆掉的环境。
+        #   _run_session_end_hooks 内部自己兜异常，这里不必再包 try。
+        await self._run_session_end_hooks()
         await self._tool_manager.shutdown()
 
     def _get_messages_with_cache_mark(self):
@@ -1231,6 +1370,24 @@ class Conversation:
                 continue
 
             # ---- 单条路径：和以前完全一样（含审批、拒绝、高危提示）----
+            # 【第 32 轮】PreToolUse 放在权限确认之前：被 hook 拦掉的调用不该先让用户点一次同意。
+            #   批量路径在 _execute_tools_parallel 的 run_one 里跑（那边每条都要过，
+            #   因为收集批次时只判断了"能不能并发"，没跑过 hook）。
+            hook_reason = await self._pre_tool_hooks(tool_call.function.name, args)
+            if hook_reason:
+                # 先画"它想干什么"再报拦截原因：用户需要看到被拦的是哪条命令
+                self._ui_manager.show_preparing_tool(tool_call.function.name, args)
+                self._ui_manager.print_warning(f"被 hook 拦下：{hook_reason}")
+                self._add_tool_response(
+                    tool_call,
+                    "这次调用被 PreToolUse hook 拒绝，工具没有执行。\n"
+                    f"原因：{hook_reason}\n"
+                    "如果这是误拦截，请换个做法；确实无法完成就直接向用户说明。",
+                    is_last_tool,
+                )
+                index += 1
+                continue
+
             # 【2026-11-06 第 8.2 轮】先把"要干什么"画出来，再问"要不要干"。
             #   改前是反过来的：先弹一段 "Tool: xxx, args: {...}"，用户点完同意，
             #   下面才出现 ⏺ cmd_runner(dir) 那行。结果是同一个命令在屏幕上出现两次，
@@ -1348,7 +1505,20 @@ class Conversation:
         async def run_one(call, args):
             tool_args = {k: v for k, v in args.items() if k != "need_user_approve"}
             try:
-                return await self._tool_manager.run_tool(call.function.name, **tool_args)
+                # 【第 32 轮】批里每一条都要过 PreToolUse——收集批次时只判断了
+                #   "能不能并发"，并没有跑过 hook（并发判断是同步的，hook 是异步的）。
+                #   用异常表示拒绝：gather 里只中断这一条，同批其他条照常完成。
+                reason = await self._pre_tool_hooks(call.function.name, tool_args)
+                if reason:
+                    raise HookBlocked(reason)
+
+                result = await self._tool_manager.run_tool(call.function.name, **tool_args)
+
+                # PostToolUse 只在成功之后跑；追加文本和结果一起写回历史
+                extra = await self._post_tool_hooks(call.function.name, tool_args, result)
+                if extra and isinstance(result, str):
+                    return result + extra
+                return result
             except Exception as e:
                 return e
 
@@ -1459,6 +1629,13 @@ class Conversation:
             # 让模型自己看到错误、自己想办法补救。这是 agent 能自我纠错的核心。
             self._finish_tool_call(tool_call, tool_args, e, is_last_tool, error=True)
             return
+
+        # 【第 32 轮】PostToolUse：成功之后、写回之前跑。
+        #   放在这里而不是更上层，是因为只有这一处知道"工具真的成功返回了"——
+        #   失败路径已经 return 了，不会误触发格式化/记日志这类 hook。
+        extra = await self._post_tool_hooks(tool_call.function.name, tool_args, tool_response)
+        if extra and isinstance(tool_response, str):
+            tool_response = tool_response + extra
 
         self._finish_tool_call(tool_call, tool_args, tool_response, is_last_tool)
 

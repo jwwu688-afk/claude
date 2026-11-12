@@ -20,7 +20,8 @@
 # 上面说明：这段是照 MCP 官方文档的示例改的
 
 import asyncio  # 用来创建后台任务
-import shutil  # 【第 32 轮】把配置里的裸命令（npx / python）解析成真实可执行路径
+import shutil  # 【第 30.1 轮】把配置里的裸命令（npx / python）解析成真实可执行路径
+import sys  # 【第 32 轮】打不开日志文件时，退回把 MCP 子进程的 stderr 交给它
 from typing import Dict, List, Optional  # 类型标注工具（Dict/List 供 /mcp 的状态快照使用）
 from contextlib import AsyncExitStack  # "异步资源栈"：统一管理多个需要关闭的东西
 from pathlib import Path  # 路径处理，用来判断配置文件在不在
@@ -38,7 +39,7 @@ load_dotenv()  # load environment variables from .env（把配置读进来）
 
 
 def resolve_command(command: str) -> str:
-    """把配置里的启动命令解析成"真正能被拉起来的那个文件"（2026-11-12 第 32 轮新增）
+    """把配置里的启动命令解析成"真正能被拉起来的那个文件"（2026-11-12 第 30.1 轮新增）
 
     为什么需要它（这是实测出来的坑，不是理论问题）：
       Windows 的 CreateProcess 只会在裸命令后面自动补 `.exe`。
@@ -84,6 +85,15 @@ class MCPClient:
         self.failures: Dict[str, str] = {}  # 名字 → 失败原因（连接/握手失败的）
         self.tool_names: Dict[str, List[str]] = {}  # 名字 → 它提供的工具名（连上之后由 ToolManager 回填）
         self.tool_errors: Dict[str, str] = {}  # 名字 → 取工具清单失败的原因（连上了但 list_tools 报错）
+
+        # 【第 32 轮】把 MCP 子进程的 stderr 收进日志文件，别让它污染界面。
+        #   起因：`@modelcontextprotocol/server-github` 启动时会往 stderr 打
+        #   "GitHub MCP Server running on stdio"，而 mcp SDK 的 stdio_client
+        #   默认把子进程 stderr 转发到父进程的 stderr —— 于是这行字混在输入提示符
+        #   后面，看起来像用户自己说的话。
+        #   改成写 ~/.thinker/mcp.log：界面干净，排查"服务器为什么起不来"时还能翻它。
+        self.log_path = Path("~/.thinker/mcp.log").expanduser()
+        self._mcp_log = None  # 懒打开：没有任何服务器时不该凭空建一个日志文件
 
         # 【2026-11-06 第 2 轮优化】新增两个"信号灯"
         self._ready = asyncio.Event()  # 连接阶段结束（不管成功失败）就点亮
@@ -147,6 +157,29 @@ class MCPClient:
         finally:
             await self._close_stack()  # 关键：在当前任务里关闭，不会触发 cross-task 报错
 
+    def _open_log(self):
+        """打开（或复用）MCP 子进程的 stderr 落点（第 32 轮新增）
+
+        为什么不是一律丢弃（os.devnull）：
+          服务器起不来时，原因几乎都写在它的 stderr 里（"token 没设"、"node 版本太低"）。
+          丢掉就等于把唯一的线索扔了。写文件既保住线索，又不打扰界面。
+
+        为什么登记到 exit_stack：
+          程序退出时按 LIFO 关闭——stdio_client 先关、日志文件后关，
+          不会出现"子进程还活着、它的 stderr 写向一个已关闭的文件"。
+        """
+        if self._mcp_log is not None:
+            return self._mcp_log
+        try:
+            self.log_path.parent.mkdir(parents=True, exist_ok=True)
+            self._mcp_log = open(self.log_path, "a", encoding="utf-8", errors="replace")
+            self.exit_stack.callback(self._mcp_log.close)
+        except OSError:
+            # 目录建不了 / 文件被占用：退回原来的行为（打到 stderr），
+            # 宁可界面脏一点，也不能因为日志打不开就少连一个服务器。
+            self._mcp_log = sys.stderr
+        return self._mcp_log
+
     async def _connect_all(self):
         """连接配置文件里列出的所有服务器（原 connect_to_server，2026-11-06 改名）"""
         mcp_servers = self.config.list_servers()  # 拿到所有服务器名字的列表
@@ -163,7 +196,7 @@ class MCPClient:
                 #   异常会一路抛到 get_connected()，导致所有外部工具都用不了，
                 #   甚至让程序启动阶段就报错。现在改成"坏的跳过，好的继续"。
                 server_params = StdioServerParameters(
-                    # 【第 32 轮】先解析成真实路径再启动：Windows 上 "npx" 会被
+                    # 【第 30.1 轮】先解析成真实路径再启动：Windows 上 "npx" 会被
                     #   CreateProcess 补成 npx.exe（不存在），而 npm 装的是 npx.cmd。
                     #   不解析的话，配置一字不差也会连接失败。详见 resolve_command 的注释。
                     command=resolve_command(server.command),  # 用哪个程序来启动它
@@ -171,7 +204,10 @@ class MCPClient:
                     env=None  # 环境变量：None 表示直接继承当前程序的环境变量
                 )
 
-                stdio_transport = await self.exit_stack.enter_async_context(stdio_client(server_params))
+                stdio_transport = await self.exit_stack.enter_async_context(
+                    # 【第 32 轮】errlog 指向日志文件：子进程 stderr 不再直通终端
+                    stdio_client(server_params, errlog=self._open_log())
+                )
                 # 上面这行做两件事：
                 #   1. 真的去启动那个外部程序，并建立输入输出通道，就是 stdin/stdout 通道
                 #   2. 把这个通道登记到资源栈里，以后统一关闭

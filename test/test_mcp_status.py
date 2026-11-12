@@ -160,7 +160,7 @@ ui = run_command("", FakeClient(servers=["slow"], ready=False))
 check("连接中能显示出来", "连接中" in ui.text(), ui.text())
 
 print("\n[6] 启动命令解析（Windows 上 npx → npx.cmd）")
-# 这一条锁的是第 32 轮修掉的坑：配置里写 "npx"，CreateProcess 只补 .exe，
+# 这一条锁的是第 30.1 轮修掉的坑：配置里写 "npx"，CreateProcess 只补 .exe，
 # 而 npm 装的是 npx.cmd，于是"配置一字不差也连不上"。
 import os  # noqa: E402
 import shutil  # noqa: E402

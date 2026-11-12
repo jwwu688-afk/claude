@@ -392,10 +392,11 @@ class CmdRunner(BaseTool):
     def get_status(self):
         return ""  # 这个工具没有状态要汇报，返回空字符串
 
-    # TODO: Read and Edit file will separate as serval tools
-    # ↑ 这是原作者留下的待办，【2026-11-06 第 8 轮】已完成：
-    #   见 tools/file_tools.py 的 file_read / file_write / file_edit / file_glob / file_grep。
-    #   保留这行是因为它记录了这次拆分的来由。
+    # 【已完成，2026-11-06 第 8 轮】原作者在这里留过一句待办：
+    #   "Read and Edit file will separate as serval tools"（原文照录，serval 应为 several）。
+    #   拆分已经落地，见 tools/file_tools.py 的 file_read / file_write / file_edit / file_glob / file_grep。
+    #   去掉那个待办前缀是刻意的：IDE 的待办面板会一直亮着它，下一个人会以为这里还有活没干，
+    #   而这段说明本身有价值——它记录了"为什么当初要把读写文件从 cmd_runner 里拆出来"。
 
     def _tool_description(self):
         # 下面是给模型看的使用说明书。

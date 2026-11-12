@@ -19,6 +19,7 @@ Thinker 是一个用 Python 复刻 Claude Code 的终端编程助手：单层主
 ```
 src/
   core/          对话总管、API 客户端、历史/压缩、权限、提示词（含 memory.py）、斜杠命令（commands.py）
+                 hooks.py 管生命周期 hook（读 ~/.thinker/settings.json、跑 shell、判阻断）
   tools/         内置工具 + MCP 适配 + 子 agent + 技能（skill/，见下）
                  mcp_config.py 管 MCP 配置的定位/读写；mcp_cli.py 管 `thinker mcp` 子命令
   ui/            显示与输入（theme 管配色符号）
@@ -41,6 +42,8 @@ thinker
 node demo/plane/test/game.test.js
 python test/test_compress_boundary.py
 python test/test_mcp_cli.py
+python test/test_mcp_status.py
+python test/test_hooks.py
 python -m compileall -q src
 ```
 
@@ -178,6 +181,9 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 
 ## 已知的坑
 
+- **hook 的四个挂点集中在 `conversation.py` 的 `_run_session_start_hooks` / `_pre_tool_hooks` / `_post_tool_hooks` / `_run_session_end_hooks`**：加新事件时也放这里，别散到各处。`PreToolUse` 必须在**权限确认之前**跑（被 hook 拦下的调用不该让用户先点一次同意）；批量路径的每条在 `_execute_tools_parallel.run_one` 里单独过，因为收集批次时只判断了"能不能并发"，没跑 hook。
+- **hook 只读用户级 `~/.thinker/settings.json`**：项目级配置会被刻意忽略（克隆仓库即可执行 shell 的风险）。别顺手"补上"项目级支持，除非同时做内容哈希批准。
+- **hook 的输出解码要平台分支**：Windows 上 `cmd` 内建命令按控制台代码页（cp936）输出，而 `locale.getpreferredencoding()` 在本机返回 `utf-8`，直接用它会解出一串问号。`_decode_output()` 里先严格 UTF-8、失败再 `oem`/`mbcs`，改这块前先看测试里那条 `cmd echo 的中文正常`。
 - `mcp` 库 1.x 用 `inputSchema`、2.x 用 `input_schema`，`McpTool` 里做了双向回退，改这块要同时考虑两个版本。
 - **Windows 上启动外部命令必须走 `resolve_command()`**（`tools/mcp_client/client.py`）：`CreateProcess` 对裸命令只补 `.exe`，而 npm 装的是 `npx.cmd`，直接传 `"npx"` 会 `FileNotFoundError [WinError 2]`。配置文件里仍然存裸名（可移植），解析放在启动时（第 30.1 轮）。
 - **MCP 的连接结果靠四个字段串起来，改连接逻辑时别漏**：`MCPClient.connections`（连上了）、`failures`（连不上）、`tool_names`/`tool_errors`（连上了但取工具清单的结果，由 `ToolManager._register_mcp_tool` 回填）、`MCPConfig.skipped`（配置阶段就被跳过）。`/mcp` 只读这些字段，不自己去连——漏记一个，命令就会把"已连接"显示成"状态未知"，比没有这条命令更误导。
