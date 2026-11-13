@@ -14,7 +14,7 @@
   /** 开始或继续由同一按钮触发，只有重新开局才重建核心状态。 */
   function start() {
     effects.unlock(); clearInput();
-    if (game.state === 'paused') game.pause(); else { game.reset(); effects.particles = []; effects.floaters = []; }
+    if (game.state === 'paused') game.pause(); else { game.reset(); effects.particles = []; effects.floaters = []; effects.grazes = []; effects.prevFreeze = 0; effects.freezeFlash = 0; }
     canvas.focus(); sync();
   }
   /** 结算时才写存储；每帧只刷新数字，状态变化才改遮罩。 */
@@ -26,13 +26,13 @@
     $('bomb').disabled = game.state !== 'playing' || !game.p.bombs;
     $('pause').disabled = !['playing', 'paused'].includes(game.state);
     $('pause').firstChild.textContent = game.state === 'paused' ? '继续' : '暂停';
-    $('power').textContent = [game.p.power > 0 ? `${game.p.weapon} 发火力 ${Math.ceil(game.p.power)}s` : '', game.p.shield > 0 ? `护盾 ${Math.ceil(game.p.shield)}s` : ''].filter(Boolean).join('　/　');
+    $('power').textContent = [game.p.power > 0 ? `${game.p.weapon} 发火力 ${Math.ceil(game.p.power)}s` : '', game.p.shield > 0 ? `护盾 ${Math.ceil(game.p.shield)}s` : '', game.p.freeze > 0 ? `时停 ${Math.ceil(game.p.freeze)}s` : ''].filter(Boolean).join('　/　');
     if (shownState === game.state) return;
     shownState = game.state; $('overlay').hidden = game.state === 'playing';
     if (game.state === 'ready') return;
     const paused = game.state === 'paused';
     $('title').textContent = paused ? '暂歇' : '归航';
-    $('message').textContent = paused ? '天空会等你。准备好后继续出击。' : `本次得分 ${game.score} · 坚持 ${Math.floor(game.time)} 秒`;
+    $('message').textContent = paused ? '天空会等你。准备好后继续出击。' : `本次得分 ${game.score} · 击落 ${game.kills} · 最高连击 ${game.bestCombo} · 坚持 ${Math.floor(game.time)} 秒`;
     $('start').textContent = paused ? '继续飞行' : '再次出击';
     $('hint').textContent = paused ? '按 P 也可继续' : '每一次归航，都是下一次起飞的开始';
     if (!paused && game.score > best) {
