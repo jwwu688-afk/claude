@@ -539,21 +539,17 @@ thinker mcp add duckduckgo -e HTTPS_PROXY=http://127.0.0.1:7890 -- C:/tools/duck
 
 ## 验证
 
-`test/` 下现在有 **33 个脚本**（都不是 pytest，直接 `python test/xxx.py`，靠打印的 ✓ 和退出码判定结果）。当前 **25 个能通过**，**8 个跟随旧接口写的、现在会失败**——不是功能坏了，是这些脚本写死的行为后来被改了（明细见下）。它们的价值在于记录了"当时怎么验的"，改回去时可以照着重写。
+`test/` 下现在有 **33 个脚本**（都不是 pytest，直接 `python test/xxx.py`，靠打印的 ✓ 和退出码判定结果）。**全部可跑、全部离线**——不联网、不消耗模型额度，可以整个目录批量跑：
 
-> ⚠️ **`test_streaming.py` 和 `test_streaming_with_tools.py` 会真发请求。** 它们直接 `APIClient()` 读 `.env` 里的密钥，跑起来就会消耗模型额度（后者还会一直等回复）。其余 31 个不联网、不花钱。
+```bash
+for f in test/*.py; do /path/to/python "$f" > /dev/null || echo "失败：$f"; done
+```
 
-| 失效脚本 | 为什么 | 什么时候会用到它 |
-|---|---|---|
-| `test_commands.py` | `history_token_usage` 结构改了，`[-1]` 取不到 | 重做账本时 |
-| `test_five_layer_compress.py` | 五层的判定阈值随 17 / 25 轮调整过 | 重做压缩时 |
-| `test_history_compress.py` | 压缩后条数口径与当前实现不一致 | 同上 |
-| `test_parallel_tools.py` | mock 的 `get_reminder()` 还是无参，实际已带 `mode` | 改工具并发时 |
-| `test_skills.py` | `register_skill_commands()` 第 24 轮已删（技能不再占命令） | 改技能时 |
-| `test_streaming.py` / `test_streaming_with_tools.py` | `ThinkingChunk` 不再有 `.content`；且会真发请求 | 改流式时 |
-| `test_tab_completion.py` | 输入层第 16.2 轮整行自管后，按键注入点变了 | 改输入层时 |
+> 两个流式脚本（`test_streaming.py` / `test_streaming_with_tools.py`）默认走**假客户端**，只验 chunk 分流与 tool_calls 拼装；想真打一次接口确认线上流式没坏，加 `--live`（会花钱、需要联网）。
+>
+> 2026-11-13 重写过一遍：其中 8 个是跟随旧接口写的（`history_token_usage` 结构、`get_reminder` 加 `mode`、`register_skill_commands` 删除、`ThinkingChunk` 没有 `.content`、L5 改成按边界压之后"没有可压内容"、输入层整行自管后的按键注入点），已全部对齐当前实现——**顺带把两个流式脚本从"真请求、只打印、永远绿"改成了有断言的离线脚本**。
 
-下面 7 条是"出问题最先跑"的骨干，也是唯一保证**当前全绿**的部分：
+下面 7 条是"出问题最先跑"的骨干：
 
 **1. 全部模块能编译**
 
@@ -607,7 +603,7 @@ python test/test_hooks.py
 
 盯的是这类机制最容易坏、又最不报错的地方：坏 JSON 只提示不崩、未知事件名有反馈、`matcher` 的四种写法、`exit 0/1/2` 三种结局、超时不阻断、串行短路（第一个拦下后后面的不执行）、超长输出被截断、失败提示的节流曲线、以及 Windows 上 `cmd echo` 的中文不被解成问号。
 
-> 上面**编号的七条**都**不联网、不消耗模型额度**。`test/` 里其余脚本大多也是离线的，但 `test_streaming.py` / `test_streaming_with_tools.py` 两个会发真请求——批量跑整个目录前先把它们排除。
+> 上面编号的七条，以及 `test/` 里其余 26 个脚本，**都不联网、不消耗模型额度**，可以放心批量跑。唯一会发真请求的是给两个流式脚本加 `--live` 时。
 
 业务逻辑的其余部分（主循环、权限判定）靠手动冒烟：改完启动一次，让它读一个文件、改一个文件、跑一条命令，看确认框和状态行对不对。动过 `core/history/` 或 `core/conversation.py` 时，务必聊到上下文过半触发一次压缩再退出。
 
@@ -653,7 +649,6 @@ Windows 控制台的老坑，已在第 16.2 轮整行自管重做。若仍异常
 | 429 / 5xx 一次失败就降级 | 走非流式兜底，能用，但没有指数退避重试 |
 | 跨平台不完整 | Tab 补全、方向键、Esc 打断依赖 Windows 的 `msvcrt`，其他平台降级为原生输入 |
 | 状态栏不固定 | 长对话滚动后看不到底部状态 |
-| `test/` 里有历史脚本 | 33 个脚本中 25 个能跑、8 个是跟随旧接口写的（详见[验证](#验证)章节），不是功能坏了 |
 
 完整清单和排期理由见 [`docs/ROADMAP.md`](docs/ROADMAP.md)。
 

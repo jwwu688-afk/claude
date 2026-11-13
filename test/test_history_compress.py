@@ -91,7 +91,20 @@ def test_auto_compression_not_triggered():
 
 
 def test_auto_compression_multiple_sessions():
-    """测试多会话压缩（用户说过好几轮时，删最老的那一轮）"""
+    """测试多会话压缩（用户说过好几轮时，把最早那段压成摘要）
+
+    【第 25 轮改动】L5 从"每次删最老一轮"改成"保留最近 10 条
+      （COMPACT_KEEP_RECENT）、其余整段一次压完"。
+
+      这个用例原来只造了 2 个会话共 5 条消息（+ system = 6 条），
+      全部落在保留区里，于是压缩会打印"没有可压缩的较早对话"然后一条不动——
+      断言"只剩一句用户消息"必然失败。看起来像压缩坏了，实际是数据量没跟上新阈值。
+
+      现在造 6 轮（12 条 + system = 13 条），比保留区长，压完才会剩下
+      "公告 + 最近 10 条"。断言的写法也跟着换成**不依赖保留区具体条数**的版本：
+      只钉"最老那句没了、最新那句还在、总条数确实变少、公告有且只有一条"。
+      这样以后 COMPACT_KEEP_RECENT 从 10 调成 8 或 12，这个用例仍然有效。
+    """
     print("\n测试: 多会话压缩")
 
     manager = fresh_manager(model_max_tokens=10, compress_threshold=0.8)  # 上限故意设很小
@@ -99,14 +112,10 @@ def test_auto_compression_multiple_sessions():
     # 添加系统消息
     manager.add_message(MockMessage(Role.SYSTEM, "You are a helpful assistant"))
 
-    # 第一个会话
-    manager.add_message(MockMessage(Role.USER, "First question"))  # 第 1 轮的问
-    manager.add_message(MockMessage(Role.ASSISTANT, "First answer"))  # 第 1 轮的答
-    manager.add_message(MockMessage(Role.TOOL, "Tool response 1"))  # 第 1 轮的工具结果
-
-    # 第二个会话
-    manager.add_message(MockMessage(Role.USER, "Second question"))  # 第 2 轮的问
-    manager.add_message(MockMessage(Role.ASSISTANT, "Second answer"))  # 第 2 轮的答
+    # 6 轮问答：第 1~2 轮会落进"被压掉"的那一段，第 6 轮一定在保留区里
+    for round_index in range(1, 7):
+        manager.add_message(MockMessage(Role.USER, f"Question {round_index}"))
+        manager.add_message(MockMessage(Role.ASSISTANT, f"Answer {round_index}"))
 
     # 更新token使用量，超过阈值
     class MockTokenUsage:
@@ -119,17 +128,28 @@ def test_auto_compression_multiple_sessions():
     #   旧逻辑"过 80% 就调摘要模型删一轮"，所以 0.83 必然走摘要；
     #   现在 0.83 落在 L2（Snip 剪中间）档，而 L2 要求"至少 50 条消息"才有得剪——
     #   本用例只有 7 条，剪不动，于是什么都不发生，断言自然失败。
-    #   用例要验证的是 L5「删最老一轮 + 摘要」的语义，所以把占用推到 0.96 档。
+    #   用例要验证的是 L5「删最老一段 + 摘要」的语义，所以把占用推到 0.96 档。
     #   用 _model_max_tokens 现算而不是写死数字：MODEL_MAX_TOKENS 从 .env 读，
     #   写死会让这个用例在别人机器上莫名其妙地挂。
     heavy_total = int(manager._model_max_tokens * 0.96)  # 0.96 → L5 档
     manager.update_token_usage(MockTokenUsage(heavy_total - 60000, 60000, heavy_total))
+
+    # 【第 25 轮改动】L5 现在"摘要拿不到就一条都不动"（宁可多留，也不静默删）。
+    #   这个用例原来没注入摘要器，靠的是旧版"没有摘要器 → 直接删最老一轮"的兜底；
+    #   那条兜底跟着第 25 轮一起删了，所以必须给一个假摘要器，
+    #   否则压缩会返回 reason="summarize_failed"，历史一条都不会变。
+    async def fake_summarizer(msgs):
+        return "之前聊过 Question 1 到 Question 2 的内容，细节已省略。"
+
+    manager.set_summarizer(fake_summarizer)
 
     # Check if compression is required
     print(f"Requires compression: {manager._requires_compression()}")  # 打印：需不需要压缩
     print(f"Threshold: {manager._compress_threshold * manager._model_max_tokens}")  # 打印：阈值到底是多少
     print(f"Current usage: {manager.history_token_usage[-1].total_tokens}")  # 打印：当前用了多少
     # 这三行是调试输出，帮你确认"判断条件到底对不对"
+
+    before_count = len(manager.get_current_messages())  # 压缩前条数，用来验"真的变少了"
 
     # 执行自动压缩
     asyncio.run(manager.auto_messages_compression())
@@ -141,19 +161,21 @@ def test_auto_compression_multiple_sessions():
     for i, msg in enumerate(messages):  # 逐条打印，方便肉眼检查
         print(f"  {i}: {msg.role} - {msg.content}")
 
-    # 验证第一个会话被删除，保留系统消息和第二个会话
-    user_messages = [msg for msg in messages if msg.role == Role.USER and "压缩" not in msg.content]
     # 挑出"用户消息"，但排除掉那句"历史已压缩"的公告（公告也是以用户身份发的）
+    user_messages = [msg for msg in messages if msg.role == Role.USER and "压缩" not in msg.content]
+    contents = [msg.content for msg in user_messages]
     print(f"User messages found: {len(user_messages)}")
-    assert len(user_messages) == 1  # 只剩下一句用户消息
-    assert user_messages[0].content == "Second question"  # 而且是第二轮那句
+
+    assert len(messages) < before_count, f"压缩后条数没变：{before_count} → {len(messages)}"
+    assert "Question 1" not in contents, f"最老的那句应该被压掉了，实际还在：{contents}"
+    assert "Question 6" in contents, f"最新那句必须留着，实际：{contents}"
 
     # 验证有压缩通知
     compression_notices = [msg for msg in messages if "压缩" in msg.content]
     # 挑出那条公告
-    assert len(compression_notices) == 1  # 有且只有一条
+    assert len(compression_notices) == 1, f"公告应该只有一条，实际 {len(compression_notices)} 条"
 
-    print("✓ 通过: 第一个会话被删除，保留了系统消息和最新会话")
+    print("✓ 通过: 最早的一段被压成摘要，最近的对话完整保留")
 
 
 def test_auto_compression_single_session():
@@ -191,19 +213,31 @@ def test_auto_compression_single_session():
 
     messages = manager.get_current_messages()
 
-    # 验证部分消息被删除
-    assert len(messages) < original_length  # 条数应该变少了
+    # 【第 25 轮改动】这个用例的场景是"只有一句用户指令、后面全是工具来回"。
+    #   在旧版"删最老一轮"的语义下，它能把 user 后面那几条 assistant/tool 删掉，
+    #   所以断言"条数变少 + 公告一条"。
+    #
+    #   第 25 轮之后，L5 的刀口有两道护栏：
+    #     · 不允许越过最后一条用户消息（否则模型忘了当前要做什么）；
+    #     · 不允许越过第一条实质消息。
+    #   6 条消息本来就没超出保留区（10 条），刀口直接落到 0 → 返回
+    #   reason="nothing_to_compress"，**一条都不动**。这是设计意图，不是回归：
+    #   唯一的用户指令被压掉等于把任务弄丢（这种情况该用 L3 折叠工具结果）。
+    #
+    #   所以这里把断言反过来写：条数一条不变、唯一那句指令还在、没有公告。
+    #   这样将来如果谁把护栏去掉了，这条用例会立刻红，而不是悄悄通过。
+    assert len(messages) == original_length, f"不该压：{original_length} → {len(messages)}"
 
     # 验证用户消息保留
     user_messages = [msg for msg in messages if msg.role == Role.USER and "压缩" not in msg.content]
     assert len(user_messages) == 1  # 用户那句还在
     assert user_messages[0].content == "Complex question"  # 内容没变
 
-    # 验证有压缩通知
+    # 没有压 → 不该有公告（公告本身也会占一条消息、还会让模型以为历史被删过）
     compression_notices = [msg for msg in messages if "压缩" in msg.content]
-    assert len(compression_notices) == 1  # 有一条公告
+    assert len(compression_notices) == 0, f"没压却插了公告：{compression_notices}"
 
-    print("✓ 通过: 部分消息被删除，用户消息和系统消息保留")
+    print("✓ 通过: 单会话长工具链不压 L5，唯一的用户指令完整保留")
 
 
 def test_token_usage_update():

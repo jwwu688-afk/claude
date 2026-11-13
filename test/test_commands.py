@@ -332,14 +332,23 @@ def test_compact():
         return "之前讨论了 A 方案，改了 a.py 的登录逻辑。"
 
     hm.set_summarizer(fake_summary)
-    # 造两轮对话：压缩会把最老的一轮换成摘要公告
-    hm.messages_history[-1] = [
-        {"role": "system", "content": [{"type": "text", "text": "系统提示词"}]},
-        {"role": "user", "content": [{"type": "text", "text": "第一轮：" + "问题" * 200}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "回答" * 200}]},
-        {"role": "user", "content": [{"type": "text", "text": "第二轮：然后呢"}]},
-        {"role": "assistant", "content": [{"type": "text", "text": "然后这样"}]},
-    ]
+    # 【第 25 轮改动】L5 从"每次压最老一轮"改成"保留最近 10 条（COMPACT_KEEP_RECENT）、
+    #   其余整段一次压完"。原来这里只造了 2 轮共 5 条，全都落在保留区里，
+    #   于是 /compact 会走"没有可压缩的较早对话"分支：一条不动、摘要模型也不调，
+    #   "条数变少""确实调用了摘要模型"这两条断言必然失败——看起来像压缩坏了，
+    #   其实是测试的数据量没跟上新阈值。
+    #   现在造 8 轮 = 16 条 + system，比保留区（10 条）长，压缩才有东西可压。
+    msgs = [{"role": "system", "content": [{"type": "text", "text": "系统提示词"}]}]
+    for round_index in range(8):
+        msgs.append({
+            "role": "user",
+            "content": [{"type": "text", "text": f"第{round_index}轮：" + "问题" * 200}],
+        })
+        msgs.append({
+            "role": "assistant",
+            "content": [{"type": "text", "text": "回答" * 200}],
+        })
+    hm.messages_history[-1] = msgs
     before_count = len(hm.messages_history[-1])
 
     ui = FakeUI()

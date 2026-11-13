@@ -92,11 +92,25 @@ def fresh_manager():
     不重置的后果：上一个用例塞进去的 120 条消息会留到下一个用例，
     条数断言全部对不上，而且报错信息会指向完全无关的地方。
     现有 test_history_compress.py 的 fresh_manager() 也是这个套路。
+
+    【2026-11-13 补】四个阈值必须在这里钉死，不能让它读 .env。
+      原因是 HistoryManager.__init__ 的阈值全部走 os.getenv(..., 默认值)：
+      用户自己的 .env 一旦调过线（本机现在是 COMPRESS 0.70 / SNIP 0.75 /
+      MICRO 0.85 / COLLAPSE 0.90），测试里那些"0.82 该走 L2、0.87 该走 L3、
+      0.92 该走 L4"的断言就会整体错档——代码没坏，阈值被环境改掉了。
+      这种失败最难查：单独跑测试全绿，换台机器全红，看起来像分支丢了改动。
+      钉住之后，这个文件只验"分档路由逻辑对不对"，用户实际阈值由 .env 决定、
+      与这里无关（想验阈值可以另写一条读 .env 的用例，但别混进路由测试）。
     """
     HistoryManager._instance = None  # 丢掉旧实例
     HistoryManager._initialized = False  # 清掉初始化标记，逼它重新 __init__
     manager = HistoryManager()  # 新实例
     manager._ui_manager = _SilentUI()  # 压缩会打提示语，测试里静音
+    # 与 .env.example 的默认值对齐：0.80 总闸 / 0.85 L2 / 0.90 L3 / 0.95 L4
+    manager._compress_threshold = 0.80
+    manager._snip_threshold = 0.85
+    manager._micro_threshold = 0.90
+    manager._collapse_threshold = 0.95
     return manager
 
 
@@ -680,10 +694,16 @@ def test_same_usage_not_compressed_twice():
     asyncio.run(manager.auto_messages_compression())  # 同一份用量再调一次
     assert calls["n"] == 1  # 不该再压
 
-    # 真来了新用量（模型又回了一轮），标记清掉，允许重新判断
+    # 【第 25 轮改动】原来这里断言"真来了新用量，标记清掉，允许再压一次"（== 2）。
+    #   第 25 轮把 L5 改成"保留最近 10 条、其余整段一次压完"之后，这个预期失效了——
+    #   压完一次，保留区之外已经没有任何内容可压，再触发会走
+    #   reason="only_previous_summary" 直接 return（**不调模型、不花钱**），
+    #   这正是那次改动想要的：L5 是"一压到底"，不是"每轮压一点"。
+    #   所以这里改成断言"新用量也骗不出第二次摘要调用"——验的目标从
+    #   "标记会不会清"变成"清掉之后也没东西可压"，两层都有价值。
     manager.update_token_usage(mock_sdk_usage(int(manager._model_max_tokens * 0.96)))
     asyncio.run(manager.auto_messages_compression())
-    assert calls["n"] == 2  # 新用量下可以再压
+    assert calls["n"] == 1  # 已经压到底了：新用量不会再调一次摘要
 
     print("✓ 通过")
 

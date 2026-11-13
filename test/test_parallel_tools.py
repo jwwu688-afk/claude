@@ -117,6 +117,27 @@ def build_conversation(ui, tm):
     conv._history_manager = fresh_history_manager()
     conv._task_depth = 0
     conv._session = None
+
+    # 【第 32 轮后补】hook 机制上线后，并发路径的 run_one 会在执行工具**之前**
+    #   调 self._pre_tool_hooks，成功之后再调 self._post_tool_hooks，两者都读
+    #   self._hooks。而这个对象是 __new__ 造出来的裸对象，没走过 __init__，
+    #   身上没有 _hooks → AttributeError 被 run_one 的 except 兜成"工具失败"。
+    #
+    #   症状特别有迷惑性：工具一次都没执行（run_tool 没被调用），历史里却老老实实
+    #   写了两条"工具调用失败"，耗时也是 0.02s 而不是 0.6s——看起来像"并发没生效"，
+    #   实际是每条都在碰 hook。
+    #
+    #   这里直接替换两个入口，不构造真 HookRunner：真的那个会读用户自己的
+    #   ~/.thinker/settings.json 并执行里面的 shell（本机现在挂了 2 个），跑测试
+    #   不该有副作用。hook 本身由 test_hooks.py 用临时配置专测，这里只是绕开它。
+    async def _no_pre_hook(tool_name, tool_input):
+        return None  # None = 放行
+
+    async def _no_post_hook(tool_name, tool_input, result):
+        return ""  # 空串 = 没有要追加的内容
+
+    conv._pre_tool_hooks = _no_pre_hook
+    conv._post_tool_hooks = _no_post_hook
     return conv
 
 
@@ -255,8 +276,11 @@ if __name__ == "__main__":
     from pathlib import Path
     import core.session as _session_module
     _session_module.SESSIONS_DIR = Path(tempfile.mkdtemp(prefix="thinker_test_sessions_"))
-    # get_reminder 会去构造 ToolManager 单例（连 MCP 服务器），测试里换成空串
-    conversation_module.get_reminder = lambda: ""
+    # get_reminder 会去构造 ToolManager 单例（连 MCP 服务器），测试里换成空串。
+    # 【第 33 轮后】签名变成 get_reminder(mode: str = None)，调用方会传当前工作模式；
+    #   原来写成 lambda: ""（无参）会直接 TypeError，所以这里必须用 *a, **kw 兜住任意参数。
+    #   不写死 `lambda mode: ""` 是故意的：以后再加参数也不用回来改这一行。
+    conversation_module.get_reminder = lambda *a, **kw: ""
 
     test_parallel_is_faster()
     print()

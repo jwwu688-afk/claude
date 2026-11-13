@@ -1201,8 +1201,12 @@ async def cmd_skills(conversation, args: str) -> None:
         for spec in specs:
             # 标记位拼成一段括号，比每个技能打好几行更省屏幕。
             flags = []
-            if not spec.user_invocable:
-                flags.append("不进斜杠命令")
+            # 【第 24 轮后续清理】这里原来有一条：
+            #     if not spec.user_invocable: flags.append("不进斜杠命令")
+            #   第 24 轮取消"技能自动登记成 /名字"之后，这句话就在描述一个
+            #   不存在的入口——用户看到它只会去 /help 里找那条命令，然后找不到。
+            #   按 21.2 轮定下的口径（不认识的字段直接忽略、不展示），
+            #   这个标记也一并删掉：字段本身仍然解析，只是不再有任何可见痕迹。
             if not spec.description.strip():
                 # 【第 21.1 轮】没描述不再等于"模型看不到"，只是清单里显示占位文字。
                 # 标记保留，是因为"给模型看的那一行信息量很低"仍然值得提醒用户补一句。

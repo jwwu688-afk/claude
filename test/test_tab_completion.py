@@ -123,14 +123,22 @@ class RecordingEditor:
     """假的编辑器：只记录 readline 有没有被调用（不模拟按键）
 
     分流层只需要知道"走没走自管"，按键级行为由第四组负责。
+
+    【第 33 轮后补】签名必须跟着真实 LineEditor.readline 走：33 轮加了
+      `on_mode_cycle`（Shift+Tab / Alt+M 切模式的回调，见 line_editor.py:312）。
+      少写这个参数会直接抛
+        TypeError: RecordingEditor.readline() got an unexpected keyword argument 'on_mode_cycle'
+      而报错点在"分流"这一步，看起来像分流逻辑坏了，实际只是假对象没跟上真签名。
+      所以这里三个参数都接住（哪怕不用），以后真签名再加参数时，
+      至少报错会指回这一行。
     """
 
     def __init__(self, available: bool = True):
         self.available = available
         self.called = None
 
-    def readline(self, prompt, completer=None):
-        self.called = (prompt, completer)
+    def readline(self, prompt, completer=None, on_mode_cycle=None):
+        self.called = (prompt, completer, on_mode_cycle)
         return "/cost"
 
 
@@ -235,7 +243,12 @@ def test_readline_basics() -> None:
     ed = ScriptedEditor(["帮", "我", "看", "看", "\r"])
     got = ed.readline("> ")
     check("中文可正常输入并返回", got == "帮我看看", repr(got))
-    check("提示符被写出来了", ed.screen().startswith("> "), repr(ed.screen()[:10]))
+    # 【第 20.1 轮后补】输入行下方的留白改成"按窗口高度先打若干空行"之后，
+    #   readline 开头输出的是 `\n\n\n…`，提示符写在**最后一行**，
+    #   所以 screen() 不再以 "> " 开头（原来这条断言就是 `startswith`）。
+    #   改成"整屏里出现过提示符"：验证的原意没变——提示符确实是我们自己写出去的，
+    #   没有被 input() 抢顺序、也没有丢。
+    check("提示符被写出来了", "> " in ed.screen(), repr(ed.screen()[-20:]))
 
     # --- 退格删到空，仍能继续输入（16 轮那个 bug 的正面回归） ---
     # 场景：打一个字、退格删掉、再打一个字、回车。

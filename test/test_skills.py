@@ -96,14 +96,18 @@ def reset_tree():
 
 
 def fresh():
-    """干净目录 + 顺手把上一用例登记过的技能命令撤掉
+    """干净目录（每个用例从空的两个技能目录开始）
 
-    为什么要撤：REGISTRY 是模块级全局，用例之间会互相影响。
-      不撤的话，"上一个用例登记的 /pdf" 会让下一个用例的断言假失败，
-      而那种失败看起来像功能坏了。
+    【第 24 轮改动】原来这里还要调 commands.register_skill_commands()，把上一
+      用例登记过的 /pdf 从 REGISTRY 撤掉——因为当时"每个技能会自动登记成一条
+      斜杠命令"，而 REGISTRY 是模块级全局，用例之间会互相污染。
+
+      第 24 轮取消了"技能占命令名"这件事（技能只由模型通过 skill 工具按需调用），
+      register_skill_commands 这个函数也一起删了。现在技能的唯一状态在
+      SkillManager 的扫描缓存里，reset_tree() 里的 reload() 已经把那份缓存清干净，
+      所以这里不需要再动 commands。
     """
     reset_tree()
-    commands.register_skill_commands()  # 空目录 → 把所有技能命令清掉，内置命令保留
 
 
 def rescan():
@@ -241,15 +245,24 @@ def test_bad_names():
 
 
 def test_builtin_conflict():
+    """与内置命令同名不再冲突（第 24 轮）
+
+    改前：技能名撞上 /cost 这类内置命令会被整条跳过并留一条"重名"警告——
+          因为当时每个技能要自动登记成 /名字，两个 /cost 会打架。
+    改后：技能不再占命令名，撞名没有任何后果。所以这里不再验"被跳过"，
+          而是验"两边各走各的"：技能照常加载、照常进模型清单，
+          内置 /cost 也不受影响。
+    """
     fresh()
     write_skill(PROJECT_DIR, "cost", "description: 想顶掉内置命令")
     rescan()
 
     manager = SkillManager()
-    check("重名：被跳过", manager.count() == 0, f"实际 {manager.count()}")
-    check("重名：留了警告", any("重名" in warning for warning in manager.warnings), str(manager.warnings))
+    check("重名：技能照常加载", manager.count() == 1, f"实际 {manager.count()}")
+    check("重名：不产生警告", manager.warnings == [], str(manager.warnings))
+    check("重名：技能进模型清单", "cost" in manager.available_block(), manager.available_block())
     check(
-        "重名：内置 /cost 还在",
+        "重名：内置 /cost 不受影响",
         commands.REGISTRY["cost"].handler.__name__ == "cmd_cost",
         commands.REGISTRY["cost"].handler.__name__,
     )
@@ -327,12 +340,15 @@ def test_arguments():
 
     # argument-hint 的写法是 `[文件路径]`，假 YAML 会把它当内联列表。
     # 这里盯的是"还原后能不能照原样显示"——实现在 skill_spec._hint_text。
-    commands.register_skill_commands()
-    check(
-        "argument-hint：/help 里显示成 [文件路径] 而不是列表",
-        commands.REGISTRY["pdf"].usage == "/pdf [文件路径]",
-        commands.REGISTRY["pdf"].usage,
-    )
+    #
+    # 【第 24 轮改动】原来验的是 /help 里那条命令的 usage（`/pdf [文件路径]`）。
+    #   技能不再登记成斜杠命令之后，argument-hint 的唯一去处是**模型看到的技能清单**
+    #   （skill_manager.available_block 里拼成「（参数：…）」）。
+    #   所以断言点从 REGISTRY 挪到 available_block——验的还是同一件事：
+    #   `[...]` 被还原成一句话，而不是显示成一个列表。
+    block = manager.available_block()
+    check("argument-hint：清单里显示成 [文件路径] 而不是列表", "（参数：[文件路径]）" in block, block)
+    check("argument-hint：没被解析成 Python 列表", "['" not in block, block)
 
 
 def test_skill_dir_variable():
@@ -407,11 +423,25 @@ def test_unknown_fields_are_ignored():
     check("嵌套 metadata：技能正常加载", manager.get("with-meta") is not None)
     check("嵌套 metadata：不产生任何警告", manager.warnings == [], str(manager.warnings))
 
-    commands.register_skill_commands()
-    check("无用字段：斜杠命令照常登记", "pdf" in commands.REGISTRY)
+    # 【第 24 轮改动】原来这里验"斜杠命令照常登记"（`"pdf" in commands.REGISTRY`）。
+    #   技能不再占命令名，这条断言失去对象。改成验 21.2 轮真正要守的东西：
+    #   不认识的字段不该漏进**模型看到的清单文本**——清单是每轮都发的常驻内容，
+    #   混进字段名既是噪音，也会让模型以为这是它能用的配置项。
+    block = manager.available_block()
+    check("无用字段：不出现在模型清单里", "disable-model-invocation" not in block, block)
 
 
 def test_not_user_invocable():
+    """user-invocable: false 现在还剩什么作用（第 24 轮后）
+
+    改前：这个字段决定"要不要登记成 /名字 命令"，所以当时验的是 REGISTRY 里没有它。
+    改后：技能一律由模型通过 skill 工具调用，字段**不再影响任何行为**——
+          技能照常加载、照常进模型清单、模型照常能调。
+          （`/skills` 里原来还会为它打一句"不进斜杠命令"的标记，也已删除：
+            斜杠命令都不存在了，那句话只会让人去找一条用不了的路。）
+          所以这里从"验登记"改成"验加载 + 验字段仍被解析出来"（前者是行为，
+          后者是兼容：老技能带这个字段不该报错）。
+    """
     fresh()
     write_skill(
         GLOBAL_DIR,
@@ -422,10 +452,13 @@ def test_not_user_invocable():
     rescan()
 
     manager = SkillManager()
-    check("不进命令：仍在工具清单里", "auto" in manager.available_block(), manager.available_block())
-
-    commands.register_skill_commands()
-    check("不进命令：REGISTRY 里没有它", "auto" not in commands.REGISTRY, str(sorted(commands.REGISTRY)))
+    spec = manager.get("auto")
+    check("不进命令：技能照常加载", spec is not None)
+    check("不进命令：仍进模型清单", "auto" in manager.available_block(), manager.available_block())
+    check("不进命令：字段仍被解析出来（老技能不报错）",
+          spec is not None and spec.user_invocable is False,
+          str(getattr(spec, "user_invocable", None)))
+    check("不进命令：模型照样能调用", "按步骤做" in asyncio.run(Skill().act(skill="auto")))
 
 
 # -----------------------------------------------------------------------------
@@ -442,33 +475,50 @@ def test_unknown_skill():
     check("未知技能：把可用清单交回去", "pdf" in message, message)
 
 
-def test_slash_invocation():
+def test_tool_invocation():
+    """技能的唯一入口：skill 工具（第 24 轮起没有斜杠命令了）
+
+    改前：这个用例走 `REGISTRY["pdf"].handler`，验"留下一条待发消息、带
+          `[技能已加载：pdf]` 标记、不自己记历史"。那套东西
+          （Conversation.set_pending_input / 来源标记）随第 24 轮一起删了。
+    改后：直接调 `Skill().act(skill="pdf", args="a.pdf")`，验三件用户看得见的事：
+          · 参数替换进了正文（原来验的是"待发消息里有 a.pdf"）；
+          · 返回的就是正文本身，不是"命令已执行"之类的壳；
+          · 不残留占位符。
+          "不记历史"这条不用再验：工具层现在只返回字符串，它没有历史可写。
+    """
     fresh()
     write_skill(GLOBAL_DIR, "pdf", "description: 处理 PDF", body="用户要处理：$ARGUMENTS")
-    commands.register_skill_commands()
+    # 【第 24 轮】必须显式 rescan：以前 register_skill_commands() 会顺手触发扫描，
+    #   现在没有那个函数了，写完文件不 reload 的话 manager 还停在空目录的缓存上。
+    rescan()
 
-    handler = commands.REGISTRY["pdf"].handler
-    conversation = FakeConv()
-    asyncio.run(handler(conversation, "a.pdf"))
-
-    pending = conversation.take_pending_input()
-    check("斜杠调用：留下待发消息", pending is not None)
-    check("斜杠调用：带来源标记", pending and "[技能已加载：pdf]" in pending, (pending or "")[:40])
-    check("斜杠调用：参数已替换", pending and "a.pdf" in pending)
-    check("斜杠调用：没有自己记历史", conversation.messages == [], str(conversation.messages))
+    body = asyncio.run(Skill().act(skill="pdf", args="a.pdf"))
+    check("工具调用：参数被替换进正文", "用户要处理：a.pdf" in body, body[:60])
+    check("工具调用：返回的是正文本身", body.lstrip().startswith("用户要处理"), body[:30])
+    check("工具调用：不残留占位符", "$ARGUMENTS" not in body)
 
 
-def test_reload_drops_command():
+def test_reload_drops_skill():
+    """技能被删 + reload 之后，管理器里就没有它了
+
+    改前：验的是"REGISTRY 里的 /pdf 消失、内置命令一条不少"。
+    改后：技能只活在 SkillManager 的扫描结果里，所以验"manager.get 拿不到"，
+          内置命令表顺带再确认一次没被动过（它和技能已经没有任何耦合，
+          这两条断言现在只是防止将来又有人把两者接回去）。
+    """
     fresh()
     write_skill(GLOBAL_DIR, "pdf", "description: 处理 PDF", body="按步骤做")
-    commands.register_skill_commands()
-    check("reload 前：/pdf 存在", "pdf" in commands.REGISTRY)
+    rescan()
+    check("reload 前：技能在", SkillManager().get("pdf") is not None)
+
+    shutil.rmtree(GLOBAL_DIR / "pdf")  # 模拟用户删掉技能
+    SkillManager().reload()
+
+    check("reload 后：技能消失", SkillManager().get("pdf") is None)
+    check("reload 后：模型清单里也没有", "pdf" not in SkillManager().available_block())
 
     builtin_names = ["help", "memory", "resume", "init", "cost", "compact", "clear", "agents", "skills"]
-    shutil.rmtree(GLOBAL_DIR / "pdf")  # 模拟用户删掉技能
-    commands.register_skill_commands()
-
-    check("reload 后：/pdf 消失", "pdf" not in commands.REGISTRY, str(sorted(commands.REGISTRY)))
     missing = [name for name in builtin_names if name not in commands.REGISTRY]
     check("reload 后：内置命令一条不少", not missing, str(missing))
 
@@ -777,9 +827,9 @@ def main():
         print()
         test_unknown_skill()
         print()
-        test_slash_invocation()
+        test_tool_invocation()
         print()
-        test_reload_drops_command()
+        test_reload_drops_skill()
         print()
         test_imported_skill_compat()
         print()
