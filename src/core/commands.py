@@ -74,7 +74,7 @@ import os  # /resume 按 cwd 过滤"本项目的会话"；/init 要拼 THINKER.m
 from dataclasses import dataclass  # 用一个"只装字段"的小类描述命令，省掉手写 __init__
 from typing import Awaitable, Callable, Dict  # handler 是"异步函数"，注册表是字典
 
-from core.session import SessionStore  # /resume 要列会话、读会话
+from core.session import SessionStore, inspect_session  # /resume 要列会话、读会话
 
 
 @dataclass(frozen=True)
@@ -477,7 +477,12 @@ async def cmd_resume(conversation, args: str) -> None:
         # 每个文件都要读一遍才能拿到 header 和消息数。
         # 为什么敢这么干：会话一般几十个、每个几十 KB，实测无感。
         # 真要优化就把 cwd 编进文件名，但那样名字会变得很难看，不值得。
-        messages, header = SessionStore.load(path)  # 坏行会被跳过，不会抛
+        # 【2026-11-13 第 34 轮】改用 inspect_session：一次读盘同时拿到
+        #   "原始消息"（用于取预览）和"压缩后的有效消息"（用于显示条数）。
+        #   以前这里用 SessionStore.load() 数文件里的行数，于是列表显示 803 条、
+        #   选中后却只恢复 12 条——用户第一反应是"压缩没生效/数据丢了"。
+        info = inspect_session(path)
+        messages, header = info["raw"], info["header"]
 
         started = header.get("started_at", "")[:16].replace("T", " ")
         # "2026-11-07T23:47:12" → "2026-11-07 23:47"。
@@ -487,7 +492,11 @@ async def cmd_resume(conversation, args: str) -> None:
         mark = "  ← 当前" if current_path and path == current_path else ""
         # 标出"当前"是必要的：用户很可能不知道自己正在哪个会话里，
         # 选了当前这个会看起来"什么都没发生"，然后以为命令坏了。
-        labels.append(f"{started}  {len(messages):>3} 条  {preview}{mark}")
+        # 条数用"恢复后实际多少条"，和用户选中后看到的那句"已恢复 N 条"保持一致。
+        # 压缩过的加个后缀，免得他以为 803 条凭空消失了（原始记录仍在文件里）。
+        count = len(info["effective"])
+        suffix = "（压缩后）" if info["compacted"] else ""
+        labels.append(f"{started}  {count:>3} 条{suffix}  {preview}{mark}")
         # {len(messages):>3} 右对齐到 3 位：条数会从个位变到三位，
         # 不补齐的话后面的预览会参差不齐。
 

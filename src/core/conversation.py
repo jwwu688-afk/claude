@@ -303,6 +303,11 @@ class Conversation:
             self._history_manager.set_repeatable_checker(
                 lambda name: self._tool_manager.is_tool_repeatable(name)
             )
+            # 【2026-11-13 第 34 轮】压缩落盘回调：压完之后把"压到哪儿了"写进会话文件。
+            #   不写的话，resume 读到的是压缩前的完整历史（文件是 append-only、从不重写），
+            #   估算必然超标，于是每次 resume 都重新压一次、每次都真花一次摘要调用。
+            #   这里只传方法引用，真正落盘发生在压缩成功那一刻——那时 self._session 已就绪。
+            self._history_manager.set_compaction_writer(self._write_compaction)
             self._prompt_manager = PromptManager()  # 建提示词管理器
             # 【2026-11-07 第 13 轮】会话落盘 + Esc 打断
             self._session = None  # 当前会话的存储句柄，start_conversation 时才创建
@@ -1237,6 +1242,40 @@ class Conversation:
     # -------------------------------------------------------------------------
     # 【2026-11-06 第 2 轮新增】摘要式压缩相关
     # -------------------------------------------------------------------------
+    def _write_compaction(self, keep_count: int, summary: str, stats: dict) -> None:
+        """把"压缩到哪儿了"记进会话文件（2026-11-13 第 34 轮新增）
+
+        【为什么需要这一步】
+          压缩只改内存里的 messages_history，而会话文件是 append-only、从不重写。
+          于是 resume 每次都拿回压缩前的完整历史：估算必然超标 →
+          每次都重新压一次 → 每次都真花一次摘要调用，而且反复把同一段历史
+          摘要来摘要去（第二次开始就是在摘要"上一次的摘要"）。
+
+          实测过的现场：一个 796 条 / 36.8 万 token 的会话，窗口 20 万，
+          resume 后占用 180%，第一个请求前必然触发一次 L5。
+
+        【参数 keep_count 是"保留了几条"，不是文件行号】
+          文件行号要现读文件才知道。不能拿内存坐标代替：resume 之后内存会
+          前面多一条新生成的 system，两边永远差一条，用内存坐标会整体错位——
+          症状是"恢复出来少了一条/多了一条"，很难往坐标上想。
+          所以这里现算：文件当前条数 - 保留条数 = 保留区在文件里的起点。
+
+        【落盘失败只影响下次 resume】
+          最坏结果是"下次 resume 多压一次"，不会影响当前这次对话，
+          所以异常在 history_manager 那一侧已经被吞掉了（见 _compress_by_boundary）。
+        """
+        if self._session is None:
+            return  # 没有会话文件（测试环境 / 还没建会话），跳过
+
+        total = self._session.count_messages()
+        keep_from = max(0, total - int(keep_count))
+        self._session.append_compaction(
+            keep_from=keep_from,
+            summary=summary,
+            before=stats.get("before_count", 0),
+            after=stats.get("after_count", 0),
+        )
+
     async def _summarize_messages(self, messages) -> str:
         """把一批旧消息压缩成一段摘要（交给大模型做）
 

@@ -201,6 +201,70 @@ class SessionStore:
             "message": message,  # 完整消息对象，原样存
         })
 
+    def count_messages(self) -> int:
+        """这个文件里已经写了多少条 message 行（2026-11-13 第 34 轮新增）
+
+        谁在用：压缩落盘时要记"保留区从文件第几条开始"（keep_from），
+        这个坐标必须基于**文件里已有的条数**，不能基于内存里的条数——
+        resume 之后内存会多一条新生成的 system，两边永远差一条。
+
+        为什么现读文件而不是维护一个计数器：
+          SessionStore 是"打开就写"的薄封装，resume 之后重新
+          `SessionStore(path)` 时计数器从 0 开始，和文件实际条数对不上。
+          要在构造函数里数一遍就得每次 resume 多读一次文件，不如需要时再读。
+          压缩是低频操作（一个会话几次），读一次 1~2MB 完全可以接受。
+
+        坏行跳过，与 load() 的口径一致：数少了只会让 keep_from 偏小
+        （保留区多留几条），是安全方向；数错了宁可多留不可少留。
+        """
+        try:
+            text = self.path.read_text(encoding="utf-8", errors="replace")
+        except OSError:
+            return 0
+        total = 0
+        for line in text.splitlines():
+            line = line.strip()
+            if not line:
+                continue
+            try:
+                if json.loads(line).get("type") == "message":
+                    total += 1
+            except json.JSONDecodeError:
+                continue
+        return total
+
+    def append_compaction(self, keep_from: int, summary: str,
+                          before: int = 0, after: int = 0) -> None:
+        """记一条"这里发生过压缩"（2026-11-13 第 34 轮新增）
+
+        【为什么需要这条记录】
+          压缩只改内存里的 messages_history，文件是 append-only、从不重写。
+          后果是：resume 永远读到压缩前的完整历史 → 估算必然超高 → 每次
+          resume 都要重新压一次、重新花一次摘要调用，而且反复把同一段历史
+          摘要来摘要去。
+          有了这条记录，resume 就能重建"压缩后的视图"，与内存保持一致。
+
+        参数：
+          keep_from  压缩时，保留区在**文件**里的起始条数（0 基，含 system 行）。
+                     注意是文件坐标不是内存坐标：resume 时内存会多一条新生成的
+                     system，两者永远差一条，用内存坐标会整体错位。
+          summary    这次生成的摘要正文（不含公告抬头）。
+          before/after 压缩前后的条数，纯记录用，排查时能看出压了多少。
+
+        为什么单独一种行类型而不是复用 message：
+          它描述的是"如何解释前面的消息"，不是对话的一部分。
+          load() 里 type 不认识就跳过，所以老版本读到新文件不会崩，
+          新版本读到老文件（没有这种行）也只是"没有压缩记录"，行为不变。
+        """
+        self._write_line({
+            "type": "compaction",
+            "ts": time.time(),
+            "keep_from": int(keep_from),
+            "summary": summary or "",
+            "before": int(before),
+            "after": int(after),
+        })
+
     def _write_line(self, obj: dict) -> None:
         """写一行 JSON 到文件末尾（2026-11-07 第 13 轮）
 
@@ -266,38 +330,10 @@ class SessionStore:
           调用方经常需要 header 里的 cwd 来判断"这是不是本项目的会话"，
           多返回一个字段比让它自己再读一遍文件划算。
         """
-        messages: List[dict] = []  # 攒消息
-        header: Dict = {}  # 攒 header（正常情况下只有一行）
-        target = Path(path)  # 传字符串也能用
-
-        try:
-            text = target.read_text(encoding="utf-8", errors="replace")
-            # errors="replace"：文件里有非法字节（比如被别的程序写坏）时，
-            # 换成 � 而不是抛 UnicodeDecodeError。
-            # 存档读不全是小事，读不出来直接崩才是大事。
-        except OSError:
-            # 文件不存在、没权限——返回空结果，让调用方当成"没有历史"处理
-            return messages, header
-
-        for line in text.splitlines():
-            # splitlines() 自动处理 \n 和 \r\n，比 split("\n") 稳妥
-            line = line.strip()  # 去掉可能残留的空白
-            if not line:
-                continue  # 空行（文件末尾常见）直接跳过
-            try:
-                obj = json.loads(line)
-            except json.JSONDecodeError:
-                continue  # 半行 / 坏行，跳过。见上面"坏行直接跳过"的说明
-
-            kind = obj.get("type")
-            if kind == "header":
-                header = obj  # 后来覆盖前面：理论上只有一行，
-                              # 万一文件被追加了第二个 header，以最后一个为准
-            elif kind == "message" and isinstance(obj.get("message"), dict):
-                # 二次检查 message 是不是字典：坏数据里它可能是字符串或 null，
-                # 直接 append 进去会让后面的代码在 message["role"] 处崩掉
-                messages.append(obj["message"])
-
+        # 【2026-11-13 第 34 轮】解析逻辑抽到模块级 _read_session()：
+        #   resume 还需要同一文件里的"压缩记录"，分两次读 1~2MB 不划算。
+        #   这里只要前两项，行为与以前完全一致。
+        messages, header, _ = _read_session(path)
         return messages, header
 
     # -------------------------------------------------------------------------
@@ -352,6 +388,55 @@ class SessionStore:
 # 四、恢复：把存档变成"能直接用"的消息列表
 # =============================================================================
 
+def _read_session(path) -> Tuple[List[dict], dict, dict]:
+    """读会话文件，返回 (消息列表, header, 最后一条压缩记录)（2026-11-13 第 34 轮新增）
+
+    【为什么"压缩记录"要和消息一起读出来】
+      压缩只改内存里的 messages_history，文件是 append-only、从不重写。
+      所以文件里必须留一条"这里压缩过"的痕迹，否则 resume 每次都读到压缩前的
+      完整历史：估算必然超高 → 每次都重新压一遍 → 每次都真花一次摘要调用，
+      而且反复把同一段历史摘要来摘要去（第二次开始就是在摘要"上一次的摘要"）。
+
+    三个东西同一次读盘返回，是因为 resume 两条路都要用：
+      · 有压缩记录 → 用消息 + 记录重建"压缩后的视图"；
+      · 没有 → 只返回消息，行为和以前完全一样（老会话文件天然走这条路）。
+
+    坏行直接跳过、不抛异常：会话文件是"尽力保存"的产物，可能因为断电留下半行，
+    为了半行坏数据让整个恢复失败不值得。
+    """
+    messages: List[dict] = []
+    header: Dict = {}
+    compaction: Optional[dict] = None
+    target = Path(path)
+
+    try:
+        text = target.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return messages, header, compaction
+
+    for line in text.splitlines():
+        line = line.strip()
+        if not line:
+            continue
+        try:
+            obj = json.loads(line)
+        except json.JSONDecodeError:
+            continue
+
+        kind = obj.get("type")
+        if kind == "header":
+            header = obj
+        elif kind == "message" and isinstance(obj.get("message"), dict):
+            messages.append(obj["message"])
+        elif kind == "compaction":
+            # 后来覆盖前面：多次压缩只认最后一条。
+            # 它描述的保留区已经把之前几次压缩的结果包含在内了，
+            # 用更早的记录重建会退回到"压缩到一半"的状态。
+            compaction = obj
+
+    return messages, header, compaction
+
+
 def load_messages_for_resume(path, keep_system: bool = False) -> List[dict]:
     """读会话文件并整理成"可以直接塞进历史"的消息列表（2026-11-07 第 13 轮）
 
@@ -370,10 +455,105 @@ def load_messages_for_resume(path, keep_system: bool = False) -> List[dict]:
       恢复是"忠实还原"，压缩是"按当前上下文窗口做取舍"，
       两件事发生在不同的时间点，混在一起会让行为难以预测。
       压缩交给 HistoryManager 在下一轮请求前自己判断。
+
+    但有一件事必须在这里做（第 26 轮）：**应用已有的压缩记录**。
+      那不是"现在做一次压缩"，而是"把上次已经压过的结果还原出来"——
+      和"忠实还原"是同一件事，只是还原的是压缩后的那份视图。
+      不做的话，resume 每次都退回压缩前，于是每次都重压、每次都花钱。
     """
-    messages, _ = SessionStore.load(path)
+    messages, _header, compaction = _read_session(path)
+
+    # 排查模式：原样返回，不做任何重建——这时要看的正是"当时到底存了什么"
     if keep_system:
-        return messages  # 排查模式：原样返回
+        return messages
+
+    # 【2026-11-13 第 34 轮】有压缩记录就先重建"压缩后的视图"。
+    #   不重建的话，resume 拿回的是压缩前的完整历史，账本一估就超标，
+    #   于是每次 resume 都要重新压一次、重新花一次钱。
+    if compaction:
+        rebuilt = _apply_compaction(messages, compaction)
+        if rebuilt is not None:
+            return rebuilt
+
     return [m for m in messages if m.get("role") != "system"]
     # 用列表推导而不是在 load 里跳过：load 保持"忠实读取"的职责，
     # 筛不筛由调用方决定
+
+
+def inspect_session(path) -> dict:
+    """列表展示用：一次读盘，返回"原始"和"有效"两份消息（2026-11-13 第 34 轮新增）
+
+    为什么需要两份：
+      · raw       —— 文件里原样的消息。用于取预览（第一条用户说了什么）。
+                     压缩后恢复出来的第一条是"历史已压缩"的公告，拿它做预览
+                     会显示成"[为节省上下文空间…"，完全看不出这个会话是干嘛的。
+      · effective —— 应用压缩记录后的消息。用于显示"这条会话现在有多大"。
+                     用户看到列表写 803 条、选中后却只恢复 12 条，第一反应是
+                     "压缩是不是没生效/数据丢了"——两处口径必须一致。
+
+    为什么不让调用方自己调两个函数：
+      列表一次要列 10 个会话，各读两遍 1~2MB 的文件，加起来就是几十 MB。
+      这里同一次读盘把两份都算出来，代价只有一次解析。
+
+    返回 dict 而不是元组：四个字段（raw / effective / header / compacted），
+      用元组的话调用方得记住顺序，可读性太差。
+    """
+    messages, header, compaction = _read_session(path)
+
+    compacted = False
+    effective = None
+    if compaction:
+        rebuilt = _apply_compaction(messages, compaction)
+        if rebuilt is not None:
+            effective = rebuilt
+            compacted = True
+    if effective is None:
+        # 没有记录、或记录不可用：行为和以前一致（去掉 system 就是有效消息）
+        effective = [m for m in messages if m.get("role") != "system"]
+
+    # 四个字段各对应列表里的一项展示，缺一个调用方就得再读一次盘：
+    #   raw 取预览、effective 显示条数、header 显示时间、compacted 决定加不加"（压缩后）"。
+    # 为什么一个都不能省：
+    #   只给 effective → 预览会变成"[为节省上下文空间…"，看不出会话主题；
+    #   只给 raw → 条数又回到 805，和"已恢复 14 条"打架，用户以为压缩没生效。
+    return {
+        "raw": messages,         # 文件原文：只用来取预览（第一条用户到底说了什么）
+        "effective": effective,  # 压缩后实际会恢复的那份：条数必须与"已恢复 N 条"一致
+        "header": header,        # 会话元信息（开始时间、cwd、模型名）
+        "compacted": compacted,  # 是否应用过压缩记录 → 列表里标"（压缩后）"
+    }
+
+
+def _apply_compaction(messages: List[dict], record: dict) -> Optional[List[dict]]:
+    """按压缩记录重建"压缩后的视图"（2026-11-13 第 34 轮新增）
+
+    重建规则：公告（含摘要）+ 文件里 keep_from 之后的那些消息。
+    新的 system 由调用方（Conversation）重新生成后插在最前面，这里不管。
+
+    参数 keep_from 是**文件坐标**：压缩那一刻文件里已经有几条 message 行。
+    它之后的消息就是"压缩后新聊的内容"，必须原样保留——否则压缩过的那次
+    会话一旦 resume，后面的对话就全丢了。
+
+    返回 None 表示这条记录不可用（字段缺失、类型不对、坐标是负数）。
+    调用方会退回"返回完整历史"：宁可让用户多压一次，也不能因为一条坏记录
+    把整段对话弄丢。这是所有"尽力恢复"路径的共同取舍。
+
+    公告文案必须和 HistoryManager._create_compression_notice() 逐字一致：
+    那边靠 `[为节省上下文空间` 这个前缀识别"这是上次压缩留下的"，
+    前缀对不上，防套娃判断就失效（症状是"压了没效果"，不报错）。
+    """
+    try:
+        keep_from = int(record.get("keep_from", -1))
+    except (TypeError, ValueError):
+        return None
+    if keep_from < 0:
+        return None
+
+    summary = record.get("summary") or ""
+    kept = messages[keep_from:] if keep_from < len(messages) else []
+    # 压缩时 system 是单独拎出去的，保留区理论上不含 system；
+    # 但手工改过的文件可能有，过滤掉——否则会出现两个 system 抢规则。
+    kept = [m for m in kept if isinstance(m, dict) and m.get("role") != "system"]
+
+    notice_text = "[为节省上下文空间，之前的对话已被压缩。以下是被压缩部分的摘要：]\n" + summary
+    return [{"role": "user", "content": [{"type": "text", "text": notice_text}]}] + kept

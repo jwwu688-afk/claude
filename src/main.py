@@ -54,7 +54,7 @@ from rich.text import Text  # 富文本：可以给一段文字的不同部分�
 # 【2026-11-13 第 33.5.2 轮】0.12.1 → 0.12.2：MCP 配置支持 env。
 #   功能小增量：`mcp add -e KEY=VALUE` 把环境变量写进配置，子进程启动时
 #   与当前环境合并后生效（配代理、给单个服务器设 API key）。
-VERSION = "0.12.2"  # 【第 33.5.2 轮】MCP 单服务器 env；启动时 banner 会显示
+VERSION = "0.12.3"  # 【第 33.5.2 轮】MCP 单服务器 env；启动时 banner 会显示
 
 
 def _readable_dir(path: str) -> str:

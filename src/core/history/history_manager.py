@@ -390,6 +390,10 @@ class HistoryManager(BaseHistoryManager):
             self._compress_threshold = float(os.getenv("COMPRESS_THRESHOLD", compress_threshold))
             # 压缩阈值：用到 80%（0.8）就开始压缩，留点余量免得撞上限
             self._summarizer = None
+            # 【2026-11-13 第 34 轮】压缩落盘回调：把"压到哪儿了"记进会话文件。
+            #   不注入时（测试、没有会话文件）压缩照常进行，只是不落盘——
+            #   代价是下次 resume 会重新压一次，功能不受影响。
+            self._compaction_writer = None
             # 【2026-11-06 第 2 轮新增】"摘要生成器"，是一个异步函数：传入一批消息，返回一段摘要文字。
             #   为什么要留成"外部注入"而不是在这里直接调模型？
             #     1. 历史管理器不该知道 API 密钥、模型名这些事（分层清晰）
@@ -430,6 +434,24 @@ class HistoryManager(BaseHistoryManager):
         由 Conversation 在启动时注入；不注入则压缩时直接丢弃旧消息。
         """
         self._summarizer = summarizer
+
+    def set_compaction_writer(self, writer):
+        """注入「压缩落盘」回调（2026-11-13 第 34 轮新增）
+
+        writer 的签名要求：def fn(keep_count: int, summary: str, stats: dict) -> None
+          · keep_count：保留区有多少条（调用方拿它去算文件坐标）
+          · summary：这次生成的摘要正文
+          · stats：压缩前后的条数，纯记录用
+
+        为什么让调用方去算"文件坐标"，而不是把 SessionStore 传进来：
+          历史管理器不该知道会话文件在哪、长什么样——那是 core/session.py 的职责。
+          这里只说"我留了最近 N 条"，至于这 N 条在文件里对应第几行，由持有文件的人算。
+          这也让 history_manager 不依赖 session，两边都能单独测。
+
+        不注入时压缩照常进行，只是不落盘。代价是下次 resume 会重新压一次；
+        相比"为了存档而让压缩本身失败"，这个代价明显更小。
+        """
+        self._compaction_writer = writer
 
     def set_repeatable_checker(self, checker):
         """注入「工具是否可重复查询」的判断函数（2026-11-09 第 3 批新增）
@@ -1157,7 +1179,7 @@ class HistoryManager(BaseHistoryManager):
         else:
             self.history_token_usage.append(usage)
 
-        return {
+        stats = {
             "compressed": True,
             "reason": "ok",
             "before_count": total,
@@ -1168,6 +1190,20 @@ class HistoryManager(BaseHistoryManager):
             "before_tokens": before_tokens,
             "after_tokens": after_tokens,
         }
+
+        # 【2026-11-13 第 34 轮】把"压到哪儿了"写进会话文件。
+        #   不写的话 resume 会读到压缩前的完整历史：账本一估就超标，
+        #   于是每次 resume 都重新压一次、重新花一次摘要调用（见 session.append_compaction）。
+        #   放在账本重算之后：即使这一步失败，内存里的状态也已经是自洽的。
+        #   吞异常的理由和会话存档一致——存档失败不该把正在进行的压缩搞砸，
+        #   最坏的结果只是"下次 resume 多压一次"。
+        if self._compaction_writer is not None:
+            try:
+                self._compaction_writer(len(to_keep), summary, stats)
+            except Exception:
+                pass
+
+        return stats
 
     async def _summarize_if_possible(self, messages: list):
         """尝试把一段消息总结成摘要；做不到就返回 None（2026-11-06 第 2 轮新增）
