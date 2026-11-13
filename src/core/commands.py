@@ -834,6 +834,61 @@ async def cmd_agents(conversation, args: str) -> None:
 
 
 # =============================================================================
+# 八点四、工作模式（2026-11-12 第 33 轮）
+#
+# 【为什么模式必须有一条命令，而不是只靠 Shift+Tab】
+#   快捷键依赖终端把 Shift+Tab 当成 \x1b[Z 送进来，而 Windows 各终端行为不一致
+#   （conhost 传统模式可能直接给 \t，和补全键撞车）。/mode 走的是"读一整行再解析"，
+#   任何终端、任何输入法下都一样，它是唯一 100% 可靠的入口。
+#   快捷键是顺手，命令是保底——顺序不能反过来。
+#
+# 【为什么列表要带颜色】
+#   四种模式的区分方式就是颜色（底栏那一条）。列表里不上色，用户得自己
+#   把"计划模式"和底栏里的浅绿对上号；上色之后是直接对应上的。
+# =============================================================================
+
+async def cmd_mode(conversation, args: str) -> None:
+    """/mode —— 查看或切换工作模式
+
+    用法：
+      /mode            列出四档，标出当前是哪一档
+      /mode plan       直接切到某一档（也认 acceptEdits、bypass 这些别名）
+
+    为什么不带参数时只列不切：
+      这条命令最常见的用法是"我现在是哪一档？"——尤其按了 Shift+Tab 之后
+      想确认一下。默认动作应该是回答这个问题，而不是替用户做决定。
+    """
+    # 局部导入：modes 只被这一条命令和 conversation 用到，
+    # 放模块顶部会让"命令模块 → 模式"在导入期就成形，收益为零。
+    from core.modes import MODE_SPECS
+
+    ui = conversation._ui_manager
+    arg = (args or "").strip()
+
+    if not arg:
+        current = conversation.mode
+        ui.print_info("工作模式（Shift+Tab 或 Alt+T 循环切换）：")
+        for spec in MODE_SPECS:
+            # ▸ 标当前档。不用颜色区分"当前"，是因为每行本身已经有颜色了，
+            # 再用颜色表达"选中"会和模式配色打架。
+            mark = "▸" if spec.name == current else " "
+            ui.print_mode_line(spec.name, f"{mark} {spec.label}（{spec.name}）— {spec.summary}")
+        ui.print_info("切换写法：/mode default、/mode plan、/mode accept、/mode auto")
+        return
+
+    ok, message = conversation.set_mode(arg)
+    if not ok:
+        names = "、".join(spec.name for spec in MODE_SPECS)
+        ui.print_warning(f"{message}。可选：{names}")
+        return
+    # 【第 33.3 轮】set_mode 不再自己往屏幕上写东西，由这里补一行。
+    #   为什么用 print_mode_status 而不是 print_info：这一行要和快捷键那条
+    #   长得一模一样（同样带 ▸▸、同样用模式色），否则同一个状态在两种入口下
+    #   会有两种长相，用户会以为是两个不同的功能。
+    ui.print_mode_status(conversation.mode, message)
+
+
+# =============================================================================
 # 八点五、MCP 服务器运行时状态（2026-11-12 第 31 轮）
 #
 # 【和 `thinker mcp list` 的分工——这块最容易被问"list 不是也能看吗"】
@@ -1394,6 +1449,15 @@ register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cm
 register(CommandSpec("compact", "/compact", "立刻压缩上下文（不等 80%）", cmd_compact))
 register(CommandSpec("clear", "/clear", "清空上下文并开一个新会话", cmd_clear))
 register(CommandSpec("agents", "/agents", "列出子 agent 类型（同时重新扫描目录）", cmd_agents))
+# 【第 33 轮】工作模式。放在 /agents 后面、/mcp 前面：
+#   它和 /model、/skills 一样属于"改当前会话的运行参数"，
+#   归在一起读起来是连续的一类。
+register(CommandSpec(
+    "mode",
+    "/mode [default|plan|accept|auto]",
+    "查看或切换工作模式（四档）",
+    cmd_mode,
+))
 # 【第 31 轮】MCP 的运行时视角：哪些连上了、几个工具、谁失败了。
 #   和终端命令 `thinker mcp list`（只看配置文件）互补，不重复。
 register(CommandSpec("mcp", "/mcp", "MCP 服务器：哪些连上了、各自几个工具", cmd_mcp))

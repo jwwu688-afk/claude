@@ -16,6 +16,10 @@
 from abc import ABC, abstractmethod  # 抽象基类工具
 
 from core.auto_memory import render_for_prompt as render_auto_memory  # 【第 12 轮】自动记忆
+# 【2026-11-12 第 33 轮】工作模式的固定说明段。
+#   注意只 import 这一段静态文字，不 import 任何"当前模式"的东西——
+#   当前档位必须留在 reminder 里，否则会破坏提示词前缀缓存。
+from core.modes import MODE_SECTION
 from core.prompt.enviroment import get_enviroment_info  # 导入函数：生成环境信息文字
 from core.prompt.memory import load as load_project_memory  # 导入函数：加载 THINKER.md
 from core.prompt.system_rule import get_system_rule  # 导入函数：生成行为规矩文字
@@ -96,5 +100,13 @@ class PromptManager(BasePromptManager):
         if SkillManager().count() > 0:
             sections.append(SKILLS_SECTION)
 
-        sections.append(get_enviroment_info())  # 第五段：当前环境信息
+        # 【2026-11-12 第 33 轮】第五段：工作模式说明。
+        #   这一段是**固定文本**：只讲"有哪几种模式、分别是什么"，不讲"现在哪一种"。
+        #   之所以必须这么切分：当前模式是会变的，写进系统提示词就等于
+        #   每切一次模式都让前缀缓存整段失效（/cost 的命中率会掉）。
+        #   当前档位由每轮末尾的 <mode> 提醒给出（core/modes.mode_reminder）。
+        #   放在环境信息之前，是为了保住第 11 轮"环境永远在最后"的判断。
+        sections.append(MODE_SECTION)
+
+        sections.append(get_enviroment_info())  # 第六段：当前环境信息
         return "\n\n".join(sections).strip()

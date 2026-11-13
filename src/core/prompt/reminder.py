@@ -15,21 +15,40 @@
 
 from tools.todo_write import TodoWrite  # 导入待办工具，为了拿到它当前的状态
 from tools.tool_manager import ToolManager  # 导入工具管理器，为了按名字找到那个待办工具
+from core.modes import mode_reminder  # 【第 33 轮】当前工作模式那一段
 
 
-def get_reminder() -> str:
+def get_reminder(mode: str = None) -> str:
     # 定义函数，返回一段提醒文字
     tool_manager = ToolManager()  # 拿到工具管理器（单例，就是对话在用的那个）
     todo_status = tool_manager.get_tool_status(TodoWrite.get_tool_name())  # 查询待办工具现在装了些什么
     # 上面这行的效果：如果清单是空的，会返回"当前没有任何待办事项"；
     # 如果有内容，会返回格式化好的 JSON 文字
 
-    return f"""
+    reminder = f"""
 <reminder>
 ## 当前待办状态
 {todo_status}
 记得经常用 todo_write 工具检查并更新待办清单，保持条理和效率。
 </reminder>
 """.strip()
+
+    # 【2026-11-12 第 33 轮】模式说明作为**独立的一块**接在待办提醒后面。
+    #
+    # 为什么不塞进上面的 <reminder> 里：
+    #   <reminder> 的语义是"顺带提醒你看看待办"，而模式是"这一轮的硬约束"。
+    #   两者语气和优先级都不同，混在一个标签里，模型容易把模式也当成"可选建议"。
+    #
+    # 为什么放在工具结果里、而不是每轮单独发一条 system 消息：
+    #   · 工具结果每一轮都会出现，位置天然合适；
+    #   · 单独插一条 system 消息会让历史多出一堆重复内容，且部分接口对
+    #     "中途插入 system"的处理不一致（有的直接报 400）。
+    #
+    # 为什么允许 mode 为 None：
+    #   子 agent、测试、以及第 33 轮之前就存在的调用方都可能不传。
+    #   不传就保持原样（只给待办提醒），兼容性最好。
+    if mode:
+        reminder = reminder + "\n\n" + mode_reminder(mode)
+    return reminder
     # 上面把状态嵌进一段固定模板里。
     # 用 <reminder> 这种标签包起来，是让模型能清楚区分"这是系统提醒"和"这是工具结果"

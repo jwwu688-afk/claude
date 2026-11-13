@@ -235,6 +235,19 @@ class ToolManager:
             return False  # 保守：未知工具按"不可折叠"处理，宁可多保留
         return bool(getattr(tool, "is_repeatable", False))  # 读工具的 is_repeatable 属性
 
+    def is_readonly_tool(self, tool_name: str) -> bool:
+        """这个工具是否"自己声明了只读"（2026-11-13 第 33.5 轮新增）
+
+        目前只有 MCP 工具会声明：MCP 规范的 Tool.annotations.readOnlyHint。
+        内置工具的读写属性由 core/permissions.py 里的集合判断，不经过这里——
+        那两份集合在权限层已经有了，没必要也让工具管理器维护一份。
+
+        找不到工具（还没注册完 / 已下线）返回 False：没声明就当能写，安全方向。
+        计划模式依赖这个返回值决定"MCP 工具直接放行还是问用户"。
+        """
+        tool = self.tools.get(tool_name)
+        return bool(getattr(tool, "is_readonly", False))
+
     async def shutdown(self):
         """关闭所有外部资源（2026-11-06 第 2 轮新增）
 

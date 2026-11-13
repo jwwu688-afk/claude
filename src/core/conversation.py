@@ -28,7 +28,18 @@ from core.api_client import APIClient, ThinkingChunk, ToolCallChunk  # 导入 AP
 from core.commands import REGISTRY, handle_command, is_command  # 【第 14 轮】斜杠命令：在消息进历史之前截下来；【第 16 轮】REGISTRY 供 Tab 补全
 from core.hooks import HookBlocked, HookRunner  # 【第 32 轮】生命周期 hook（SessionStart / PreToolUse / PostToolUse / SessionEnd）
 from core.limits import MAX_TOOL_OUTPUT_CHARS  # 【第 9 轮】输出上限统一到一处，不再各处各写一个数
-from core.permissions import READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
+# 【2026-11-12 第 33 轮】工作模式：四档定义、循环切换、给模型看的提示文案。
+#   注意这里只 import 纯数据和纯函数，模式状态本身存在 Conversation 实例上——
+#   状态必须跟着会话走，放模块级全局会让子 agent 和 /resume 串味。
+from core.modes import (
+    MODE_DEFAULT,
+    MODE_PLAN,
+    cycle_mode,
+    mode_reminder,
+    normalize_mode,
+    status_line,
+)
+from core.permissions import ACTION_ALLOW, READ_ONLY_TOOLS, classify  # 【第 9 轮】权限判定集中到 core/permissions.py
 from core.prompt.prompt_manager import PromptManager  # 导入提示词管理器：负责生成"系统提示词"
 from core.prompt.reminder import get_reminder  # 导入函数：生成一段"提醒模型去看 todo"的文字
 from core.session import SessionStore, load_messages_for_resume  # 【第 13 轮】会话持久化
@@ -303,6 +314,21 @@ class Conversation:
             #   已经渲染好的技能正文，_read_user_input 会把它当成用户这一句返回，
             #   于是它走正常的 add_message → 发模型流程。普通命令永远是 None。
             self._pending_input = None
+            # 【2026-11-12 第 33 轮】当前工作模式（四档，见 core/modes.py）。
+            #   为什么放在 Conversation 上而不是全局：
+            #     它是**会话级**状态，跟着这次对话走；放模块级全局会让
+            #     子 agent、/resume 的另一条会话、测试之间互相串味。
+            #   为什么要给默认值：单例的 __init__ 只跑一次，测试会用 __new__
+            #     造裸对象（不走 __init__），那种对象上访问它会 AttributeError。
+            #     后面所有读取点都用 getattr(self, "_mode", MODE_DEFAULT) 兜底。
+            self._mode = MODE_DEFAULT
+            # 【第 33 轮】模式切换后"还没告诉模型"的提示。
+            #   切换发生在等用户输入的时候，此刻没有请求可发；把提示存在这里，
+            #   等用户真正说下一句时拼进那条 user 消息（见 _user_message）。
+            #   为什么不留一条单独的 system 消息：那会让历史多一条消息、
+            #   而且有些接口对连续 system 消息的处理不一致；拼进 user 消息的第二块
+            #   最稳，也不影响前缀缓存（它在尾部）。
+            self._mode_notice = None
             self._esc = EscWatcher()  # 监听 Esc 的后台线程（不支持的平台会自动降级）
             # 【2026-11-12 第 32 轮】hook 执行器 + SessionStart 的上下文。
             #   _hook_context 在 start_conversation 里由 SessionStart 的 stdout 填充，
@@ -527,7 +553,106 @@ class Conversation:
         """
         self._pending_input = text
 
+    # =========================================================================
+    # 【2026-11-12 第 33 轮】工作模式：状态、切换、以及"什么时候告诉模型"
+    #
+    # 为什么这一组方法直接放在 Conversation 上、不另做一个 ModeManager：
+    #   模式的全部状态就是一个字符串 + 一个待发提示，没有任何需要封装的资源。
+    #   多一个单例只会多一处"初始化时序"的坑（项目里已经有四个单例了），
+    #   而它需要读写的东西（_ui_manager、历史注入点）本来就在 Conversation 手里。
+    # =========================================================================
+
+    @property
+    def mode(self) -> str:
+        """当前工作模式（2026-11-12 第 33 轮新增）
+
+        用 getattr 兜底的理由见 __init__ 里 _mode 的注释：
+        测试可能先 __new__ 造裸对象、不走 __init__，那种对象上没有这个属性。
+        返回默认档是安全方向——问得最多的那一档。
+        """
+        return getattr(self, "_mode", MODE_DEFAULT)
+
+    def set_mode(self, raw) -> tuple:
+        """切换工作模式（2026-11-12 第 33 轮新增；33.3 轮去掉 announce）
+
+        返回 (是否切换成功, 给用户看的一句话)。失败时成功标志为 False，
+        调用方据此决定要不要列出可选模式——这里不打印错误，因为
+        `/mode`、启动参数、快捷键三个入口的错误文案不该一模一样。
+
+        为什么没有 announce 了：第 33 轮它控制"切换时要不要打一行/刷底栏"，
+        而现在底栏不显示模式、`/mode` 又自己负责打印那一行状态，
+        两条路都不需要 set_mode 亲自往屏幕上写东西。留着一个"什么也不做"的
+        参数，只会让调用方以为它还在起作用。
+
+        为什么切换时还要写 _mode_notice：
+          切换发生在等用户输入的时候，此刻没有请求在飞。
+          模型要到用户说下一句才知道模式变了——那时 _user_message 会把
+          这段提示拼进同一条消息。不这么做的话，模型会拿着旧模式的认知
+          继续干活（最典型的是 plan 切回 accept 之后，它还在问"要不要我动手"）。
+        """
+        name = normalize_mode(raw)
+        if name is None:
+            return False, f"未知模式：{raw}"
+
+        if name == self.mode:
+            # 已经是这一档：仍然返回一行状态，让快捷键路径把它刷在输入行上方。
+            # 为什么不返回"已经是计划模式，没有变化"：那是一句日志，
+            # 连按到循环回原档时会多出一行噪音；状态行覆盖同一行，视觉上没变化。
+            return True, status_line(name)
+
+        self._mode = name
+        self._mode_notice = mode_reminder(name)
+
+        # 【第 33.3 轮】切换只做两件事：更新状态、把新档位告诉输入层（供状态行上色）。
+        #   屏幕上那句话由调用方决定怎么显示——/mode 用 print_mode_status 打一行，
+        #   快捷键交给 LineEditor 原地覆盖。set_mode 不再碰界面。
+        message = status_line(name)
+        self._ui_manager.set_mode_state(name)
+        return True, message
+
+    def cycle_mode(self) -> tuple:
+        """按 Shift+Tab 的顺序切到下一档（2026-11-12 第 33 轮新增）
+
+        顺序由 core/modes.py 的 MODE_SPECS 决定（default → plan → accept → auto），
+        这里不重复写一遍——两处各写一份顺序，加第五档时必然漏一处。
+        """
+        return self.set_mode(cycle_mode(self.mode))
+
+    def _cycle_mode_from_key(self) -> tuple:
+        """快捷键按下时的回调（2026-11-12 第 33 轮新增）
+
+        为什么单独包一层、不把 set_mode 直接交给 UI：
+          set_mode 只改状态、不打印，但"这一行由谁画"必须由调用方决定。
+          快捷键这条路上光标还停在输入行中间，只有 LineEditor 知道当前屏幕状态
+          （它会"清行 → 打提示 → 重画输入行"）。包一层把这个入口显式标出来，
+          以后再加"从别的地方切模式"时，能一眼看到这里还有一条专用通道。
+        """
+        return self.cycle_mode()
+
+    def _user_message(self, text: str) -> dict:
+        """构造一条用户消息，必要时把"模式已切换"的提示拼在后面（第 33 轮新增）
+
+        为什么把提示作为**第二个内容块**，而不是直接改用户输入的文字：
+          用户看到的必须是他自己说的话；模型可以多看到一块"当前模式"。
+          分块之后，将来要拆、要换成 system 消息，都只是改这里一处。
+
+        为什么提示放在用户文字**后面**：
+          模型是按顺序读的，"用户让我做 X，当前模式是 plan"读起来是
+          "这条要求受这个约束"；反过来会变成"模式是 plan，然后用户让我做 X"，
+          约束容易被当成背景信息忽略掉。
+
+        为什么取出即清空：和 _pending_input 同一个理由——同一条提示只该发一次。
+        忘了清会让之后每一轮都白带一段文字，还重复计费。
+        """
+        content = [{"type": "text", "text": text}]
+        notice = getattr(self, "_mode_notice", None)
+        if notice:
+            content.append({"type": "text", "text": notice})
+            self._mode_notice = None
+        return {"role": "user", "content": content}
+
     def take_pending_input(self):
+
         """取出待发消息，**取出即清空**；没有就返回 None（2026-11-10 第 21 轮新增）
 
         为什么取出就清空，而不是让调用方自己清：
@@ -694,6 +819,14 @@ class Conversation:
 
         ensure_memory_dir()
 
+        # 【2026-11-12 第 33 轮】把模式相关的两个钩子交给输入层：
+        #   · cycler：快捷键按下时调用，负责真正切档并返回提示文案；
+        #   · state ：当前档位，底栏用它决定显示什么名字、什么颜色。
+        # 每次 start_conversation 都设一遍是幂等的（/resume 会再进来一次），
+        # 代价是两次属性赋值，换来的是"任何进入对话的路径都保证钩子已就位"。
+        self._ui_manager.set_mode_cycler(self._cycle_mode_from_key)
+        self._ui_manager.set_mode_state(self.mode)
+
         # 【第 32 轮】SessionStart 必须在 build_system_message 之前：
         #   它的 stdout 要拼进系统提示词，晚一步这一轮就少了那段环境信息。
         await self._run_session_start_hooks()
@@ -729,13 +862,9 @@ class Conversation:
 
         # 【第 14 轮】走 _read_user_input：斜杠命令在这里被截下，不进历史、不发模型
         user_input = await self._read_user_input()
-        user_message = {
-            "role": "user",  # user 表示"用户说的"
-            "content": [
-                {"type": "text", "text": user_input}  # 用户输入的文字
-            ]
-        }
-        self.add_message(user_message)  # 放进消息列表
+        # 【第 33 轮】改走 _user_message：模式切换后的提示要拼进这条消息。
+        #   为什么不在上面直接改 user_input：用户看到的和模型看到的应该分开处理。
+        self.add_message(self._user_message(user_input))  # 放进消息列表
 
         try:  # 开始试：后面的整个对话循环都可能出错
             await self._recursive_message_handling()  # 进入主循环（下文详解）
@@ -991,11 +1120,8 @@ class Conversation:
                 # 而不是 return True 让外层再转一圈——那样会立刻又去请求模型，
                 # 用户根本没机会改口。
                 user_input = await self._read_user_input()  # 【第 14 轮】命令也在这里截
-                user_message = {
-                    "role": "user",
-                    "content": [{"type": "text", "text": user_input}],
-                }
-                self.add_message(user_message)
+                # 【第 33 轮】同样走 _user_message：中断这条路上切换过模式也要告知模型
+                self.add_message(self._user_message(user_input))
                 return True
 
             # If no complete response message, create one
@@ -1072,13 +1198,8 @@ class Conversation:
             if self._task_depth > 0:  # 如果我是子 agent
                 return False  # 【第 8 轮】活干完了，让外层 while 停下，把结论交给主 agent——不要再去问用户要输入
             user_input = await self._read_user_input()  # 主 agent 就等用户说下一句（【第 14 轮】命令已在此截下）
-            user_message = {
-                "role": "user",  # 用户说的
-                "content": [
-                    {"type": "text", "text": user_input}  # 用户输入的内容
-                ]
-            }
-            self.add_message(user_message)  # 存进历史
+            # 【第 33 轮】走 _user_message：把"模式已切换"的提示拼成第二个内容块
+            self.add_message(self._user_message(user_input))  # 存进历史
             return True  # 【第 8 轮】交给外层 while 再转一圈：带着新问题再问模型
 
     def _print_context_window_and_total_cost(self):
@@ -1101,8 +1222,16 @@ class Conversation:
             #   原因：绝对数没有参照系，8640 可能是 20 万输入的 4%（很差），
             #   也可能是 1 万输入的 86%（很好），用户每次都得自己心算。
             cache_part = f" {DOT} 缓存命中 {self._api_client.cache_hit_rate:.0f}%"
+        # 【2026-11-13 第 33.4 轮】子 agent 期间标明这是谁的账本。
+        #   为什么必须标：子 agent 会 start_new_chat() 压一页新历史，
+        #   用量账本也跟着压入一条 0，于是这行百分比从 48.5% 直接跳到 1.0%——
+        #   数字本身没错（那确实是子 agent 刚起步的占用），但和主对话那一行
+        #   长得一模一样，用户看到的就是"我的上下文被清空了"。
+        #   主对话的数字并没有丢，只是被压在栈底；子 agent 交差后会自动跳回来。
+        #   代价只有一个词，换来的是这条路不再需要解释。
+        label = "子 agent 上下文" if self.is_subagent else "上下文"
         self._ui_manager.print_status(
-            f"上下文 {used_text}% {DOT} 花费 ${self._api_client.total_cost}{cache_part}", level
+            f"{label} {used_text}% {DOT} 花费 ${self._api_client.total_cost}{cache_part}", level
         )
 
     # -------------------------------------------------------------------------
@@ -1277,6 +1406,16 @@ class Conversation:
                "拿不准就派个子 agent"。子 agent 拿到这些指令会去撞 todo_write——
                而那个工具的状态存在单例实例上，一撞就覆盖主 agent 的待办清单。
           这是两道闸里的第一道（清单层），第二道在 _is_tool_allowed。
+
+        【第 33 轮】曾在这里按模式剪过清单（plan 下只发只读工具）。
+        【第 33.5 轮撤掉那一层】改成 Claude Code 的方向：**工具照常下发，
+          由权限层在执行前裁决**。撤掉的两个理由都是实测出来的：
+            · 模型看不到 file_write，写方案时就说不出"用哪个工具改哪一处"，
+              方案粒度只到"改这里"，落地时还得再猜一遍；
+            · cmd_runner 被白名单卡死，`node --check`、`Get-ChildItem` 这类只读命令
+              全被挡，计划模式几乎没法调研。
+          安全边界没变松：classify() 的 plan 分支仍然会 deny 写工具与写命令，
+          只是"看不到"变成了"看得见、动不了"，模型知道该往哪个方向写方案。
         """
         exclude = {"task", "skill"} if self.is_subagent else None  # 子 agent：派活和加载技能都不给
         allow = None  # None = 不限制（主 agent、或"继承全部"的子 agent）
@@ -1286,6 +1425,8 @@ class Conversation:
             # 或者以后有人手工 register 时绕过了解析，这里仍然兜住。
             # 【第 21 轮】skill 同理：白名单里写了也不给，和 exclude 那条保持一致。
             allow = {name for name in agent.tools if name not in ("task", "skill")}
+
+        # 【第 33.5 轮】这里不再按模式剪枝——见方法文档里那段撤掉清单层的说明。
         return await self._tool_manager.get_tools_description(exclude=exclude, allow=allow)  # 向工具管理器要清单
 
     @staticmethod
@@ -1304,6 +1445,26 @@ class Conversation:
         想看完整规则请读 core/permissions.py 的 classify()。
         """
         return classify(tool_name, args).need_approval
+
+    def _readonly_hint(self, tool_name: str) -> bool:
+        """这个工具是否"自己声明了只读"（2026-11-13 第 33.5 轮新增）
+
+        目前只有 MCP 工具能给出这个信息（服务端 Tool.annotations.readOnlyHint）。
+        计划模式用它决定"MCP 工具直接放行"还是"问用户一次"——和 Claude Code 一致：
+        声明了只读就不打扰，没声明就请求权限。
+
+        为什么包一层 try、取不到就当"不是只读"：
+          MCP 工具是后台异步注册的，对话第一轮时工具表可能还没填满；
+          测试里的裸对象也可能没有 _tool_manager。这些情况下返回 False 是安全方向——
+          多问一次确认，而不是把一个会提交工单的外部工具静默放出去。
+        """
+        manager = getattr(self, "_tool_manager", None)
+        if manager is None:
+            return False
+        try:
+            return manager.is_readonly_tool(tool_name)
+        except Exception:
+            return False
 
     async def _handle_tool_calls(self, tool_calls):
         """处理模型这一轮申请的所有工具（第 15 轮：连续的只读调用并发执行）
@@ -1359,7 +1520,13 @@ class Conversation:
                 continue
 
             args = parsed
-            decision = classify(tool_call.function.name, args)  # 第 9 轮：要不要问用户
+            # 【第 33 轮】把当前模式传进去：判定结果从"问/不问"变成三态
+            # 【第 33.5 轮】再多传一个"是否自声明只读"——MCP 工具靠它决定
+            #   计划模式下直接放行还是问用户一次（Claude Code 的做法）。
+            decision = classify(
+                tool_call.function.name, args, self.mode,
+                self._readonly_hint(tool_call.function.name),
+            )
 
             # 先看看能不能攒一批并发（至少两条才值得并，一条并了反而多一层开销）
             batch, next_index = self._collect_parallel_batch(tool_calls, parsed_args, index)
@@ -1388,14 +1555,44 @@ class Conversation:
                 index += 1
                 continue
 
+            # 【第 33 轮】deny：计划模式下的写操作。
+            #   为什么放在 hook 之后：hook 是用户自己配的规则（可能要记审计日志），
+            #   被 hook 拦下的调用同样不该执行；先让 hook 看一眼，再按模式拒绝。
+            #   为什么放在 show_preparing_tool 之前：被拒绝的调用没有"执行"这一步，
+            #   屏幕上画一个工具头再跟上"没执行"，看起来像是执行失败，
+            #   而它其实是"压根没允许"。一行拦截提示更准确。
+            if decision.is_denied:
+                # 【第 33.5 轮】提示里补上"被拦的具体是什么"。
+                #   第 33 轮只打了工具名（`已拦截（计划模式）：cmd_runner`），
+                #   用户看不出拦的是哪条命令——尤其是 cmd_runner 这种一个工具
+                #   对应无数命令的情况，这条提示等于没说。
+                #   format_tool_call 会把参数压成一行摘要并截断，和批准弹窗
+                #   用的是同一个函数，屏幕上不会出现两种写法。
+                shown = self._ui_manager.format_tool_call(tool_call.function.name, args)
+                self._ui_manager.print_warning(f"已拦截（计划模式）：{shown}")
+                # 完整理由写回历史，模型下一轮据此改道。理由里已经写明"改用只读工具"
+                # 和"让用户切模式"两条出路，所以这里不需要再补话。
+                self._add_tool_response(
+                    tool_call,
+                    f"这次调用被拦截，工具没有执行。\n{decision.reason}",
+                    is_last_tool,
+                )
+                index += 1
+                continue
+
             # 【2026-11-06 第 8.2 轮】先把"要干什么"画出来，再问"要不要干"。
             #   改前是反过来的：先弹一段 "Tool: xxx, args: {...}"，用户点完同意，
             #   下面才出现 ⏺ cmd_runner(dir) 那行。结果是同一个命令在屏幕上出现两次，
             #   第一次还是一坨没排版的字典。现在头部只画一次，顺序也符合人的阅读习惯。
             self._ui_manager.show_preparing_tool(tool_call.function.name, args)
 
-            if decision.is_high_risk:  # 【第 9 轮】高危操作先亮红牌再问
+            if decision.is_high_risk and decision.need_approval:  # 【第 9 轮】高危操作先亮红牌再问
                 self._ui_manager.print_warning(f"高危操作（{decision.reason}）：回车将默认拒绝，确认执行请输入 y。")
+            elif decision.is_high_risk:
+                # 【第 33 轮】自动模式：高危但不停下来问。不阻断，只留一行痕迹——
+                #   用户要的是"全放开"，但事后完全不知道跑过一条 `del /s /q`
+                #   属于装瞎。这行提示不影响任何行为，删掉也只是少一行输出。
+                self._ui_manager.print_warning(f"自动模式执行高危操作（{decision.reason}）")
 
             should_execute = True  # 默认执行；下面要问用户时再按回答改写
             content = ""  # 用户拒绝时说的话
@@ -1423,16 +1620,22 @@ class Conversation:
 
         三个条件缺一不可：
           1. 在只读工具清单里——只有只读才没有先后依赖；
-          2. 判定结果不需要审批——要停下来问人，并行就没意义（人只有一个）；
+          2. 判定结果必须是 allow——要停下来问人（ask），并行就没意义（人只有一个）；
+             被模式拒绝（deny）的也不并发，它根本不会执行，凑进批次只会把
+             "拦截提示"和真正执行的结果混在一起。
           3. 不是高危——高危必须单独走，合批会把"回车默认拒绝"的提示挤在一起，
              用户根本分不清那句话对应哪条命令。
 
         只认 READ_ONLY_TOOLS 这个集合，不自己判断"这个工具看起来是只读的"：
           判据只有一份（core/permissions.py），两处各判一次迟早不一致。
+
+        【第 33 轮】把 `not need_approval` 换成 `action == allow`：
+          三态之后 "不需要审批" 不等于 "可以执行"——deny 也不审批。
+          用 action 判断才没有歧义。
         """
         return (
             tool_name in READ_ONLY_TOOLS
-            and not decision.need_approval
+            and decision.action == ACTION_ALLOW
             and not decision.is_high_risk
         )
 
@@ -1462,7 +1665,12 @@ class Conversation:
             if isinstance(parsed, json.JSONDecodeError):  # 留给单条路径单独报错
                 break
             name = tool_calls[index].function.name
-            if not self._can_run_in_parallel(name, classify(name, parsed)):
+            # 【第 33 轮】带上当前模式：plan 模式下只读工具仍是 allow，
+            #   判定结果和 default 一样，所以这一处不需要额外分支。
+            # 【第 33.5 轮】自声明只读的 MCP 工具会走 allow，同样可以并发。
+            if not self._can_run_in_parallel(
+                name, classify(name, parsed, self.mode, self._readonly_hint(name))
+            ):
                 break
             batch.append((tool_calls[index], parsed))
             index += 1
@@ -1569,6 +1777,15 @@ class Conversation:
           · 主 agent（current_agent 为 None）→ 全部允许；
           · 子 agent 且 tools 为 None（继承全部）→ 允许，但 task 永远不许；
           · 子 agent 且 tools 有值 → 只允许名单里的，task 永远不许。
+
+        【第 33 轮】曾在这里加过一道"当前模式"的闸（plan 下白名单外的工具直接不可用）。
+        【第 33.5 轮撤掉】模式约束现在只在权限层实现（classify 的 plan 分支）。
+          为什么能撤：清单层也不剪了，工具全部下发；模式要不要执行由 classify 判，
+          那里能给出"为什么不行、方案该怎么写"的具体理由，比这里一句
+          "不可用"更有用。两层各判一次，反而容易出现"清单给了、这里拦了、
+          模型不知道听谁的"这种自相矛盾。
+          子 agent 的白名单闸保留在下面——那是"子 agent 永远比父更窄"的约束，
+          和模式无关。
         """
         agent = self.current_agent
         if agent is None:
@@ -1650,7 +1867,9 @@ class Conversation:
 
         # Add reminder after the last tool call in each iteration
         if is_last_tool:  # 只有最后一个工具结果后面才加提醒
-            reminder_content = get_reminder()  # 生成一段提醒（内容是当前的 todo 列表 + 一句叮嘱）
+            # 【第 33 轮】把当前模式传给 reminder：模式说明每轮附在最后，
+            #   模型对最近内容的注意力最强，适合放"这一轮按什么规矩来"。
+            reminder_content = get_reminder(self.mode)
             tool_content.append({"type": "text", "text": reminder_content})
             # 为什么加在工具结果里而不是单独发一条消息？因为这样模型一定会读到，不占额外消息位
 

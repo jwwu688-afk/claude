@@ -17,6 +17,7 @@ Main UI manager that coordinates input and display operations.（协调输入与
 
 from typing import Optional  # 类型标注
 from rich.console import Console  # rich 的控制台对象
+from rich.text import Text  # 【第 33 轮】/mode 列表要按模式上色，需要富文本
 from .input_handler import InputHandler  # 导入输入处理器
 from .display_manager import DisplayManager  # 导入显示管理器
 from . import theme  # 【2026-11-06 第 4 轮】统一配色与符号
@@ -63,6 +64,48 @@ class UIManager:
         传 None 就是原来的行为，一行都不走自管模式。
         """
         return await self.input_handler.get_user_input(prompt, completer)
+
+    def set_mode_state(self, mode: str) -> None:
+        """把当前模式告诉输入层（2026-11-12 第 33 轮新增；33.3 轮去掉 refresh）
+
+        为什么由 UIManager 转一手、而不是让 Conversation 直接摸 input_handler：
+          项目一直守着"其他模块只跟门面打交道"这条约定（见 get_numbered_choice 的说明）。
+          多一行转发，换来的是以后换输入实现时只需要改这里。
+
+        为什么没有 refresh 参数：底栏不再显示模式（模式归输入行上方那条状态行），
+        "模式变了要重画底栏"这件事不存在了。
+        """
+        self.input_handler.set_mode_state(mode)
+
+    def print_mode_status(self, mode: str, text: str) -> None:
+        """用当前档位的颜色打一行模式状态（2026-11-13 第 33.3 轮新增）
+
+        谁会用：`/mode` 切换成功后。快捷键那条路自己会把它画在输入行上方，
+        而命令这条路输入行已经结束，需要在这里补一行，否则用户敲完 /mode plan
+        屏幕上什么变化都看不到。
+
+        格式与 LineEditor 里那条保持一致（`▸▸ 计划模式 · 只读，用来出方案`）：
+        同一个状态在两个入口有两种长相，是最容易让人觉得"这不是一个功能"的细节。
+        """
+        self._console.print(Text("  " + text, style=theme.mode_color(mode)))
+
+    def set_mode_cycler(self, cycler) -> None:
+        """注入快捷键切换模式的回调（2026-11-12 第 33 轮新增）
+
+        cycler 的签名是 () -> (bool, str)，由 Conversation 提供。
+        UI 层不反向依赖核心层，所以只能这样注入，不能自己 new 一个 Conversation。
+        """
+        self.input_handler.set_mode_cycler(cycler)
+
+    def print_mode_line(self, mode: str, text: str) -> None:
+        """用某一档模式的颜色打一行（2026-11-12 第 33 轮新增）
+
+        谁会用：/mode 的列表。四档各占一行，用各自颜色显示，
+        用户一眼就能把"名字"和"底栏那个颜色"对上号。
+        为什么不做成通用的 print_colored：那等于给 UI 层开一个"随便传样式"的口子，
+        迟早出现七八种散落的自定义颜色；只开这一个窄接口，配色仍旧只有 theme 一处。
+        """
+        self._console.print(Text(f"  ● {text}", style=theme.mode_color(mode)))
 
     async def wait_for_user_approval(self, question: str = "是否执行？", default_yes: bool = True) -> tuple[bool, str]:
         """问一次"要不要执行"，等用户回车或给一句反馈（2026-11-06 第 8.2 轮重写）

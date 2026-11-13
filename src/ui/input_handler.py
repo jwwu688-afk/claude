@@ -24,6 +24,9 @@ from rich.text import Text  # 富文本：给横线染色
 
 from . import theme  # 【2026-11-06 第 4 轮】输入提示符的样式从这里取
 from .line_editor import LineEditor  # 【第 16 轮】Tab 补全用的自管行编辑
+# 注：第 33 轮这里曾 import core.modes.get_spec，用于在底栏显示档位名。
+#   33.3 轮底栏不再显示模式（改由输入行上方的状态行负责），这个导入随之删除——
+#   留着它只会让下一个人以为底栏还在跟模式走。
 # 注：EXTENDED_PREFIX / KEY_CTRL_C 原本在这里被用来做"首字符分流"，
 # 16.2 轮把分流整个删掉（改成整行自管）后，按键常量只在 line_editor 内部使用，
 # 这里不再需要导入。
@@ -40,6 +43,20 @@ class InputHandler:
         #   在这里就建好而不是用到时再建：它的 available 判断要看 msvcrt 和 isatty，
         #   启动时算一次就够了，不用每次输入都重新 import 一遍。
         self._editor = LineEditor()
+        # 【2026-11-12 第 33 轮】当前工作模式 + 底栏上一次画的是哪一档。
+        #   为什么这里存一份、而不是每次去问 Conversation：
+        #     底栏在"画横线"这个热路径上被调用，而 InputHandler 刻意不持有
+        #     Conversation（那样 UI 层就反向依赖了核心层，测试也难替身）。
+        #     启动时 Conversation 会把当前档推过来，切换时再推一次，这里只负责显示。
+        self._mode = "default"
+        # _status_mode 记"屏幕上那条底栏写的是哪一档"，用来判断要不要重画。
+        #   为什么不直接比 self._mode 和上一次的值：_status_shown 只控制首次，
+        #   真正需要的是"显示的"和"当前的"不一致时才重画，两者不是同一个东西。
+        self._status_mode = None
+        # 快捷键切换模式的回调（由 Conversation 注入，返回 (是否成功, 提示文案)）。
+        #   为什么不在这里直接 import Conversation：会形成 ui → core 的反向依赖，
+        #   而且单例在模块导入期还没建好，拿到的永远是 None。
+        self._mode_cycler = None
 
     def _draw_rule(self) -> None:
         """画输入框下方那条横线（2026-11-07 第 10 轮新增）
@@ -62,8 +79,15 @@ class InputHandler:
         except Exception:  # 某些非交互环境拿不到宽度
             width = 60
         self._console.print(Text("─" * width, style="qs.dim"))
-        if not self._status_shown:  # 第一次输入完成才画状态栏，位置正好在横线下面
+        # 【第 33.3 轮】回到"只画一次"。
+        #   第 33 轮曾让它跟着模式重画（_status_mode != _mode），那是因为底栏
+        #   承担着"当前是哪一档"的显示。现在模式只在上方那条状态行里出现，
+        #   底栏内容与模式无关了——再按模式重画，只会每切一次多堆一条相同的底栏。
+        if not self._status_shown:
             self._status_shown = True
+            # _status_mode 保留赋值只是为了不让旧属性变成"从未写过"的怪状态，
+            # 它已经不参与任何判断。
+            self._status_mode = self._mode
             self._draw_status_bar()
         # 显式刷出缓冲区，理由见本方法文档字符串里【16.1 轮补了 flush】那段。
         # 用 _console.file 而不是 sys.stdout：rich 可能把输出接到别处（比如测试里
@@ -74,14 +98,29 @@ class InputHandler:
             pass
 
     def _draw_status_bar(self) -> None:
-        """画输入框下面那行黄色状态提示（2026-11-07 第 10 轮新增）
+        """画输入框下面那行状态提示（2026-11-07 第 10 轮新增，第 33 轮改成跟随模式变色）
 
-        截图原文是 `▸▸ auto mode on (shift+tab to cycle) · ← for agents`。
-        那两项对应"权限模式切换"和"agent 面板"，本项目都还没有，
-        照抄会变成按了没反应的假按钮——所以保留字形和配色，
-        内容换成本项目真实存在的操作提示。
+        【第 10 轮的来历】截图原文是 `▸▸ auto mode on (shift+tab to cycle) · ← for agents`。
+          当时那两项对应"权限模式切换"和"agent 面板"，本项目都还没有，
+          照抄会变成按了没反应的假按钮——所以保留字形和配色，内容换成真实操作。
+          现在模式切换真的做了，这条提示第一次名副其实。
 
-        只画一次：它是"底栏"，不是每轮都要重复的日志。
+        【第 33 轮改了什么】
+          1. 写死的"默认模式"换成当前档位的名字，`▸▸` 和名字一起用该档的颜色；
+          2. 补上 "shift+tab 切换"，否则用户不知道可以按。
+          3. 去掉了"←→ 编辑"：加上模式名之后整行接近 80 列，
+             窄一点的终端会折行，而 ←→ 是三条提示里最次要的（↑↓ 历史更高频）。
+
+        颜色只作用于"模式"这一段，其余仍是暗灰：底栏是背景信息，
+        全部上色会变成一条彩虹，反而看不出重点。
+
+        【第 33.3 轮】不再显示模式名，整行统一暗灰。
+          用户实测反馈：输入行上方已经有一条彩色的「▸▸ 计划模式 · 只读，用来出方案」，
+          底栏再写一遍"计划模式"就是同一句话说两次，而且底栏那句还是上一轮的旧值
+          （要等提交后才重画），两条并排时反而互相矛盾。
+          现在分工明确：模式归输入行上方那条状态行（实时、有色、可覆盖），
+          底栏只讲"这里能按什么"，不参与状态表达。
+          `▸▸` 作为引导符保留——它在 Claude Code 里就是底栏的行首标记，不承载语义。
         """
         threshold = os.getenv("COMPRESS_THRESHOLD", "0.8")
         try:
@@ -90,20 +129,60 @@ class InputHandler:
             threshold_pct = "80%"
 
         line = Text()
-        line.append(f"{theme.ARROWS} ", style=f"bold {theme.WARN}")
-        line.append("默认模式", style=theme.WARN)
+        line.append(f"{theme.ARROWS} ", style="qs.dim")
+        line.append("shift+tab 切换模式", style="qs.dim")
         line.append(f" {theme.DOT} ", style="qs.dim")
-        # 【第 18.3 轮】补上输入层的真实能力提示：↑↓ 翻历史、←→ 改句子中间，
-        #   这些是第 18 / 18.1 轮加的功能，不写出来用户根本不知道能用。
-        #   只写真实存在的，不照抄截图里"auto mode / for agents"那些没实现的假按钮。
+        # 【第 18.3 轮】补上输入层的真实能力提示：↑↓ 翻历史。
+        #   只写真实存在的，不照抄截图里那些没实现的假按钮。
         line.append("↑↓ 历史", style="qs.dim")
-        line.append(f" {theme.DOT} ", style="qs.dim")
-        line.append("←→ 编辑", style="qs.dim")
         line.append(f" {theme.DOT} ", style="qs.dim")
         line.append("ctrl+c 退出", style="qs.dim")
         line.append(f" {theme.DOT} ", style="qs.dim")
         line.append(f"上下文 {threshold_pct} 自动压缩", style="qs.dim")
         self._console.print(line)
+
+    # ------------------------------------------------------------------
+    # 【2026-11-12 第 33 轮】模式相关的三个入口
+    # ------------------------------------------------------------------
+
+    def set_mode_state(self, mode: str) -> None:
+        """记下当前模式（2026-11-12 第 33 轮新增；33.3 轮去掉 refresh 参数）
+
+        为什么不再有 refresh：底栏从 33.3 轮起不显示模式，所以"模式变了要重画底栏"
+        这件事整个消失了。留着那个参数只会让后来人以为底栏还在跟模式走。
+        现在这里只做一件事——让 cycle_mode() 给状态行上色时能拿到最新的档位。
+        """
+        self._mode = mode
+
+    def set_mode_cycler(self, cycler) -> None:
+        """注入"按快捷键时怎么切模式"的回调（2026-11-12 第 33 轮新增）
+
+        回调签名：() -> (bool, str)。bool 表示有没有真的切成功，
+        第二个是给人看的一句话（已切好 → "已进入计划模式 · ..."）。
+        由 Conversation 在启动时注入，UI 层不反向依赖核心层。
+        """
+        self._mode_cycler = cycler
+
+    def cycle_mode(self):
+        """快捷键切换模式，返回带颜色的提示文字（2026-11-12 第 33 轮新增）
+
+        返回 None 表示没有可用的回调（比如测试里、或还没启动完成），
+        LineEditor 拿到 None 就什么都不做——绝不能让"按了个键"变成一次崩溃。
+
+        为什么由这里上色、而不是 LineEditor 自己：
+          颜色表在 theme.py，LineEditor 只认按键和缓冲区，不该知道模式配色。
+          它拿到一段已经带转义码的文字，原样打到屏幕上就行。
+        """
+        if self._mode_cycler is None:
+            return None
+        try:
+            ok, message = self._mode_cycler()
+        except Exception:
+            # 切换失败不该把用户正在输入的那一行弄没。响一声、保持原样。
+            return None
+        if not ok:
+            return None
+        return theme.mode_ansi(self._mode, message)
 
     async def get_user_input(self, prompt: str = None, completer=None) -> str:
         """
@@ -171,7 +250,7 @@ class InputHandler:
         # THINKER_PLAIN_INPUT=1 的用途：万一自管模式在某个终端/输入法下表现异常
         # （比如中文打不出来），用户设这个变量就能立刻回到原生 input()，
         # 代价只是没有 Tab 补全。留这个口子，是因为真机行为我在测试环境验证不了。
-        return self._editor.readline(prompt, completer)
+        return self._editor.readline(prompt, completer, on_mode_cycle=self.cycle_mode)
 
     # 【2026-11-06 第 8.2 轮】"同意"和"拒绝"的精确词表。
     #   为什么不用原来那种 "yes" in text 的子串匹配？

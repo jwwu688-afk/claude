@@ -183,6 +183,20 @@ class LineEditor:
         """
         self._key_reader = key_reader
         self._msvcrt = None
+        # 【2026-11-12 第 33 轮】"已经读出来、还没被主循环消费"的按键。
+        #   为什么需要它：识别 Shift+Tab 要在读到 \x1b 之后再往前看一到两个字节，
+        #   如果看下来不是 \x1b [ Z，那几个字节已经被读走了、塞不回去
+        #   （msvcrt.ungetch 对中文和宽字符都会抛异常，16.1 轮已经试过）。
+        #   与其丢弃它们（会让用户按方向键时丢字符），不如先存进这个队列，
+        #   read_key 优先从这里取——顺序和真实按键完全一致。
+        self._pushed = []
+        # 【第 33.2 轮】输入行上方是否已经有一条"模式状态行"。
+        #   为 True 时，下一次切换用"上移一行改写"的方式更新它，而不是再插一行。
+        #   这就是"状态可覆盖、日志才追加"那条判断的落地处：
+        #   连按三次 Shift+Tab 应该只在原地闪三下，不是堆三行长句。
+        #   每次 readline 开始都归零——上一行提交后，那条状态行已经是历史输出，
+        #   不能再被"上移"覆盖掉。
+        self._mode_line_visible = False
         if key_reader is None:  # 只有真要读真键盘时才去 import
             try:
                 import msvcrt  # 只有 Windows 有；其他平台直接降级
@@ -243,6 +257,8 @@ class LineEditor:
           现在改成：**所有输入都由本类自己读**，不再往 input() 交还字符，
           自然也就不需要"塞回去"这个动作。
         """
+        if self._pushed:  # 【第 33 轮】被"预读"过的按键优先返回，保证顺序不变
+            return self._pushed.pop(0)
         if self._key_reader is not None:
             return self._key_reader()
         return self._msvcrt.getwch()  # 宽字符版，中文能正确返回
@@ -293,13 +309,16 @@ class LineEditor:
     # 主循环
     # ------------------------------------------------------------------
 
-    def readline(self, prompt: str, completer=None) -> str:
+    def readline(self, prompt: str, completer=None, on_mode_cycle=None) -> str:
         """读一行，支持 Tab 补全、退格、Esc 清空（2026-11-08 第 16 轮新增）
 
         参数 prompt：要显示的提示符（本来要交给 input()，现在是本类自己写的，
                      所以颜色码照常生效——这也是"提示符消失"能一并修掉的原因之一：
                      屏幕上所有字符都由这一处控制，不会再有 rich 和 input() 抢顺序）
         参数 completer：候选来源，见类文档
+        参数 on_mode_cycle（第 33 轮新增）：按 Shift+Tab / Alt+M 时调用的回调，
+                     返回一段**已带颜色**的提示文字；None 表示这次输入不支持切换模式
+                     （授权提问、选编号那些走 input() 的路径本来也到不了这里）。
 
         返回：用户输入的整行（不含末尾回车）
         异常：Ctrl+C 时抛 KeyboardInterrupt，和 input() 行为一致——
@@ -314,6 +333,10 @@ class LineEditor:
         cursor = 0  # 光标在 buffer 里的下标，0=行首，len(buffer)=行尾（第 18.1 轮）
         self._history_index = None  # 每次开始新的一行，历史位置归零
         self._draft = ""  # 草稿也清掉，避免把上一行的半句话带进来
+        # 【第 33 轮】预读队列必须按行清空：上一行末尾若残留一个被预读的字节，
+        # 下一行会凭空多出一个字符，而且看起来像输入法抽风，极难查。
+        self._pushed = []
+        self._mode_line_visible = False  # 【第 33.2 轮】新的一行不继承上一行的状态行
         # 【第 18.8 轮】受控状态是"一行之内"的：每次开始新输入必须归零，
         # 否则上一行长输入留下的 _frame_rows 会让这一行一上来就往历史输出里乱擦。
         self._controlled = False
@@ -366,6 +389,16 @@ class LineEditor:
                         old_text = "".join(buffer)
                         buffer.pop(cursor)
                         self._paint(prompt, old_text, "".join(buffer), cursor)
+                elif code in ("t", "T"):
+                    # 【第 33 轮】Alt+T：切换模式的备用键。
+                    #   为什么需要备用键：Shift+Tab 要靠终端下发 \x1b[Z，
+                    #   而 conhost 不启用 VT 输入时可能把它当成普通的 \t（Tab），
+                    #   那就和补全键撞了、完全区分不出来。Alt+T 走 \x00 前缀，
+                    #   在传统控制台下也能稳定读到，是那条路上的兜底。
+                    #   为什么选 T 而不是 M：EXT_RIGHT 的键码就是 "M"，
+                    #   撞上会把"切模式"变成"光标右移"，是最难查的一类错。
+                    #   T（toggle）不和任何 EXT_* 常量冲突。
+                    self._handle_mode_cycle(on_mode_cycle, prompt, buffer, cursor)
                 # 光标动了就重定位（历史翻页/Delete 已自己重画，跳过）
                 if code in (EXT_LEFT, EXT_RIGHT, EXT_HOME, EXT_END):
                     self._move_cursor(prompt, "".join(buffer), old_cursor, cursor)
@@ -383,11 +416,36 @@ class LineEditor:
                 continue
 
             if ch == KEY_TAB:
-                self._handle_tab(buffer, prompt, completer)
+                # 【第 33.1 轮】多传两个参数：Tab 在"没有可补全内容"时被当成模式切换键，
+                #   需要回调，也需要光标位置（切完要原样重画这一行）。
+                self._handle_tab(buffer, prompt, completer, on_mode_cycle, cursor)
                 cursor = len(buffer)  # 补全后光标统一落到行尾
                 continue
 
             if ch == KEY_ESC:
+                # 【2026-11-12 第 33 轮】先判断这是不是 Shift+Tab。
+                #   为什么要走到这里判：VT 终端把 Shift+Tab 下发成 \x1b [ Z 三个字节，
+                #   第一个字节和 Esc 一模一样。不做区分的话，用户按 Shift+Tab 会
+                #   先触发下面"清空输入"，再把 "[Z" 当普通字符打进输入框——
+                #   既丢了正在打的字，又塞进两个乱码。
+                #   只在三字节完全匹配时才当模式切换；其他组合把读到的字节按原顺序
+                #   还给主循环（见 _pushed），行为和不识别之前完全一致。
+                second = self._read_following_key()
+                if second == "[":
+                    third = self._read_following_key()
+                    if third == "Z" and on_mode_cycle is not None:
+                        self._handle_mode_cycle(on_mode_cycle, prompt, buffer, cursor)
+                        continue
+                    if third is not None:
+                        # 按原顺序压回：先 "[" 再 "Z"，read_key 从头取才不乱序。
+                        # （第一版写反了，按 Shift+Tab 会往输入里塞进 "Z["。）
+                        self._pushed.append(second)
+                        self._pushed.append(third)
+                    else:
+                        self._pushed.append(second)
+                elif second is not None:
+                    self._pushed.append(second)
+
                 # 输入行里按 Esc：清空当前内容（和 Claude Code 一致）。
                 # 注意这和"等模型回复时按 Esc 打断"是两件事，那个由 EscWatcher 负责，
                 # 两者运行时机不重叠：一个在等用户打字，一个在等模型输出。
@@ -413,17 +471,137 @@ class LineEditor:
     # Tab 的具体处理
     # ------------------------------------------------------------------
 
-    def _handle_tab(self, buffer: list, prompt: str, completer) -> None:
-        """按了一次 Tab（2026-11-08 第 16 轮新增）
+    # ------------------------------------------------------------------
+    # 【2026-11-12 第 33 轮】模式切换键
+    # ------------------------------------------------------------------
+
+    def _read_following_key(self):
+        """非阻塞地读一个后续按键，没有就返回 None（第 33 轮新增）
+
+        为什么真实键盘必须非阻塞：这个函数是"往后再看一个字节"用的。
+        如果阻塞等，用户单独按 Esc 时程序会挂在那里，直到他再按一个键——
+        表现为"Esc 清空失效、输入没反应"，比不识别 Shift+Tab 严重得多。
+
+        为什么测试注入的按键源走另一条路：注入的是一个有限迭代器，
+        没有"此刻有没有按键"的概念，kbhit 无从判断。直接读下一个即可——
+        读到的不是 [Z 会由调用方原样压回 _pushed，效果和 peek 一样。
+        序列读完时抛的 StopIteration 在这里转成 None（"没有后续键"）。
+        """
+        if self._key_reader is not None:
+            try:
+                return self._key_reader()
+            except StopIteration:
+                return None
+        if self._msvcrt is None:
+            return None
+        try:
+            if self._msvcrt.kbhit():
+                return self._msvcrt.getwch()
+        except Exception:
+            # 控制台被关掉、或 stdin 不是真终端时 kbhit 可能抛异常。
+            # 这里绝不能让异常冒到主循环——那会把用户正在输入的一行弄没。
+            return None
+        return None
+
+    def _handle_mode_cycle(self, on_mode_cycle, prompt: str, buffer: list, cursor: int) -> None:
+        """按到切换键：切模式，并把结果提示插到输入行上方（第 33 轮新增）
+
+        参数 on_mode_cycle：回调，返回一段已带颜色的提示文字；None 表示不支持。
+        参数 buffer / cursor：当前正在编辑的内容，用来重画——**不能丢**，
+          用户可能已经打了两百字，因为按了一下 Shift+Tab 就没了是不可接受的。
+
+        为什么提示插在输入行**上方**而不是下方：
+          下方紧接着就是这条输入的后续输出，插在那里会让"正在编辑的行"
+          和"它所属的提示"分家，看起来像两条无关的内容。
+          做法是"清掉当前行 → 打提示 → 重画提示符和已输入内容"。
+
+        为什么受控帧（多行输入）下只响一声、不打印：
+          受控帧的行数、光标所在行都是第 18.8 轮一步步写出来的状态。
+          中途往上面插一行会让 _frame_rows / _frame_cursor_row 全部失效，
+          屏幕上出现残影——那正是 18.8 轮花整轮才修掉的东西。
+          多行输入时用户按 Shift+Tab 的诉求（切模式）已经生效，
+          少一次即时提示，换来的是屏幕不会乱；这一行提交后底栏就是新颜色。
+        """
+        if on_mode_cycle is None:
+            self._bell()
+            return
+        message = on_mode_cycle()
+        if not message:
+            # 回调返回空：说明没切成（未知模式、或回调内部异常）。
+            # 响一声告诉用户"按到了，但没生效"，不要静默吞掉。
+            self._bell()
+            return
+        if self._controlled:
+            # 多行输入（受控帧）下不往上插行：_frame_rows / _frame_cursor_row 是
+            # 第 18.8 轮一步步写出来的状态，插一行会让它们全部失效，屏幕留残影。
+            # 模式本身已经切好了，底栏会在这一行提交后更新；这里静默返回，
+            # **不响铃**——响铃会让用户以为按键没生效（那正是 33.1 轮前的症状）。
+            return
+
+        old_text = "".join(buffer)
+
+        if self._mode_line_visible:
+            # 【第 33.2 轮】已经有状态行：上移一行改写它，输入行本身一动不动。
+            #   这就是"连按三次只闪一下、不堆三行"的实现。
+            #   为什么不一并重画输入行：内容没变，重画只会闪一下，
+            #   而且多一次光标定位就多一次算错的机会（第 18.8 轮的血泪）。
+            self._write("\x1b[1A\r\x1b[2K")  # 上移一行 → 回行首 → 清整行
+            self._write(message)  # 写新状态（颜色由回调带）
+            self._write("\x1b[1B\r")  # 下移一行，回到输入行行首
+            offset = display_width(prompt) + display_width(old_text[:cursor])
+            if offset:
+                # 右移到原来那一列。用 display_width 而不是 len：
+                # 中文占两列，按字符数算会把光标停在半个字上（第 16.2 轮）。
+                self._write("\x1b[{}C".format(offset))
+            return
+
+        # 第一次：擦掉当前输入行，状态行写在它上面，再把输入行重画一遍。
+        self._write("\r\x1b[2K")  # 回车 + 清整行，把当前输入行擦掉
+        self._write(message + "\n")  # 提示占一行，颜色由回调带
+        self._write(prompt + old_text)  # 把提示符和已输入内容原样重画
+        self._mode_line_visible = True  # 下一次切换走上面的覆盖分支
+        if cursor < len(buffer):
+            # 光标原来停在中间：重画后光标在行尾，按可见列数退回去。
+            self._write("\x1b[{}D".format(display_width(old_text[cursor:])))
+
+    def _handle_tab(self, buffer: list, prompt: str, completer, on_mode_cycle=None, cursor=None) -> None:
+        """按了一次 Tab（2026-11-08 第 16 轮新增；第 33.1 轮加了"模式切换"这一路）
 
         参数 buffer 是**原地修改**的：这样调用方不用接收返回值，
         和 readline 里其他键的处理方式保持一致。
+
+        【第 33.1 轮：为什么 Tab 也要能切模式】
+          实测在 conhost 传统模式下，Shift+Tab 和 Tab 送给 getwch 的都是同一个
+          `\\t`（0x09）——控制台压根没有把"按没按 Shift"这件事告诉字符流。
+          所以第 33 轮那条 `\\x1b[Z` 的路在这种终端上永远不会触发，
+          按 Shift+Tab 只会走进本函数、发现没有候选，然后响铃。
+          用户看到的就是"按了没反应，还响一声"。
+
+          解决办法不是去改控制台模式（启用 VT 输入会让现有方向键的
+          `\\x00/\\xe0` 解码全部失效，风险远大于收益），而是换一个判据：
+          **Tab 只在输入以 "/" 开头时才有补全语义**，其余情况它本来只是个
+          无效操作（响一声就完了）。把"无效操作"改成"切换模式"，
+          成本为零，而在任何终端上 Shift+Tab 都等效于 Tab——
+          于是这一键在哪儿都能用了。
+
+          为什么不干脆把 Tab 整个让给模式：`/cos<Tab>` 补全成 `/cost` 是
+          第 16 轮的核心功能，不能丢。两个语义按"输入有没有斜杠开头"天然分开，
+          不需要用户记两套规则。
         """
+        text = "".join(buffer)
+
+        # 不是命令补全的场景 → 当成模式切换。
+        #   cursor 为 None 时取行尾（调用方没传就说明光标本来就在末尾）。
+        if on_mode_cycle is not None and not text.startswith("/"):
+            self._handle_mode_cycle(
+                on_mode_cycle, prompt, buffer, len(buffer) if cursor is None else cursor
+            )
+            return
+
         if completer is None:
             self._bell()
             return
 
-        text = "".join(buffer)
         try:
             candidates = completer(text) or []
         except Exception:

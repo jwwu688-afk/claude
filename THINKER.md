@@ -69,6 +69,7 @@ thinker mcp remove 12306                     # 别名 rm
 /compact                           立刻压缩一次上下文（不等 80%，会调一次摘要模型）
 /clear                             清空上下文并开一个新会话（旧会话文件保留，可 /resume 回去）
 /agents                            列出子 agent 类型、工具白名单、模型与来源（每次执行都会重扫 .thinker/agents）
+/mode [default|plan|accept|auto]   查看或切换工作模式（四档）；不带参数列出全部并标出当前档
 /mcp                               MCP 运行时状态：哪些连上了、各自几个工具、谁失败/被跳过
 /model                            列出可选模型并切换（只影响本次进程，不写回 .env）
 /skills [reload|install <地址>]    列出技能；reload 重扫；install 从 GitHub 地址/本地目录装新技能
@@ -150,7 +151,7 @@ argument-hint: [文件路径]
 - **参考密度**：注释行占总有效行的 **60%~75%**。标杆是 `core/session.py`（76%）和 `core/prompt/memory.py`（62%）。低于 50% 基本要返工。
 - **写完自检**：跑一段统计确认密度达标，别凭感觉。
 
-```python
+```bash
 # 自检命令（在项目根执行）
 python -c "
 lines = open('src/core/xxx.py', encoding='utf-8').read().splitlines()
@@ -178,6 +179,20 @@ print(f'有效行 {total}，注释 {c+doc}，占比 {(c+doc)/total:.0%}')
 - **不要让「技能正文」影响权限判定**。技能只是文字：正文写"直接 rm -rf 不用问"也不生效，
   `classify()` 只看工具名和参数。所以也不要加 `allowed-tools`——那等于开一个
   "仓库里的文本能让权限变松"的口子；要免审批就去做 `classify()` 里的用户允许清单。
+- **当前模式不要写进系统提示词**。`PromptManager` 里只放 `MODE_SECTION`（"有哪四档"的固定文字），
+  当前档位由 `core/modes.mode_reminder()` 附在每轮工具结果的尾部。把 `conversation.mode` 拼进
+  系统提示词，等于每切一次模式就让前缀缓存整段失效——`/cost` 里的命中率会直接掉下来。
+- **模式约束只在权限层实现**（`classify()` 的 plan 分支）。第 33 轮曾经在清单层剪掉写工具、
+  在 `_is_tool_allowed` 再拦一次，第 33.5 轮把这两层都撤了：模型看不到工具就写不出
+  「用 file_edit 改 foo.ts:42」这种可执行方案，cmd_runner 也会被白名单卡死。
+  现在工具照常下发，能不能执行只由 classify 判——**别再往清单层加模式过滤**。
+- **子 agent 的白名单与模式无关**。它只受 `AgentSpec.tools` 约束（"子 agent 永远比父更窄"），
+  模式由父、子共用的 classify 统一裁决。不要再把两者取交集——那是清单层剪枝时代的写法。- **conhost 不区分 Shift+Tab 与 Tab**：两者送给 `getwch()` 的都是 `\t`，控制台不会把 Shift 状态告诉字符流。
+  所以 Tab 在 `LineEditor._handle_tab` 里承担两个语义：`/` 开头是补全，其余是切模式。
+  别再试图"靠 `\x1b[Z` 识别 Shift+Tab"作为主路径——那只在启用了 VT 输入的终端上成立（第 33.1 轮）。
+- **模式切换只刷新状态行，不要打日志**。`LineEditor._handle_mode_cycle` 用"上移一行改写"
+  覆盖上一次的状态（`_mode_line_visible`），文案来自 `modes.status_line()`，必须短。
+  想加"已进入 X · 说明"这种句子前先想清楚：那是日志，连按三次就会在屏幕上堆三行（第 33.2 轮）。
 
 ## 已知的坑
 

@@ -29,6 +29,32 @@ class McpTool(BaseTool):
     def get_tool_name():
         return ""  # 静态方法返回空字符串，因为真正的名字要从 self.tool.name 取（每个外部工具都不一样）
 
+    @property
+    def is_readonly(self) -> bool:
+        """服务器有没有声明"这个工具只读"（2026-11-13 第 33.5 轮新增）
+
+        MCP 规范里 Tool 带一个 annotations，其中 readOnlyHint 表示"调用它不会
+        改动任何东西"。计划模式要用这个信息：声明了的直接放行，没声明的只能问用户。
+
+        三种情况都要兼容，因为不同 mcp 版本 / 不同服务器写法不一致：
+          1. annotations 是对象、字段叫 readOnlyHint（mcp 的 pydantic 模型，camelCase）；
+          2. annotations 是对象、字段叫 read_only_hint（Python 习惯写法）；
+          3. annotations 干脆是 dict（有些服务器直接透传 JSON）。
+
+        取不到一律返回 False——**没声明就当能写**，这是安全方向：
+        大不了多问用户一次，而不是把一个会提交工单的工具静默放出去。
+        """
+        annotations = getattr(self.tool, "annotations", None)
+        if annotations is None:
+            return False
+
+        hint = getattr(annotations, "readOnlyHint", None)
+        if hint is None:
+            hint = getattr(annotations, "read_only_hint", None)
+        if hint is None and isinstance(annotations, dict):
+            hint = annotations.get("readOnlyHint", annotations.get("read_only_hint"))
+        return bool(hint)
+
     async def act(self, **kwargs):
         # 执行：把参数原样转发给远程服务器，等它返回结果
         try:  # 试

@@ -20,6 +20,7 @@
 # 上面说明：这段是照 MCP 官方文档的示例改的
 
 import asyncio  # 用来创建后台任务
+import os  # 【第 33.5.2 轮】合并子进程环境变量时要读当前进程的 os.environ
 import shutil  # 【第 30.1 轮】把配置里的裸命令（npx / python）解析成真实可执行路径
 import sys  # 【第 32 轮】打不开日志文件时，退回把 MCP 子进程的 stderr 交给它
 from typing import Dict, List, Optional  # 类型标注工具（Dict/List 供 /mcp 的状态快照使用）
@@ -195,13 +196,26 @@ class MCPClient:
                 #   原来只要有一个服务器启动失败（路径写错、依赖没装），
                 #   异常会一路抛到 get_connected()，导致所有外部工具都用不了，
                 #   甚至让程序启动阶段就报错。现在改成"坏的跳过，好的继续"。
+                #
+                # 【第 33.5.2 轮】支持配置文件里的 env（给单个服务器设代理 / API key）。
+                #   为什么要和 os.environ 合并、而不是直接传 server.env：
+                #     stdio_client 拿到 env 之后是**整体替换**子进程的环境，
+                #     只给 {"HTTPS_PROXY": ...} 会让子进程丢掉 PATH、SystemRoot、
+                #     APPDATA 这些必需变量——Windows 下最直接的表现就是"进程起不来"，
+                #     而且错误信息只会说连不上，极难定位。
+                #   没有配 env 时仍然传 None：少一次字典复制，语义上也更清楚
+                #     （None = 完全继承父进程）。
+                child_env = None
+                if server.env:
+                    child_env = {**os.environ, **server.env}
+
                 server_params = StdioServerParameters(
                     # 【第 30.1 轮】先解析成真实路径再启动：Windows 上 "npx" 会被
                     #   CreateProcess 补成 npx.exe（不存在），而 npm 装的是 npx.cmd。
                     #   不解析的话，配置一字不差也会连接失败。详见 resolve_command 的注释。
                     command=resolve_command(server.command),  # 用哪个程序来启动它
                     args=server.args,  # 启动参数（比如要运行哪个 .py 文件）
-                    env=None  # 环境变量：None 表示直接继承当前程序的环境变量
+                    env=child_env  # 合并后的环境变量；None = 直接继承父进程
                 )
 
                 stdio_transport = await self.exit_stack.enter_async_context(

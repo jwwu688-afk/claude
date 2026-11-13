@@ -21,16 +21,26 @@ from typing import List, Dict, Optional  # 类型标注工具
 
 class MCPServer:
     # 一个"服务器"的配置。就是个装数据的容器
-    def __init__(self, name: str, type_: str, command: str, args: List[str]):
+    def __init__(self, name: str, type_: str, command: str, args: List[str], env: Optional[Dict[str, str]] = None):
         # 注意 type_ 后面带下划线，是因为 type 是 Python 的内置函数名，不能直接当变量名
         self.name = name  # 服务器名字
         self.type = type_  # 连接类型（目前只支持 stdio）
         self.command = command  # 用哪个程序启动
         self.args = args  # 启动参数列表
+        # 【2026-11-13 第 33.5.2 轮】这个服务器额外需要的环境变量。
+        # 为什么现在才加：之前 client 里写死了 env=None（直接继承父进程），
+        # 配置里就算写了 env 也不会生效。要给自己加代理、设 API key 的服务器
+        # （比如走 HTTP 的搜索工具）只能去改系统环境变量，等于没配。
+        # 空字典表示"没有额外变量"，client 那边会走继承父进程的最短路径。
+        self.env: Dict[str, str] = dict(env or {})
 
     def __repr__(self):
         # __repr__ 决定"直接打印这个对象时显示什么"
-        return f"<MCPServer name={self.name}, type={self.type}, command={self.command}, args={self.args}>"
+        # 只打 key 不打 value：env 里可能有 token，日志和报错都可能被贴到别处
+        return (
+            f"<MCPServer name={self.name}, type={self.type}, command={self.command}, "
+            f"args={self.args}, env_keys={sorted(self.env)}>"
+        )
 
 
 class MCPConfig:
@@ -106,7 +116,22 @@ class MCPConfig:
                     self.skipped[name] = "args 应该是列表（用 [ ]）"
                     continue
 
-                self.servers[name] = MCPServer(name=name, type_=type_, command=command, args=args)
+                # 【第 33.5.2 轮】可选的 env：给了就只影响这个子进程。
+                #   校验从宽：值统一转成字符串（JSON 里写 7890 会被解析成整数，
+                #   而子进程的环境变量必须是字符串），键必须是字符串。
+                #   整个 env 写错（比如给成列表）时不跳过服务器，只忽略这一段并提示一行——
+                #   "代理配错了"不该让原本能用的服务器整个连不上。
+                raw_env = info.get("env", {})
+                env: Dict[str, str] = {}
+                if raw_env:
+                    if isinstance(raw_env, dict):
+                        env = {str(key): str(value) for key, value in raw_env.items()}
+                    else:
+                        print(f"[MCP] 服务器 {name} 的 env 应该是对象（用 {{ }}），已忽略该字段")
+
+                self.servers[name] = MCPServer(
+                    name=name, type_=type_, command=command, args=args, env=env
+                )
                 # 包装成对象，存进字典
             except Exception as e:  # 兜底：万一还有没想到的情况
                 print(f"[MCP] 服务器 {name} 加载失败（{e}），已跳过")

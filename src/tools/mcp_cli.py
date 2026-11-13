@@ -65,7 +65,7 @@ import shutil  # 判断命令在不在 PATH 里（which）
 from pathlib import Path  # 判断绝对路径形式的命令是否存在
 # 只用到这三个：参数是 list、name 在解析完成前可能是 None、解析结果是一个四元组。
 # 项目下限是 3.9，`list[str]` 能用但 `str | None` 不能，所以 Optional 不能省。
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from rich import box  # 表格边框样式（SIMPLE：只有表头一条横线，最不打扰）
 from rich.table import Table  # 列对齐的表格：手写空格对齐在中文宽度下一定错位
@@ -105,9 +105,13 @@ _HELP_TEXT = """\
 
 add 的选项：
   -t, --transport <类型>   连接类型，目前只有 stdio（默认就是 stdio）
+  -e, --env KEY=VALUE      给这个服务器单独设环境变量，可写多次
+                           最常见的用法是配代理：
+                           -e HTTPS_PROXY=http://127.0.0.1:7890
 
 示例：
   thinker mcp add 12306 -- npx -y 12306-mcp
+  thinker mcp add duckduckgo -e HTTPS_PROXY=http://127.0.0.1:7890 -- C:/tools/duckduckgo-mcp.exe
   thinker mcp list
   thinker mcp remove 12306
 
@@ -193,7 +197,7 @@ def _cmd_add(tokens: List[str]) -> int:
     任何一步失败都发生在写盘之前，所以「报错了但文件被改了一半」在结构上不可能出现。
     反过来写（先读文件、边解析边改）就得靠人记得在每个 return 前回滚。
     """
-    name, transport, command, args = _parse_add_args(tokens)
+    name, transport, command, args, env = _parse_add_args(tokens)
 
     if transport != "stdio":
         # 这条不是「暂不支持，敬请期待」的客套话：客户端代码里根本没有 http/sse 的通道，
@@ -207,11 +211,14 @@ def _cmd_add(tokens: List[str]) -> int:
     servers = data["mcpServers"]
     replaced = name in servers  # 记住是不是覆盖，输出提示要说清楚（「已添加」和「已更新」不是一回事）
 
-    # 刻意只写 type/command/args 三项：
+    # 写三项必填 + 可选的 env（第 33.5.2 轮）：
     #   type 显式写 "stdio"，是为了让人直接看文件时也知道这是 stdio（缺省虽然也能跑）；
-    #   env 之类的字段本版本客户端还不支持，命令里也就不提供，避免「配了却不生效」。
-    # list(args) 复制一份：调用方的 list 和这里存进去的对象不该共享引用。
-    servers[name] = {"type": "stdio", "command": command, "args": list(args)}
+    #   env 只在用户真的写了 -e 时才写进去，避免每台服务器都挂一个空对象。
+    # list(args) / dict(env) 复制一份：调用方的对象和这里存进去的不该共享引用。
+    entry = {"type": "stdio", "command": command, "args": list(args)}
+    if env:
+        entry["env"] = dict(env)
+    servers[name] = entry
     backup_path = save_config_dict(path, data)  # 备份 + 原子写；失败会抛 MCPConfigError
 
     # 下面四行输出各管一件事，缺一行用户就得多做一步：
@@ -222,6 +229,10 @@ def _cmd_add(tokens: List[str]) -> int:
     verb = "已更新" if replaced else "已添加"
     console.print(Text(f"  {CHECK_ON} {verb} {name}", style=OK))
     console.print(Text(f"    命令：{_join_command(command, args)}", style=DIM))
+    if env:
+        # 只打 key 不打 value：env 里通常是代理地址或 API key，
+        # 打出来会被截图、日志、聊天记录带走。
+        console.print(Text(f"    环境变量：{'、'.join(sorted(env))}（值已隐藏）", style=DIM))
     console.print(Text(f"    配置：{path}", style=DIM))
     if backup_path is not None:  # 首次创建文件时没有旧文件，也就没有备份，不打印这一行
         console.print(Text(f"    旧文件已备份：{backup_path.name}", style=DIM))
@@ -236,7 +247,7 @@ def _cmd_add(tokens: List[str]) -> int:
     return 0
 
 
-def _parse_add_args(tokens: List[str]) -> Tuple[str, str, str, List[str]]:
+def _parse_add_args(tokens: List[str]) -> Tuple[str, str, str, List[str], Dict[str, str]]:
     """把 add 后面的 token 折成（名字, 连接类型, 命令, 参数）
 
     支持两种写法：
@@ -262,6 +273,9 @@ def _parse_add_args(tokens: List[str]) -> Tuple[str, str, str, List[str]]:
     """
     name: Optional[str] = None
     transport = "stdio"  # 默认 stdio：这是唯一支持的类型，也就没必要强制用户写 -t
+    # 【第 33.5.2 轮】-e/--env 收集到的环境变量。只在 -- 之前有效——
+    #   -- 之后的东西一律属于子进程，写 `-e` 也不会被我们吃掉。
+    env: Dict[str, str] = {}
     index = 0
 
     # 用 while + 手写游标，而不是 for + enumerate：
@@ -286,6 +300,33 @@ def _parse_add_args(tokens: List[str]) -> Tuple[str, str, str, List[str]]:
             transport = token.split("=", 1)[1]
             if not transport:  # "--transport=" 后面空着
                 raise _CliError("--transport= 后面要跟类型")
+            index += 1
+            continue
+
+        if token in ("-e", "--env"):
+            # 【第 33.5.2 轮】给这个服务器单独设环境变量，最典型的用法是配代理：
+            #   thinker mcp add duckduckgo -e HTTPS_PROXY=http://127.0.0.1:7890 -- C:/.../duckduckgo-mcp.exe
+            # 为什么必须在写盘前校验格式：KEY=VALUE 写错（少等号、key 为空）
+            #   会让子进程拿到一个空名字的变量，报错却是"服务器启动失败"，
+            #   方向和真正的原因差得很远。这里直接指出是命令写错了。
+            if index + 1 >= len(tokens):  # 只写了 -e 没写值
+                raise _CliError(f"{token} 后面要跟 KEY=VALUE，例如 -e HTTPS_PROXY=http://127.0.0.1:7890")
+            pair = tokens[index + 1]
+            key, separator, value = pair.partition("=")
+            if not separator or not key.strip():
+                raise _CliError(f"环境变量要写成 KEY=VALUE，收到的是：{pair}")
+            env[key.strip()] = value
+            index += 2  # 一次吃掉「选项 + 它的值」两个 token
+            continue
+
+        if token.startswith("--env="):
+            # 等号写法：--env=KEY=VALUE。只切第一个等号后面的都留给值，
+            # 因为值本身可能带等号（base64、查询串都会出现）。
+            pair = token.split("=", 1)[1]
+            key, separator, value = pair.partition("=")
+            if not separator or not key.strip():
+                raise _CliError(f"环境变量要写成 --env=KEY=VALUE，收到的是：{token}")
+            env[key.strip()] = value
             index += 1
             continue
 
@@ -328,7 +369,8 @@ def _parse_add_args(tokens: List[str]) -> Tuple[str, str, str, List[str]]:
 
     # 第一个 token 是可执行文件，其余是它的参数；两者分开存，因为配置文件里
     # command / args 是两个键（stdio_client 也按这个结构启动子进程）。
-    return name, transport, command_tokens[0], command_tokens[1:]
+    # env 是第 33.5.2 轮加的：只在子进程里生效，不污染全局环境。
+    return name, transport, command_tokens[0], command_tokens[1:], env
 
 
 def _validate_name(name: str) -> None:
