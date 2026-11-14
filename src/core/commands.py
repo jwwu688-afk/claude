@@ -71,6 +71,7 @@
 # =============================================================================
 
 import os  # /resume 按 cwd 过滤"本项目的会话"；/init 要拼 THINKER.md 的路径
+import time  # 【第 36 轮】/resume 显示"最后修改时间"，要把它格式化成 "YYYY-MM-DD HH:MM"
 from dataclasses import dataclass  # 用一个"只装字段"的小类描述命令，省掉手写 __init__
 from typing import Awaitable, Callable, Dict  # handler 是"异步函数"，注册表是字典
 
@@ -457,7 +458,14 @@ async def cmd_resume(conversation, args: str) -> None:
         ui.print_error("子 agent 里不能用 /resume。")
         return
 
-    sessions = SessionStore.list_sessions(_cwd())  # 新的在前（文件名以时间开头）
+    # 【2026-11-14 第 36 轮】按"最后修改时间"倒序，不再按文件名（=创建时间）。
+    #   用户的说法是"距离我最后修改时间越短的越放前面"，这也符合挑会话时的直觉：
+    #   想知道的是"我最近在聊哪个"，而不是"哪个文件先被创建"。
+    #   一个典型的坏情况（改前）：上午新建的会话只问了一句就丢下，
+    #   下午一直在用的那个是三天前建的 —— 按创建排，下午在用的那个排在下面。
+    #   注意这里只是**本命令**的口径，list_sessions 的默认顺序没动
+    #   （--continue 依赖它，理由见 list_sessions 的文档字符串）。
+    sessions = SessionStore.list_sessions(_cwd(), order="modified")
     if not sessions:
         ui.print_warning("这个目录下还没有任何历史会话。")
         return
@@ -484,7 +492,16 @@ async def cmd_resume(conversation, args: str) -> None:
         info = inspect_session(path)
         messages, header = info["raw"], info["header"]
 
-        started = header.get("started_at", "")[:16].replace("T", " ")
+        # 【第 36 轮】时间列跟着排序口径走：按修改时间排，就显示修改时间。
+        #   不跟着改的话，列表会出现"上面的时间比下面的还早"这种自相矛盾的画面，
+        #   用户只会觉得排序坏了——明明排对了，却看不出排对了。
+        modified = SessionStore.modified_time(path)
+        if modified:
+            stamp = time.strftime("%Y-%m-%d %H:%M", time.localtime(modified))
+        else:
+            # 取不到 mtime（文件刚被删、网络盘断开）时退回创建时间。
+            # 宁可显示一个略旧但真实的时间，也不要显示空字符串或 "1970-01-01"。
+            stamp = header.get("started_at", "")[:16].replace("T", " ")
         # "2026-11-07T23:47:12" → "2026-11-07 23:47"。
         # 去掉秒和 T：列表里不需要精确到秒，短一点更好扫。
 
@@ -496,7 +513,7 @@ async def cmd_resume(conversation, args: str) -> None:
         # 压缩过的加个后缀，免得他以为 803 条凭空消失了（原始记录仍在文件里）。
         count = len(info["effective"])
         suffix = "（压缩后）" if info["compacted"] else ""
-        labels.append(f"{started}  {count:>3} 条{suffix}  {preview}{mark}")
+        labels.append(f"{stamp}  {count:>3} 条{suffix}  {preview}{mark}")
         # {len(messages):>3} 右对齐到 3 位：条数会从个位变到三位，
         # 不补齐的话后面的预览会参差不齐。
 

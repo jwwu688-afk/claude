@@ -356,11 +356,25 @@ class SessionStore:
     # 3.3 找历史会话
     # -------------------------------------------------------------------------
     @classmethod
-    def list_sessions(cls, cwd: Optional[str] = None) -> List[Path]:
-        """列出会话文件，新的在前（2026-11-07 第 13 轮）
+    def list_sessions(cls, cwd: Optional[str] = None, order: str = "created") -> List[Path]:
+        """列出会话文件（2026-11-07 第 13 轮；2026-11-14 第 36 轮加 order）
 
         参数 cwd 给了就只返回这个目录下的会话——在不同项目里
         `--continue` 应该接着本项目的上一次，而不是另一个项目的话题。
+
+        【order 的两种口径，为什么做成参数而不是把全局顺序改掉】
+          "created"（默认）：按文件名倒序。文件名以时间开头，等于**创建时间**倒序。
+            文件被复制、从备份恢复时 mtime 会被重置成"刚刚"，按 mtime 排会把它
+            插到最前面——对 `--continue` 来说就是接错会话。所以默认值保持原样。
+          "modified"：按最后修改时间倒序，`/resume` 列表用这个。
+            用户挑会话时想的不是"哪个先建的"，而是"我最后动过哪个"：
+            一个开了三天还在用的长会话，创建时间是三天前，按 created 排会被挤到
+            列表下方，而它恰恰是最该点的那一条。
+
+          【为什么不做成全局唯一口径】
+            /clean 的"多少天没动"判定和 --continue 的"最近一次"都依赖 created 的
+            稳定性。改全局顺序等于同时改三处行为，而且失败方式很隐蔽（接错会话）。
+            所以策略放在调用点：谁需要哪种口径，谁在调用时说明。
         """
         directory = SESSIONS_DIR.expanduser()
 
@@ -375,24 +389,47 @@ class SessionStore:
             return []  # 从没开过会话，或者目录被清空了
 
         if cwd is None:
-            return files  # 不筛项目，全都返回
+            matched = files  # 不筛项目，全都返回
+        else:
+            want = str(Path(cwd).resolve()).lower()
+            # 两边都转小写比较：Windows 路径大小写不敏感，
+            # D:\Code\Thinker 和 d:\code\thinker 应该被当成同一个项目。
+            matched = []
+            for path in files:
+                # 【第 36 轮】改用 read_header：只读第一行，不再为了拿 cwd
+                #   把整份会话读进来。改前这里调 cls.load()，一个 1.5 MB 的会话
+                #   就为开头一百来字节整份读一遍；归档更贵，还要整份解压。
+                #   header 就是第一行，读一行的代价与文件大小无关。
+                header = read_header(path)
+                if str(header.get("cwd", "")).lower() == want:
+                    matched.append(path)
 
-        want = str(Path(cwd).resolve()).lower()
-        # 两边都转小写比较：Windows 路径大小写不敏感，
-        # D:\Code\Thinker 和 d:\code\thinker 应该被当成同一个项目。
-        matched = []
-        for path in files:
-            # 【第 36 轮】改用 read_header：只读第一行，不再为了拿 cwd
-            #   把整份会话读进来。改前这里调 cls.load()，一个 1.5 MB 的会话
-            #   就为开头一百来字节整份读一遍；归档更贵，还要整份解压。
-            #   header 就是第一行，读一行的代价与文件大小无关。
-            header = read_header(path)
-            if str(header.get("cwd", "")).lower() == want:
-                matched.append(path)
+        if order == "modified":
+            # 取不到 mtime 的返回 0（见 modified_time），倒序后自然落到底部：
+            # 排序永远不该因为一个坏文件抛异常——列表里少一个，总比整条 /resume 崩掉好。
+            matched = sorted(matched, key=cls.modified_time, reverse=True)
         return matched
         # 说明：读一行虽然便宜，但仍是"每个文件一次"，文件极多时
         # （上千个）会有几十毫秒开销。真要再快，得把 cwd 编进文件名——
         # 那样名字会变得很难看，不值得。
+
+    @staticmethod
+    def modified_time(path) -> float:
+        """会话文件的最后修改时间（epoch 秒）（2026-11-14 第 36 轮新增）
+
+        为什么不各处直接写 path.stat().st_mtime：`/resume` 的排序和显示都要用，
+        而 stat 可能失败（文件在"取列表"和"读这一项"之间被删掉、网络盘断开）。
+        失败时返回一个**能参与排序的值**，而不是抛异常——调用点在画列表的热路径上，
+        一个坏文件不该让整条命令崩。
+
+        为什么是 0.0：0 在倒序排序里天然落到底部，语义正好等于
+        "这条会话的时间信息不可信，先别让人选它"，而这个语义不必写在调用方。
+        """
+        try:
+            return Path(path).stat().st_mtime
+        except OSError:
+            return 0.0
+
 
     @classmethod
     def latest(cls, cwd: Optional[str] = None) -> Optional[Path]:
@@ -493,7 +530,8 @@ class SessionStore:
                 continue  # 已经是归档：重复调用不报错，直接跳过
 
             try:
-                before = path.stat().st_size
+                original = path.stat()  # 一次拿到大小和 mtime，下面两处都要用
+                before = original.st_size
                 text = _read_text(path)
                 if not text:
                     # 读不出内容（文件坏了 / 没权限）：不压也不删。
@@ -506,6 +544,20 @@ class SessionStore:
                 with gzip.open(tmp, "wt", encoding="utf-8") as handle:
                     handle.write(text)
                 os.replace(tmp, target)  # 这一刻起归档是完整可读的
+                # 【2026-11-14 第 36 轮】把原文件的修改时间搬到归档上。
+                #   不搬的话，归档时间就是"压缩那一刻"，于是：
+                #     · /resume 按最后修改时间排序时，三个月前的会话会顶着
+                #       "刚刚"的时间戳排到第一位（用户会以为记录乱了）；
+                #     · /clean 自己靠 mtime 判断"多少天没动"，归档后这个判断
+                #       对 .jsonl.gz 就永久失效（它永远看起来是刚动过的）。
+                #   归档是原文件的替身，时间戳应当跟着走——这不是美化，
+                #   是让两处依赖 mtime 的逻辑继续成立。
+                try:
+                    os.utime(target, (original.st_atime, original.st_mtime))
+                except OSError:
+                    # 某些文件系统不让改时间戳。归档本身已经写成功了，
+                    # 为一个元数据失败把整次压缩判失败、还留着原文，不划算。
+                    pass
                 after = target.stat().st_size
 
                 # 【第 35 轮】压完没变小就撤销。

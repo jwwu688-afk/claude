@@ -256,6 +256,63 @@ def test_resume(tmp_root, project_dir):
         commands._cwd = old_cwd
 
 
+def test_resume_order_by_modified(tmp_root, project_dir):
+    """/resume 按"最后修改时间"倒序：最后动过的会话排最前（2026-11-14 第 36 轮）
+
+    造三个会话，让**创建顺序**和**最后修改顺序**故意相反：
+      早创建、晚修改  → 应该排第一
+      晚创建、早修改  → 应该排最后
+    改前的实现按文件名（=创建时间）排，会把"最后动过的"挤到下面去。
+    """
+    print("测试: /resume 按最后修改时间排序")
+    old_sessions_dir = session_module.SESSIONS_DIR
+    old_cwd = commands._cwd
+    session_module.SESSIONS_DIR = Path(tmp_root) / "sessions_order"
+    session_module.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    commands._cwd = lambda: str(project_dir)
+    try:
+        # 用固定文件名造三个会话，文件名顺序 = A < B < C（=创建顺序）。
+        # 这些文件的 header 里 cwd 会写成 sessions_order 目录（_write_old_session 的行为），
+        # 而 /resume 按 project_dir 过滤——所以这里直接造在 project_dir 的 cwd 上，
+        # 就得手写 header，不能复用 _write_old_session（它把 cwd 写成 directory）。
+        # 干脆自己写三个最小会话文件，header.cwd 指向 project_dir。
+        def _write(name, preview, mtime_delta):
+            p = session_module.SESSIONS_DIR / name
+            lines = [
+                json.dumps({"type": "header", "cwd": str(project_dir), "started_at": "2026-01-01T10:00:00"}),
+                json.dumps({"type": "message", "ts": 1763000000, "message": {"role": "user", "content": [{"type": "text", "text": preview}]}}, ensure_ascii=False),
+            ]
+            p.write_text("\n".join(lines) + "\n", encoding="utf-8")
+            stamp = time.time() + mtime_delta  # mtime_delta 为负 = 过去
+            os.utime(p, (stamp, stamp))
+            return p
+
+        # 创建顺序 A→B→C（文件名递增），最后修改顺序 C→B→A（mtime 递增），正好相反。
+        path_a = _write("20260101-000000-aaaa.jsonl", "最早创建", -10)
+        path_b = _write("20260102-000000-bbbb.jsonl", "中间创建", -100)
+        path_c = _write("20260103-000000-cccc.jsonl", "最晚创建", -1000)
+
+        ui = FakeUI()
+        conv = FakeConv(ui)
+        asyncio.run(commands.cmd_resume(conv, ""))
+
+        items = ui.choice_items or []
+        check("列出了三个会话", len(items) == 3, f"实际 {len(items)}")
+        if len(items) == 3:
+            # 用预览里的独特词定位每一项在列表里的位置，比解析时间戳稳（本地时区无关）。
+            pos_a = next(i for i, x in enumerate(items) if "最早创建" in x)
+            pos_b = next(i for i, x in enumerate(items) if "中间创建" in x)
+            pos_c = next(i for i, x in enumerate(items) if "最晚创建" in x)
+            check("最后修改的排最前", pos_a < pos_b < pos_c, f"A/B/C 位置 {pos_a}/{pos_b}/{pos_c}")
+        if items:
+            # 时间列应显示修改时间而非创建时间：A 的 mtime 是"刚刚"（今天），
+            # 而它的创建日期是 2026-01-01。列表里不该再出现那个旧日期。
+            check("时间列显示修改时间而非创建时间", "2026-01-01" not in items[0], items[0])
+    finally:
+        session_module.SESSIONS_DIR = old_sessions_dir
+        commands._cwd = old_cwd
+
+
 def test_init(tmp_root):
     print("测试: /init")
     workdir = Path(tmp_root) / "init_proj"  # 单独一个目录，别和 /resume 用的 proj 抢
@@ -623,6 +680,8 @@ if __name__ == "__main__":
         test_memory(tmp_root)
         print()
         test_resume(tmp_root, project_dir)
+        print()
+        test_resume_order_by_modified(tmp_root, project_dir)
         print()
         test_init(tmp_root)
         print()
