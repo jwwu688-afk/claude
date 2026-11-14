@@ -505,7 +505,16 @@ async def cmd_resume(conversation, args: str) -> None:
         ui.print_info("已取消。")
         return
 
-    target = picked[idx]
+    # 【第 35 轮】归档会话（.jsonl.gz）先解压回 .jsonl 再切过去。
+    #   为什么必须在这一步做：SessionStore._write_line 用的是 open("a")，
+    #   往 gzip 里追加普通文本会把整份历史写坏（连前半段都解不出来）。
+    #   _write_line 里虽然也有防御，但那条路等于"这轮聊的全没存档"。
+    #   解压出来的新文件与归档同名、内容一条不少，归档本身会被收走
+    #   （留着会让 /resume 列表把同一个会话列两次）。
+    raw_target = picked[idx]
+    target = SessionStore.open_archive(raw_target)
+    if target != raw_target:
+        ui.print_info(f"这个会话是归档状态，已解压为 {target.name}。")
 
     # 换历史走的是和 --continue 完全相同的那个方法。
     # 为什么不在这里自己写一遍：那段逻辑有四个步骤（读文件、换历史、
@@ -518,6 +527,149 @@ async def cmd_resume(conversation, args: str) -> None:
     # 只报数量，不把历史内容打出来：接上一个 100 条的会话，
     # 全打出来会刷掉整屏，而用户想要的只是"我回来了"。
     ui.print_info("直接说下一句，就接着这个会话聊。")
+
+
+_CLEAN_OLD_DAYS = 30
+# `/clean` 认为"多久没动过算旧"（2026-11-13 第 35 轮）。
+# 为什么是 30 天：
+#   比它短（7 天）会误伤"上个项目收尾、隔两周又捡起来"的会话——那种正好是
+#   用户最想留的；比它长（90 天）基本等于不清，攒一年能到几百 MB。
+#   要改就改这一个数，判定和文案都跟着它走。
+
+
+def _human_size(num_bytes: int) -> str:
+    """把字节数写成 1.5 MB / 320 KB 这种（第 35 轮）
+
+    为什么不用第三方库：为一个数字引入 humanize 不值得，四行够了。
+    为什么到 MB 就停：会话文件不会有 GB 级，多一档 GB 是没人验证过的代码。
+    """
+    if num_bytes >= 1024 * 1024:
+        return f"{num_bytes / (1024 * 1024):.1f} MB"
+    if num_bytes >= 1024:
+        return f"{num_bytes / 1024:.0f} KB"
+    return f"{num_bytes} B"
+
+
+async def cmd_clean(conversation, args: str) -> None:
+    """清理会话存档：默认压缩归档，删除要二次确认（2026-11-13 第 35 轮）
+
+    【为什么需要这条命令】
+      `~/.thinker/sessions` 原来只增不减（ROADMAP 遗留 I4）。一个长会话能到
+      1.5 MB，攒一年就是几百 MB。用户唯一的办法是手动去删目录——既要记得
+      路径，又要自己判断"哪个能删"，很容易把正在聊的那个也删了。
+
+    【为什么默认压缩，删除排在第二】
+      会话记录是这个工具唯一的外部记忆：过两个月想翻回来看"上次那个报错
+      怎么解决的"，靠的就是它。JSONL 是纯文本，gzip 之后通常只剩 8%~15%，
+      用这点空间换"一条都不丢"明显划算。
+      删除能力当然保留——有些人就是不想留——但要他主动选，还要再点一次确认。
+
+    【为什么按"文件最后修改时间"判新旧】
+      见 SessionStore.usage_report 的说明：按文件名里的创建时间判，会把
+      "开了三天还在用"的会话当成旧会话，那恰好是最不该动的。
+
+    【为什么统计之后还要再问一次】
+      清理是不可逆的。先让用户看到"共几个、多大、要动哪几个"，再让他选动作，
+      比"敲一条命令然后少一批文件"安全得多。这也是项目一贯的口径：
+      凡是可能丢东西的操作，屏幕上必须先说清楚。
+
+    参数 args：暂时不用。将来可能支持 `/clean --days 7` 或 `--all`，
+      现在只做交互式——少一条没人验证的路径。
+    """
+    ui = conversation._ui_manager
+
+    # 子 agent 不该改主会话的存档。和 /resume 同一个口径，明确拒绝。
+    if getattr(conversation, "is_subagent", False):
+        ui.print_error("子 agent 里不能用 /clean。")
+        return
+
+    report = SessionStore.usage_report(_CLEAN_OLD_DAYS)
+
+    if report["count"] == 0:
+        ui.print_warning("还没有任何会话文件，不用清理。")
+        return
+
+    summary = f"会话目录：共 {report['count']} 个文件，占 {_human_size(report['total_bytes'])}"
+    if report["archived_count"]:
+        summary += f"（其中 {report['archived_count']} 个已归档）"
+    ui.print_info(summary)
+
+    if not report["old_count"]:
+        ui.print_info(f"没有超过 {_CLEAN_OLD_DAYS} 天没动过的会话，暂时不用清理。")
+        return
+
+    ui.print_warning(
+        f"{report['old_count']} 个会话超过 {_CLEAN_OLD_DAYS} 天没动过，"
+        f"共 {_human_size(report['old_bytes'])}。"
+    )
+
+    # 用编号选择而不是 y/n：两个动作都是"要动手"，y/n 表达不了区别。
+    choice = await ui.get_numbered_choice(
+        "要怎么处理这些旧会话？",
+        [
+            "压缩归档（数据不丢，/resume 里仍然看得到）",
+            "删除（不可恢复）",
+        ],
+    )
+
+    if choice is None:
+        ui.print_info("已取消。")
+        return
+
+    if choice == 0:
+        result = SessionStore.compress_sessions(report["old_paths"])
+        saved = max(0, result["before_bytes"] - result["after_bytes"])
+        if result["count"]:
+            ui.print_success(
+                f"已归档 {result['count']} 个会话："
+                f"{_human_size(result['before_bytes'])} → {_human_size(result['after_bytes'])}，"
+                f"省下 {_human_size(saved)}。"
+            )
+            ui.print_info("归档的会话仍会出现在 /resume 列表里，选中它就会自动解压回来。")
+            if result["skipped"]:
+                # 小会话压了反而更大（gzip 头部开销），那些原样留下了。
+                # 不说一声的话，用户会奇怪"为什么还有几个没变成 .gz"。
+                ui.print_info(
+                    f"另有 {result['skipped']} 个会话太小，压了省不下空间，已原样保留。"
+                )
+        elif result["skipped"]:
+            ui.print_info(
+                f"{result['skipped']} 个会话都太小，压了省不下空间，已原样保留。"
+            )
+        else:
+            ui.print_warning("一个都没压成。")
+        # 失败的不静默：用户得知道哪几个没动、为什么。
+        for line in result["failed"][:5]:
+            ui.print_warning(f"未处理：{line}")
+        if len(result["failed"]) > 5:
+            ui.print_warning(f"……还有 {len(result['failed']) - 5} 个没处理。")
+        return
+
+    # ---- 删除分支：这里必须二次确认 ----
+    # 为什么不用 wait_for_user_approval：那句提示是给"执行工具"用的
+    # （"是否执行？"），放在"删历史"上语义不对，用户容易顺手回车。
+    # 用编号确认，让他明确说出"确认删除"。
+    ui.print_warning(
+        f"即将删除 {report['old_count']} 个会话文件（{_human_size(report['old_bytes'])}），"
+        f"删除后无法恢复。"
+    )
+    confirm = await ui.get_numbered_choice(
+        "确认删除吗？",
+        ["确认删除", "算了，取消"],
+    )
+    if confirm != 0:
+        ui.print_info("已取消。")
+        return
+
+    result = SessionStore.delete_sessions(report["old_paths"])
+    if result["count"]:
+        ui.print_success(
+            f"已删除 {result['count']} 个会话，释放 {_human_size(result['freed_bytes'])}。"
+        )
+    else:
+        ui.print_warning("一个都没删成。")
+    for line in result["failed"][:5]:
+        ui.print_warning(f"没删掉：{line}")
 
 
 def _cwd():
@@ -1457,6 +1609,7 @@ async def cmd_model(conversation, args: str) -> None:
 register(CommandSpec("help", "/help", "列出所有命令", cmd_help))
 register(CommandSpec("memory", "/memory [文件名]", "查看模型记了什么（索引与正文）", cmd_memory))
 register(CommandSpec("resume", "/resume", "在历史会话里选一个接着聊", cmd_resume))
+register(CommandSpec("clean", "/clean", "清理旧会话：压缩归档（默认）或删除", cmd_clean))
 register(CommandSpec("init", "/init [--global] [--force] [--here]", "生成 / 更新项目记忆骨架", cmd_init))
 register(CommandSpec("cost", "/cost", "本次会话的花费与缓存命中", cmd_cost))
 register(CommandSpec("compact", "/compact", "立刻压缩上下文（不等 80%）", cmd_compact))

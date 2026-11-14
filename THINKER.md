@@ -68,6 +68,7 @@ thinker mcp remove 12306                     # 别名 rm
 /cost                              本次会话的花费、token、缓存命中率、上下文占用
 /compact                           立刻压缩一次上下文（不等 80%，会调一次摘要模型）
 /clear                             清空上下文并开一个新会话（旧会话文件保留，可 /resume 回去）
+/clean                             清理旧会话存档：报占用 → 压缩归档（默认）或删除（二次确认）
 /agents                            列出子 agent 类型、工具白名单、模型与来源（每次执行都会重扫 .thinker/agents）
 /mode [default|plan|accept|auto]   查看或切换工作模式（四档）；不带参数列出全部并标出当前档
 /mcp                               MCP 运行时状态：哪些连上了、各自几个工具、谁失败/被跳过

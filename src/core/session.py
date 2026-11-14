@@ -44,6 +44,7 @@
 #   user / assistant / tool 三类消息原样恢复——那才是对话本身。
 # =============================================================================
 
+import gzip  # 【第 35 轮】会话归档：老会话压成 .jsonl.gz，读的时候要能解开
 import json  # 读写 JSONL：每行是一个 JSON 对象
 import os  # 取当前工作目录，写进 header
 import secrets  # 生成会话 id 的随机后缀，避免同一秒内开两个会话撞名
@@ -217,10 +218,10 @@ class SessionStore:
         坏行跳过，与 load() 的口径一致：数少了只会让 keep_from 偏小
         （保留区多留几条），是安全方向；数错了宁可多留不可少留。
         """
-        try:
-            text = self.path.read_text(encoding="utf-8", errors="replace")
-        except OSError:
-            return 0
+        # 【第 35 轮】改走 _read_text：会话被归档（.jsonl.gz）之后也可能走到这里
+        #   （比如统计、或者压缩落盘前恰好 resume 了归档会话）。
+        #   统一一处读法，不在这里重复一遍"按后缀分支"的判断。
+        text = _read_text(self.path)
         total = 0
         for line in text.splitlines():
             line = line.strip()
@@ -279,7 +280,22 @@ class SessionStore:
         为什么吞掉 OSError：
           磁盘满、无权限、路径失效……会话记录失败不该打断正在进行的对话。
           用户最多丢了这次存档，但当前对话还能继续——这个取舍明显更划算。
+
+        【第 35 轮】归档文件（.jsonl.gz）在这里直接拒写。
+          往 gzip 里 open("a") 追加普通文本，写出来的是一个从中间开始就坏掉
+          的文件——连前半段都解不出来，等于把整份历史毁了。
+          正常路径不会走到这（open_archive 会先解压），但 resume 那一步
+          万一解压失败（磁盘满），path 就还是 .gz；这时宁可丢这几条新存档，
+          也不能把旧历史一起弄坏。打一行 stderr 是因为这是异常路径，
+          静默的话用户永远不知道自己的对话没被记住。
         """
+        if _is_archive(self.path):
+            print(
+                f"[会话存档] {self.path.name} 是归档文件，本轮消息没有写入。"
+                f"（归档不支持追加；重新打开该会话时会自动解压）",
+                file=sys.stderr,
+            )
+            return
         try:
             with self.path.open("a", encoding="utf-8") as f:
                 # "a" 追加模式：文件不存在就创建，存在就写到末尾。
@@ -347,15 +363,16 @@ class SessionStore:
         `--continue` 应该接着本项目的上一次，而不是另一个项目的话题。
         """
         directory = SESSIONS_DIR.expanduser()
-        if not directory.is_dir():
-            return []  # 目录都还没有，说明从没开过会话
 
-        files = sorted(directory.glob("*.jsonl"), key=lambda p: p.name, reverse=True)
-        # 只认 .jsonl，其他文件（用户手动放的说明文档之类）不算
-        # 按**文件名**排序而不是 mtime：
-        #   文件名以时间开头，天然有序；而 mtime 在复制文件、从备份恢复时会被重置，
-        #   会导致"老会话排到最前面"，--continue 就接到错的地方去了。
-        # reverse=True：新的在前。
+        # 【第 35 轮】改走 _session_files：它同时认 .jsonl 和 .jsonl.gz，
+        #   并且已经按文件名倒序排好（理由见那边的注释）。
+        #   为什么归档也要出现在列表里：归档≠删除。用户 /resume 时应该看到
+        #   "这个会话还在，只是被压起来了"，选中它会自动解压回来
+        #   （见 open_archive），而不是以为记录丢了。
+        #   目录不存在时返回空列表，和原来一致。
+        files = _session_files(directory)
+        if not files:
+            return []  # 从没开过会话，或者目录被清空了
 
         if cwd is None:
             return files  # 不筛项目，全都返回
@@ -365,13 +382,17 @@ class SessionStore:
         # D:\Code\Thinker 和 d:\code\thinker 应该被当成同一个项目。
         matched = []
         for path in files:
-            _, header = cls.load(path)
+            # 【第 36 轮】改用 read_header：只读第一行，不再为了拿 cwd
+            #   把整份会话读进来。改前这里调 cls.load()，一个 1.5 MB 的会话
+            #   就为开头一百来字节整份读一遍；归档更贵，还要整份解压。
+            #   header 就是第一行，读一行的代价与文件大小无关。
+            header = read_header(path)
             if str(header.get("cwd", "")).lower() == want:
                 matched.append(path)
         return matched
-        # 说明：这里每个文件都要读一遍才能拿到 header，文件多时会慢。
-        # 但会话文件一般只有几十个、每个也就几十 KB，实测无感。
-        # 真要优化，可以把 cwd 编进文件名，但那样名字会变得很难看，不值得。
+        # 说明：读一行虽然便宜，但仍是"每个文件一次"，文件极多时
+        # （上千个）会有几十毫秒开销。真要再快，得把 cwd 编进文件名——
+        # 那样名字会变得很难看，不值得。
 
     @classmethod
     def latest(cls, cwd: Optional[str] = None) -> Optional[Path]:
@@ -383,10 +404,308 @@ class SessionStore:
         found = cls.list_sessions(cwd)
         return found[0] if found else None
 
+    # -------------------------------------------------------------------------
+    # 3.4 清理与归档（第 35 轮）
+    #
+    # 为什么"清理"要做成"先压缩、真要删得再点一次"：
+    #   会话记录是这个工具唯一的外部记忆。用户过两个月想翻回来看
+    #   "上次那个报错是怎么解决的"，靠的就是这些文件。
+    #   JSONL 是纯文本，gzip 之后通常只剩 8%~15%——用这点空间换"一条不丢"很划算。
+    #   删除能力当然要有（有些人就是不想留），但要用户明确选、且二次确认。
+    # -------------------------------------------------------------------------
+    @classmethod
+    def usage_report(cls, days: int = 30) -> dict:
+        """统计会话目录占了多少、有几个算"旧"（第 35 轮新增）
+
+        【为什么先统计再动刀】
+          清理是不可逆的（删除尤其）。用户得先看到"总共多大、要动哪几个、
+          大概能省多少"，而不是敲一条命令然后少一批文件。这个函数只读。
+
+        【"旧"按 mtime 判，不按文件名里的时间】
+          文件名是会话**创建**时间，mtime 是最后一次写入。按创建时间算的话，
+          一个开了三天还在用的会话会被判成"三天前的旧会话"压起来——那恰好
+          是用户最舍不得的那份。会话是越聊越长的东西，最后活动时间才代表
+          还有没有人用。
+          代价：复制文件、从备份恢复会重置 mtime，让老会话看起来是新的。
+            对清理来说这个方向的错误是安全的（少清一个），可以接受。
+
+        返回字典而不是元组：六个字段，用元组调用方记不住顺序。
+        """
+        directory = SESSIONS_DIR.expanduser()
+        files = _session_files(directory)
+        cutoff = time.time() - days * 86400  # 从「当前时刻」往前推 days 天
+
+        total_bytes = 0
+        archived_count = 0
+        old_paths: List[Path] = []
+        old_bytes = 0
+
+        for path in files:
+            try:
+                stat = path.stat()  # 获取该路径对应文件/目录的元数据（状态信息）
+            except OSError:
+                continue  # 刚被别的进程删了、或权限不对：跳过这一个，不影响其余统计
+            total_bytes += stat.st_size
+
+            if _is_archive(path):
+                archived_count += 1
+                continue  # 已经压过了：既不用再压，也不算"待清理"
+
+            if stat.st_mtime < cutoff:
+                old_paths.append(path)
+                old_bytes += stat.st_size
+
+        return {
+            "count": len(files),
+            "total_bytes": total_bytes,
+            "archived_count": archived_count,
+            "old_count": len(old_paths),
+            "old_bytes": old_bytes,
+            "old_paths": old_paths,
+            # files 是倒序（新的在前），所以最后一个就是最早创建的那个
+            "oldest_name": files[-1].name if files else None,
+            "days": days,
+        }
+
+    @classmethod
+    def compress_sessions(cls, paths) -> dict:
+        """把会话文件压成 .jsonl.gz，成功后才删原文件（第 35 轮新增）
+
+        【为什么不直接删】
+          见本节开头的说明：用 8%~15% 的空间换"一条都不丢"。
+          真要彻底删，用 delete_sessions，但要用户明确选。
+
+        【为什么必须"临时文件 + 原子替换"】
+          直接往目标名写的话，压缩途中断电就留下半个 .gz，而原文件已经删了
+          ——那才是真的数据没了。现在的顺序是：
+            读原文 → 写 .gz.tmp → os.replace 成 .gz → 删原文
+          任何一步崩掉，原文都还在。
+
+        返回：{"count", "before_bytes", "after_bytes", "skipped", "failed": [说明, ...]}
+          失败的文件**不删**，留在原地并在 failed 里说明原因。
+          skipped 是"压完反而没变小"的那几个——见下面那段判断。
+        """
+        report = {"count": 0, "before_bytes": 0, "after_bytes": 0, "skipped": 0, "failed": []}
+
+        for raw in paths:
+            path = Path(raw)
+            if _is_archive(path):
+                continue  # 已经是归档：重复调用不报错，直接跳过
+
+            try:
+                before = path.stat().st_size
+                text = _read_text(path)
+                if not text:
+                    # 读不出内容（文件坏了 / 没权限）：不压也不删。
+                    # 压一个空归档会让人以为"这个会话本来就是空的"。
+                    report["failed"].append(f"{path.name}（读不出内容，已跳过）")
+                    continue
+
+                target = path.with_name(path.name + ".gz")
+                tmp = target.with_name(target.name + ".tmp")
+                with gzip.open(tmp, "wt", encoding="utf-8") as handle:
+                    handle.write(text)
+                os.replace(tmp, target)  # 这一刻起归档是完整可读的
+                after = target.stat().st_size
+
+                # 【第 35 轮】压完没变小就撤销。
+                #   这不是理论情况：gzip 光头部固定开销就二十来字节，而
+                #   "开一次、问一句就退出"的小会话只有几百字节，压完可能反而更大
+                #   （实测 263 B 的会话压出 262 B）。留着这种归档没有任何好处：
+                #   空间没省、/resume 还要多一步解压。所以把刚写的归档删掉、原文留着。
+                if after >= before:
+                    target.unlink()
+                    report["skipped"] += 1
+                    continue
+
+                path.unlink()            # 归档就位之后才删原文
+
+                report["count"] += 1
+                report["before_bytes"] += before
+                report["after_bytes"] += after
+            except OSError as e:
+                # 磁盘满、文件被占用、权限不足……都不该让整批停下来：
+                # 能清几个算几个，把失败的报给用户。
+                report["failed"].append(f"{path.name}（{type(e).__name__}: {e}）")
+                # 顺手清掉可能残留的半截临时文件，免得下次 ls 看到奇怪的东西。
+                # 这里不用变量 tmp：它可能在异常发生前还没赋值。
+                try:
+                    leftover = path.with_name(path.name + ".gz.tmp")
+                    if leftover.exists():
+                        leftover.unlink()
+                except OSError:
+                    pass
+
+        return report
+
+    @classmethod
+    def delete_sessions(cls, paths) -> dict:
+        """删掉指定的会话文件，删不掉的报出来（第 35 轮新增）
+
+        【为什么这个函数自己不弹确认】
+          它只管"删"，不问"要不要删"。确认放在命令层（/clean 里问两次），
+          因为"怎么问、问几次"是交互设计，会话层不该知道终端长什么样。
+          测试也能直接调它删临时文件，不用造一堆假回答。
+
+        返回：{"count", "freed_bytes", "failed": [...]}
+        """
+        report = {"count": 0, "freed_bytes": 0, "failed": []}
+        for raw in paths:
+            path = Path(raw)
+            try:
+                size = path.stat().st_size
+                path.unlink()
+                report["count"] += 1
+                report["freed_bytes"] += size
+            except OSError as e:
+                report["failed"].append(f"{path.name}（{type(e).__name__}: {e}）")
+        return report
+
+    @classmethod
+    def open_archive(cls, path) -> Path:
+        """resume 之前调用：归档会话先解压回 .jsonl（第 35 轮新增）
+
+        【为什么必须解压，不能直接往 .gz 里追加】
+          SessionStore._write_line 用的是 open("a") —— 往 gzip 文件里追普通文本，
+          得到的是一个从中间开始就坏掉的文件，连它前半段都解不出来。
+          gzip 确实支持"多成员追加"（gzip.open("at")），但一旦某次写到一半崩了，
+          整个归档都读不了；而且"边聊边压"本身没有任何收益。
+
+        【解压后为什么删掉归档】
+          两份同时留着的话，list_sessions 会把同一个会话列两次
+          （一次 .jsonl、一次 .jsonl.gz），用户选哪个都会困惑。
+          数据没丢——全在新解出来的 .jsonl 里；等它再次变旧，
+          compress_sessions 会重新压一份。
+
+        【顺序：先写成功，再删归档】
+          反过来的话，中途失败就是"归档没了、新的还没写完"，真的丢数据。
+
+        不是归档（普通 .jsonl）就原样返回，调用方不用先判断类型。
+        """
+        source = Path(path)
+        if not _is_archive(source):
+            return source
+
+        target = source.with_name(source.name[: -len(".gz")])  # x.jsonl.gz → x.jsonl
+        try:
+            text = _read_text(source)
+            # 先写临时文件再替换：同名 .jsonl 有可能已经存在（用户手动恢复过），
+            # 直接覆盖写一半就坏了。
+            tmp = target.with_name(target.name + ".tmp")
+            with open(tmp, "w", encoding="utf-8", newline="") as handle:
+                handle.write(text)
+            os.replace(tmp, target)
+            source.unlink()  # 新的已经落地，归档可以走了
+            return target
+        except OSError:
+            # 解压失败（磁盘满、目录只读）：原样返回归档。
+            # 拿到的是一个**能读**的路径，resume 照样能看到历史；
+            # 只是接下来往里追加会被 _write_line 拦下（那里也有防御）。
+            return source
+
 
 # =============================================================================
 # 四、恢复：把存档变成"能直接用"的消息列表
 # =============================================================================
+
+def _is_archive(path) -> bool:
+    """这个会话文件是不是 gzip 归档（第 35 轮新增）
+
+    单独抽一个判断函数，是因为"怎么认出归档"这件事有四处要一致：
+    读文本、读 header、列表展示、压缩时跳过。四处的 `.suffix == ".gz"`
+    各写一遍，将来改成 .zip 或加个 .zst 时必然漏一处。
+    """
+    return Path(path).suffix.lower() == ".gz"
+
+
+def read_header(path) -> dict:
+    """只读会话文件的第一行（header），不解全量（第 36 轮新增）
+
+    【为什么要单独一个函数】
+      `list_sessions(cwd)` 要按"这条会话是哪个项目开的"过滤，而 cwd 记在
+      header 里、header 就是文件第一行。原来为了这一个字段对每个文件调
+      `load()` —— 把整份读进来逐行解析。一个 1.5 MB 的会话只为取开头
+      一百来字节，整份读一遍；`/resume`、`--continue` 每次都要付这个代价。
+
+      归档（.jsonl.gz）更贵：要走 gzip 解压。虽然 gzip 是流式压缩、
+      读第一行只需要解压开头那个块（几十 KB），但前提是**只读到第一行**
+      —— 用 _read_text 就等于把整份解压回来了，归档省的磁盘又白费。
+
+    【第一行不一定是 header】
+      老版本文件、或者用户手改过的文件，第一行可能是消息。
+      这时返回空字典，调用方按"不知道属于哪个项目"处理——
+      在按 cwd 过滤时它就会被排除，和原来 load() 拿不到 header 的结果一致。
+
+    【读失败一律返回空字典】
+      口径与 _read_text 一致：坏文件当"没有 header"，不让一条坏归档
+      把整个会话列表弄崩。
+    """
+    target = Path(path)
+    try:
+        if _is_archive(target):
+            with gzip.open(target, "rt", encoding="utf-8", errors="replace") as handle:
+                first = handle.readline()
+        else:
+            with open(target, "r", encoding="utf-8", errors="replace") as handle:
+                first = handle.readline()
+    except (OSError, EOFError, gzip.BadGzipFile):
+        # EOFError / BadGzipFile：归档被截断（压缩到一半断电）。
+        # 它们不是 OSError 的子类，必须单独接住。
+        return {}
+
+    line = first.strip()
+    if not line:
+        return {}
+    try:
+        obj = json.loads(line)
+    except json.JSONDecodeError:
+        return {}
+    return obj if isinstance(obj, dict) and obj.get("type") == "header" else {}
+
+
+def _read_text(path) -> str:
+    """把会话文件整份读成文本，自动识别 gzip 归档（第 35 轮新增）
+
+    【为什么按后缀判断，不读魔数】
+      后缀是显式的：`ls ~/.thinker/sessions` 一眼就能看出哪些会话被归档过。
+      读魔数要先按二进制读两个字节、再回退重来，两段逻辑都在猜，
+      出问题（比如半截文件）时更难判断到底走了哪条路。
+      代价是后缀必须由我们自己写出来——只有 compress_sessions 会产出 .jsonl.gz。
+
+    【读失败统一返回空串】
+      和调用方原来的口径一致：坏文件当空文件。
+        · _read_session 拿到空串 → 没有消息、没有 header；
+        · count_messages 拿到空串 → 0。
+      两种后果都是"这个会话看起来是空的"，比抛异常让整个 /resume 列表崩掉好。
+    """
+    target = Path(path)
+    try:
+        if _is_archive(target):
+            with gzip.open(target, "rt", encoding="utf-8", errors="replace") as handle:
+                return handle.read()
+        return target.read_text(encoding="utf-8", errors="replace")
+    except (OSError, EOFError, gzip.BadGzipFile):
+        # EOFError / BadGzipFile：归档写坏了（压缩到一半断电、或者有人用
+        #   git checkout 把二进制文件当文本处理过）。这两个都不是 OSError 的子类，
+        #   必须单独接住，否则一条坏归档就能让整份会话列表打不开。
+        return ""
+
+
+def _session_files(directory: Path) -> List[Path]:
+    """列出目录里所有会话文件（含归档），新的在前（第 35 轮新增）
+
+    为什么要在 list_sessions 之外单独抽一层：
+      `list_sessions` 还要按 cwd 过滤、要读 header；而清理、统计只需要
+      "有哪些文件"。两处共用这一份"什么算会话文件"的定义，
+      以后加一种格式（比如 .jsonl.zst）只改这里。
+    """
+    if not directory.is_dir():
+        return []
+    files = list(directory.glob("*.jsonl")) + list(directory.glob("*.jsonl.gz"))
+    # 按文件名排序而不是 mtime：文件名以时间开头，天然有序；
+    #   mtime 在复制、从备份恢复时会被重置，会把老会话排到最前面。
+    return sorted(files, key=lambda p: p.name, reverse=True)
+
 
 def _read_session(path) -> Tuple[List[dict], dict, dict]:
     """读会话文件，返回 (消息列表, header, 最后一条压缩记录)（2026-11-13 第 34 轮新增）
@@ -407,12 +726,12 @@ def _read_session(path) -> Tuple[List[dict], dict, dict]:
     messages: List[dict] = []
     header: Dict = {}
     compaction: Optional[dict] = None
-    target = Path(path)
 
-    try:
-        text = target.read_text(encoding="utf-8", errors="replace")
-    except OSError:
-        return messages, header, compaction
+    # 【第 35 轮】改走 _read_text：归档（.jsonl.gz）和普通 .jsonl 都从这一处进。
+    #   为什么不在这里自己 try OSError：读失败的各种情形（文件没了、归档坏了、
+    #   压缩包被截断）统一在 _read_text 里收口，那边返回空串，这里自然得到
+    #   "空会话"，少一层分支也少一处漏 catch。
+    text = _read_text(path)
 
     for line in text.splitlines():
         line = line.strip()

@@ -12,10 +12,12 @@
 # =============================================================================
 
 import asyncio
+import json  # 【第 35 轮】/clean 的用例要手写会话文件（带 header 行）
 import os
 import shutil
 import sys
 import tempfile
+import time  # 【第 35 轮】把文件 mtime 拨到几十天前，造"旧会话"
 import types
 from pathlib import Path
 
@@ -55,11 +57,18 @@ class FakeUI:
     而我们要验证的是"命令输出了什么"，不是"终端画得好不好看"。
     """
 
-    def __init__(self, answers=None):
+    def __init__(self, answers=None, choices=None):
         self.lines = []
         self._answers = list(answers or [])  # 预置的输入队列（给 get_user_input 用）
+        # 【第 35 轮】预置的编号选择队列（给 get_numbered_choice 用）。
+        #   为什么单独一个队列而不是复用 _answers：
+        #   两者回答的不是同一种问题（一个是自由输入、一个是选编号），
+        #   混在一起的话，/clean 这种"先选动作、再确认"的命令没法分别控制
+        #   第一次和第二次选什么，测试就只能验到第一条分支。
+        self._choices = list(choices or [])
         self.choice_title = None
         self.choice_items = None
+        self.choice_count = 0  # 问了几次（/clean 的删除分支应该问两次）
 
     def print_info(self, text, emoji=""):
         self.lines.append(str(text))
@@ -79,10 +88,16 @@ class FakeUI:
     def text(self):
         return "\n".join(self.lines)
 
-    async def get_numbered_choice(self, title, items):
+    async def get_numbered_choice(self, title, items, hint=None):
+        # hint 参数（第 35 轮补）：真实签名是 `hint="输入编号，直接回车取消"`，
+        #   这里写默认 None 接住——少写的话，任何传了 hint 的命令都会 TypeError，
+        #   而报错会指向"命令测试"这个毫不相干的地方。
         self.choice_title = title
         self.choice_items = list(items)
-        return 0  # 测试里固定选第一项
+        self.choice_count += 1
+        # 预置队列空了就默认选第一项：老用例（/resume 选会话）依赖"固定选第一项"，
+        # 不能因为这一轮加了队列支持就把它们的行为改掉。
+        return self._choices.pop(0) if self._choices else 0
 
     async def get_user_input(self, prompt=None, completer=None):
         # 参数 completer（第 16 轮加）：真实 UI 会对它做 Tab 补全，这里只需要接住，
@@ -390,6 +405,126 @@ def test_compact_nothing_to_do():
     check("历史没被动过", len(hm.messages_history[-1]) == 1)
 
 
+def _write_old_session(directory, name, days_ago=40, text="老问题", messages=1):
+    """造一个会话文件，并把 mtime 拨到 days_ago 天前（第 35 轮）
+
+    为什么手写而不走 SessionStore.create：
+      create 用当前时间起文件名，造不出"看起来是两个月前"的文件；
+      而 /clean 的全部判断都建立在 mtime 上（见 usage_report 的说明）。
+
+    参数 messages：写几条消息。压测分支要 30 条以上——只有几百字节的小会话
+      压完不会变小（gzip 头部开销就二十来字节），compress_sessions 会
+      把那种归档撤销、原样保留（skipped），用例就验不到"真的归档了"。
+    """
+    path = Path(directory) / name
+    lines = [
+        json.dumps({"type": "header", "cwd": str(directory), "started_at": "2026-11-01T10:00:00"}),
+    ]
+    for i in range(messages):
+        lines.append(
+            json.dumps(
+                {
+                    "type": "message",
+                    "ts": 1763000000 + i,
+                    "message": {
+                        "role": "user",
+                        "content": [{"type": "text", "text": f"{text} #{i}"}],
+                    },
+                },
+                ensure_ascii=False,
+            )
+        )
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
+    if days_ago:
+        stamp = time.time() - days_ago * 86400
+        os.utime(path, (stamp, stamp))
+    return path
+
+
+def test_clean_nothing_to_do(tmp_root):
+    """没有超过阈值的老会话时，只报一句，不动任何文件"""
+    print("测试: /clean 没有旧会话")
+    old_dir = session_module.SESSIONS_DIR
+    session_module.SESSIONS_DIR = Path(tmp_root) / "sessions_clean_a"
+    session_module.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        _write_old_session(session_module.SESSIONS_DIR, "20261113-100000-aaaa.jsonl", days_ago=0)
+
+        ui = FakeUI()
+        asyncio.run(commands.cmd_clean(FakeConv(ui), ""))
+
+        text = ui.text()
+        check("报了总数和占用", "1 个文件" in text and "占" in text, text)
+        check("提示暂时不用清理", "暂时不用清理" in text, text)
+        check("没问要选什么动作", ui.choice_count == 0, str(ui.choice_count))
+        check("文件没被动", len(list(session_module.SESSIONS_DIR.glob("*.jsonl"))) == 1)
+    finally:
+        session_module.SESSIONS_DIR = old_dir
+
+
+def test_clean_compress(tmp_root):
+    """选「压缩归档」：原文件变 .jsonl.gz，数据仍能读"""
+    print("测试: /clean 压缩归档")
+    old_dir = session_module.SESSIONS_DIR
+    session_module.SESSIONS_DIR = Path(tmp_root) / "sessions_clean_b"
+    session_module.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        path = _write_old_session(
+            session_module.SESSIONS_DIR, "20260101-100000-bbbb.jsonl", days_ago=40, messages=40
+        )
+
+        ui = FakeUI(choices=[0])
+        asyncio.run(commands.cmd_clean(FakeConv(ui), ""))
+
+        archive = path.with_name(path.name + ".gz")
+        check("先报了有几个旧会话", "1 个会话超过" in ui.text(), ui.text())
+        check("选项文案是压缩优先", "压缩归档" in (ui.choice_items or [""])[0], str(ui.choice_items))
+        check("报告已归档", "已归档 1 个会话" in ui.text(), ui.text())
+        check("原文件变归档", archive.exists() and not path.exists())
+        check("归档里数据还在", len(session_module._read_session(archive)[0]) == 40)
+    finally:
+        session_module.SESSIONS_DIR = old_dir
+
+
+def test_clean_delete_needs_confirm(tmp_root):
+    """选「删除」之后必须再确认一次；第二次选取消，文件必须还在"""
+    print("测试: /clean 删除要二次确认")
+    old_dir = session_module.SESSIONS_DIR
+    session_module.SESSIONS_DIR = Path(tmp_root) / "sessions_clean_c"
+    session_module.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        path = _write_old_session(session_module.SESSIONS_DIR, "20260101-100000-cccc.jsonl", days_ago=40)
+
+        # 第一次选 1（删除），第二次选 1（算了，取消）
+        ui = FakeUI(choices=[1, 1])
+        asyncio.run(commands.cmd_clean(FakeConv(ui), ""))
+
+        check("问了两次", ui.choice_count == 2, str(ui.choice_count))
+        check("提示了不可恢复", "无法恢复" in ui.text(), ui.text())
+        check("取消后文件还在", path.exists())
+        check("没报告删除", "已删除" not in ui.text(), ui.text())
+    finally:
+        session_module.SESSIONS_DIR = old_dir
+
+
+def test_clean_delete_confirmed(tmp_root):
+    """二次确认选「确认删除」：文件真的没了"""
+    print("测试: /clean 确认删除")
+    old_dir = session_module.SESSIONS_DIR
+    session_module.SESSIONS_DIR = Path(tmp_root) / "sessions_clean_d"
+    session_module.SESSIONS_DIR.mkdir(parents=True, exist_ok=True)
+    try:
+        path = _write_old_session(session_module.SESSIONS_DIR, "20260101-100000-dddd.jsonl", days_ago=40)
+
+        ui = FakeUI(choices=[1, 0])
+        asyncio.run(commands.cmd_clean(FakeConv(ui), ""))
+
+        check("文件被删了", not path.exists())
+        check("报告已删除", "已删除 1 个会话" in ui.text(), ui.text())
+    finally:
+        session_module.SESSIONS_DIR = old_dir
+
+
 def test_clear(tmp_root):
     print("测试: /clear")
     old_sessions_dir = session_module.SESSIONS_DIR
@@ -496,6 +631,14 @@ if __name__ == "__main__":
         test_compact()
         print()
         test_compact_nothing_to_do()
+        print()
+        test_clean_nothing_to_do(tmp_root)
+        print()
+        test_clean_compress(tmp_root)
+        print()
+        test_clean_delete_needs_confirm(tmp_root)
+        print()
+        test_clean_delete_confirmed(tmp_root)
         print()
         test_clear(tmp_root)
         print()

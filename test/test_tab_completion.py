@@ -362,12 +362,22 @@ def test_handle_tab() -> None:
     check("多候选：没把 /memory 也列出来", "/memory" not in dumped, dumped)
     check("多候选：buffer 没被改动", "".join(buf) == "/c", repr("".join(buf)))
 
-    # --- 再多一个字母就变成唯一匹配 ---
+    # --- 再多一个字母：第 35 轮加了 /clean 之后，/cl 不再是唯一匹配 ---
+    # 这条原来断言"直接补成 /clear "。加了 /clean 之后 /clear 和 /clean
+    # 共享前缀 /clea，补全只能推到公共前缀——这是**正确行为**，不是补全坏了。
+    # 所以拆成两条：这里验"公共前缀推进"，马上用 /ag 再验一次"唯一即补完"。
     ed = RecordingHandleEditor()
     buf = list("/cl")
     ed._handle_tab(buf, "> ", Conversation._complete_command)
     redraws = [e for e in ed.events if e[0] == "redraw"]
-    check("/cl 唯一匹配：直接补成 /clear", redraws and redraws[0][1] == "/clear ", str(redraws))
+    check("/cl 两个候选：补到公共前缀 /clea", redraws and redraws[0][1] == "/clea", str(redraws))
+
+    # --- 仍然唯一的命令：/ag 只有一个候选 /agents ---
+    ed = RecordingHandleEditor()
+    buf = list("/ag")
+    ed._handle_tab(buf, "> ", Conversation._complete_command)
+    redraws = [e for e in ed.events if e[0] == "redraw"]
+    check("/ag 唯一匹配：直接补成 /agents", redraws and redraws[0][1] == "/agents ", str(redraws))
 
     # --- 没有任何匹配：响铃，什么都不改 ---
     ed = RecordingHandleEditor()

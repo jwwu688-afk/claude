@@ -54,7 +54,11 @@ from rich.text import Text  # 富文本：可以给一段文字的不同部分�
 # 【2026-11-13 第 33.5.2 轮】0.12.1 → 0.12.2：MCP 配置支持 env。
 #   功能小增量：`mcp add -e KEY=VALUE` 把环境变量写进配置，子进程启动时
 #   与当前环境合并后生效（配代理、给单个服务器设 API key）。
-VERSION = "0.12.3"  # 【第 33.5.2 轮】MCP 单服务器 env；启动时 banner 会显示
+# 【2026-11-13 第 35 轮】0.12.3 → 0.13.0：会话存档清理（/clean）。
+#   进位理由：这是一次功能级变更——多了一条斜杠命令，`~/.thinker/sessions`
+#   里多出一种 `.jsonl.gz` 文件形态，`/resume` 选中归档会话会先解压。
+#   向后兼容：不敲 /clean 的用户看到的行为一字不变，老会话文件照常读。
+VERSION = "0.13.0"  # 【第 35 轮】会话存档清理（/clean）
 
 
 def _readable_dir(path: str) -> str:
