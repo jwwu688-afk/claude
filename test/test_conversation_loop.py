@@ -26,6 +26,42 @@ sys.path.insert(0, os.path.join(os.path.dirname(__file__), '..', 'src'))
 # 从 test/ 跑脚本时 Python 找不到 src/ 下的模块，手动把 "../src" 塞进搜索路径
 
 from core.conversation import Conversation, READ_ONLY_TOOLS  # 导入要测的主循环和只读工具清单
+from core.hooks import HookOutcome  # 【2026-11-14 收尾】下面的 NoopHooks 要用它当返回值
+
+
+class NoopHooks:
+    """什么都不做的 hook 运行器（2026-11-14 收尾新增）
+
+    【为什么需要它】
+      第 32 轮给工具链加了 PreToolUse / PostToolUse 两个 hook 点，
+      `Conversation._handle_tool_calls()` 里会走 `self._hooks.run_event(...)`。
+      而本文件造的是"空壳"对象（`__new__`，见 make_conversation），
+      `__init__` 从没跑过，`self._hooks` 这个属性根本不存在——
+      于是"工具调用链"那条用例会直接 `AttributeError: 'Conversation' object
+      has no attribute '_hooks'`，并且因为异常抛在用例中间，后面的断言一条都没跑到。
+
+    【为什么不去 new 一个真的 HookRunner】
+      它的 `__init__` 会读 `~/.thinker/hooks.json` 和项目设置文件。
+      开发机上真配了 hook 的话，这条用例会去跑用户自己的脚本（PreToolUse 甚至可能
+      把 file_read 拦掉），测试结果就取决于"谁的机器"，这比测试失败更糟。
+      测试替身必须与机器无关，所以这里给一个永远放行的假实现。
+
+    字段是按 `conversation.py` 里真实读到的名字给的（specs / notes / settings_path），
+    少一个就会在别的路径上再炸一次。
+    """
+
+    def __init__(self):
+        self.specs = []  # 一条 hook 都没配，启动时那行"已加载 N 个 hook"不会打印
+        self.notes = []  # 加载期告警，同理为空
+        self.settings_path = "<test>"  # 只用于拼提示文案，测试里没人读它
+
+    async def run_event(self, event, payload, tool_name=None):
+        """任何事件都放行：blocked=False、没有 reason、没有 context
+
+        签名里的 tool_name 是关键字参数（conversation 里就是这么传的），
+        默认值写成 None 才能两边都对得上。
+        """
+        return HookOutcome()
 
 
 def make_conversation():
@@ -38,7 +74,16 @@ def make_conversation():
     """
     Conversation._instance = None  # 清掉单例，避免拿到上一次测试留下的对象
     Conversation._initialized = False
-    return Conversation.__new__(Conversation)
+    conv = Conversation.__new__(Conversation)
+    # 【2026-11-14 收尾】空壳对象也得有 _hooks：第 32 轮起工具链会调它。
+    #   放在这里统一补，而不是只在那一条用例里补——将来谁再拿 make_conversation()
+    #   去驱动别的路径，都不会再撞同一个 AttributeError。
+    conv._hooks = NoopHooks()
+    # _session 同理：hook 的 payload 里要读 session_id（`getattr(self._session, "id", "")`
+    # 只能兜住 .id，兜不住 self._session 本身不存在）。全新会话时它本来就是 None，
+    # 这里显式置 None，和"刚启动、还没落盘"的真实状态一致。
+    conv._session = None
+    return conv
 
 
 def stack_depth() -> int:
@@ -215,6 +260,11 @@ def test_tool_call_chain_approval():
             self.messages = []
         def add_message(self, message):
             self.messages.append(message)
+        def get_current_messages(self):
+            # 【2026-11-14 收尾】第 25 轮起，"当前这一页消息"统一从
+            #   get_current_messages() 读（多页 + 压缩摘要之后不能直接摸属性）。
+            #   假历史也得提供这个入口，否则工具链用例会在回写那一步 AttributeError。
+            return self.messages
 
     class FakeFunction:
         """模仿 SDK 里 tool_call.function 的形状"""
@@ -297,8 +347,20 @@ def test_old_style_recursion_would_fail():
     print("✓ 通过: 对照成立，新 while 写法不会触发这个问题")
 
 
-def run_all_tests():
-    """运行所有测试（把上面 7 个用例挨个跑一遍）"""
+def run_all_tests() -> int:
+    """运行所有测试（把上面 7 个用例挨个跑一遍），返回进程退出码
+
+    【2026-11-14 收尾改了什么，为什么改】
+      改前是"一个大 try 包住整个 for 循环"：
+        · 第一个用例一抛异常，后面 6 条**一条都不会跑**，
+          屏幕上却只写"已通过 5/7"，看起来像"跑了 7 条、挂了 2 条"；
+        · 函数没有返回值，脚本 `python test/xxx.py` 永远 `exit 0`。
+      两条加在一起就是"假绿"：批量跑测试时 `|| echo 失败` 这种写法完全失效，
+      项目看起来全绿，实际上有一条路径从来没被验证过。
+
+      现在：每个用例单独 try（一条挂了不影响其余），最后一个失败就返回 1。
+      调用方（`python test/xxx.py`）拿到真实退出码，批量回归才有意义。
+    """
     print("开始运行主循环改造测试...\n")
 
     tests = [
@@ -312,16 +374,28 @@ def run_all_tests():
     ]
 
     passed = 0
-    try:  # 整体包一层 try，任何一个用例失败都能被抓住
-        for test in tests:
+    failures = []  # [(用例名, 异常描述)]，最后一起报，省得问题被下一条的日志刷走
+
+    for test in tests:
+        try:
             test()
             passed += 1
-        print(f"\n🎉 所有测试通过（{passed}/{len(tests)}）")
-    except Exception as e:  # 任何一个失败都会跳到这里
-        print(f"\n❌ 测试失败（已通过 {passed}/{len(tests)}）：{e}")
-        traceback.print_exc()  # 打印完整的出错现场
+        except Exception as error:  # 只捕获用例本身的失败，不拦 KeyboardInterrupt
+            failures.append((test.__name__, f"{type(error).__name__}: {error}"))
+            print(f"❌ 用例失败：{test.__name__} → {type(error).__name__}: {error}")
+            traceback.print_exc()  # 现场照旧打全，便于定位
+
+    if failures:
+        print(f"\n❌ 测试失败（通过 {passed}/{len(tests)}，失败 {len(failures)} 条）：")
+        for name, reason in failures:
+            print(f"   · {name} → {reason}")
+        return 1
+
+    print(f"\n🎉 所有测试通过（{passed}/{len(tests)}）")
+    return 0
 
 
 if __name__ == "__main__":
     # 直接运行这个文件时才执行（被 import 时不执行）
-    run_all_tests()  # 开跑
+    # sys.exit 把结果变成真实退出码：失败必须是非 0，否则批量回归看不出问题。
+    sys.exit(run_all_tests())

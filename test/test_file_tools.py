@@ -439,8 +439,16 @@ def test_tool_manager_registration():
     for name in ("file_read", "file_write", "file_edit", "file_glob", "file_grep"):
         assert name in names, f"{name} 没有登记进工具表"
     assert names[-1] == "file_grep", "新工具应排在清单靠后位置"
-    assert len(names) == 9, f"内置工具应该是 4 个旧的 + 5 个新的，实际 {len(names)}"
-    print("✓ 通过: 5 个新工具已登记，共 9 个内置工具")
+    # 【2026-11-14 收尾】9 → 10：后来又加了一个内置工具（smart_context_cropper），
+    #   写死 9 的断言从此每次都失败。
+    #   为什么仍然写死总数、不改成 ">= 9"：这条用例的意图就是"工具清单被人无意中
+    #   加减时立刻报警"（多一个会改变模型的工具选择，少一个会让模型报"没这个工具"）。
+    #   放宽成范围等于把警报关掉，下次真出问题就没人知道了。
+    assert len(names) == 10, (
+        f"内置工具应该是 10 个（4 个文件工具 + 5 个第 8 轮新工具 + smart_context_cropper），"
+        f"实际 {len(names)}：{names}"
+    )
+    print("✓ 通过: 5 个新工具已登记，共 10 个内置工具")
 
 
 def run_all_tests():
@@ -473,19 +481,36 @@ def run_all_tests():
     ]
 
     passed = 0
-    try:  # 整体包一层 try，任何一个用例失败都能被抓住
+    failures = []  # 【2026-11-14 收尾】[用例名, 异常描述]，最后一起报
+    try:  # 整个循环仍包在 try 里：只为了保证 finally 一定收掉临时目录
         for test in tests:
-            test()  # 跑一个用例
-            passed += 1
-        print(f"\n🎉 所有测试通过（{passed}/{len(tests)}）")
-    except Exception as e:  # 任何一个失败都会跳到这里
-        print(f"\n❌ 测试失败（已通过 {passed}/{len(tests)}）：{e}")
-        traceback.print_exc()  # 打印完整的出错现场
+            # 【2026-11-14 收尾】每条用例单独 try。
+            #   改前是一个大 try 包住整个循环：第一条一挂，后面 15 条一条都不跑，
+            #   屏幕上只写"已通过 15/16"，看起来像"跑了 16 条挂了 1 条"——
+            #   实际上被跳过的那些根本没被验证过，这种"假绿"比直接失败更危险。
+            try:
+                test()  # 跑一个用例
+                passed += 1
+            except Exception as error:
+                failures.append((test.__name__, f"{type(error).__name__}: {error}"))
+                print(f"❌ 用例失败：{test.__name__} → {type(error).__name__}: {error}")
+                traceback.print_exc()  # 现场照旧打全
+
+        if failures:
+            print(f"\n❌ 测试失败（通过 {passed}/{len(tests)}，失败 {len(failures)} 条）：")
+            for name, reason in failures:
+                print(f"   · {name} → {reason}")
+        else:
+            print(f"\n🎉 所有测试通过（{passed}/{len(tests)}）")
     finally:
         if _TMP is not None:  # 不管成功失败都把临时目录收掉
             _TMP.cleanup()
 
+    # 失败必须反映到退出码上，否则批量跑测试的人看不到（改前这里没有返回值，
+    # 脚本永远 exit 0）。返回码交给 __main__ 里统一 sys.exit。
+    return 1 if failures else 0
+
 
 if __name__ == "__main__":
     # 直接运行这个文件时才执行（被 import 时不执行）
-    run_all_tests()  # 开跑
+    sys.exit(run_all_tests())  # 开跑，并把真实结果变成进程退出码

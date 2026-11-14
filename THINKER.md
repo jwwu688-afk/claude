@@ -37,14 +37,14 @@ docs/优化记录/    每轮改动的详细记录
 #   （.env 不受影响：python-dotenv 跟着包所在目录向上找，换目录照样读得到。）
 thinker
 
-# 验证：仓库不带测试套件（早期的 27 个脚本整套移除了）
-#   现在能自动跑的是 demo 的 Node 逻辑回归 + 压缩回归 + mcp 命令回归；其余靠人工冒烟。
-node demo/plane/test/game.test.js
-python test/test_compress_boundary.py
-python test/test_mcp_cli.py
-python test/test_mcp_status.py
-python test/test_hooks.py
+# 验证：全部离线（不联网、不消耗模型额度）
+#   34 个 Python 脚本一条命令跑完，末尾给"通过 / 假绿 / 失败"汇总和失败清单；
+#   --list 只看会跑哪些，-k 关键字 只跑匹配的。单项调试仍可直接 python test/xxx.py。
+python test/run_all.py
 python -m compileall -q src
+
+# demo 的 Node 逻辑回归没并进 run_all（它要 node，不是 python）
+node demo/plane/test/game.test.js
 ```
 
 MCP 配置走命令行改（第 30 轮），别手写 JSON：
@@ -137,7 +137,7 @@ argument-hint: [文件路径]
 - **注释用中文，解释"为什么"而不是"是什么"**。这是项目最重要的风格，每个非平凡的决定都要写清背景和踩过的坑。
 - 每个文件顶部有一段 `# =====` 包围的说明，讲这个文件在整体里负责什么。
 - 改动涉及行为时，注释里标注轮次，例如 `【2026-11-07 第 11 轮】`，方便对照 `docs/优化记录/`。
-- 仓库里只有三份自动化测试：`demo/plane/test/game.test.js`（Node 逻辑）、`test/test_compress_boundary.py`（压缩边界）、`test/test_mcp_cli.py`（mcp 命令）。第 30 轮加第三份的理由：它出错不是"不好用"，而是把用户手写的配置悄悄抹掉，手点验不出来。**新的**冒烟脚本仍然放在仓库外（如 `D:/workbuddy/thinker-预览/`），不要提交进仓库。
+- 自动化测试分两块：`test/` 下 34 个离线 Python 脚本（一条命令 `python test/run_all.py` 跑完并汇总，失败返回非 0），以及 `demo/plane/test/game.test.js`（Node 逻辑，要 `node`）。它们**都不联网、不消耗模型额度**——这是硬要求，因为跑一次回归就烧一次钱的话，没人会跑。**需要真调模型**的验证脚本不要提交进仓库，放到 `D:/workbuddy/` 下的临时目录里自测。
 - **MCP 配置的路径只有一个真源**：`tools/mcp_config.resolve_config_path()`。运行时（`MCPClient`）和命令行（`thinker mcp`）都调它。不要在别处再拼 `~/.thinker/mcp.json`，否则会出现"命令写进 A、程序读 B"。
 - **改配置用"严格读"，运行时用"容错读"，两者不要合并**：`mcp_config.load_config_dict()` 读不懂就抛错（保证不会把用户文件写坏）；`server_config.MCPConfig` 坏一条跳一条（保证程序能启动）。目标不同，混在一起两边都会做错。
 - 界面上的符号和颜色只能从 `ui/theme.py` 取，不要在各处硬编码。

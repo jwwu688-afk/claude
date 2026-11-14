@@ -120,10 +120,16 @@ def test_compression_runs_only_once_per_usage():
     manager.set_summarizer(fake_summarizer)
 
     manager.add_message(msg(Role.SYSTEM, "系统提示词"))
-    manager.add_message(msg(Role.USER, "第一轮问题"))
-    manager.add_message(msg(Role.ASSISTANT, "第一轮回答"))
-    manager.add_message(msg(Role.USER, "第二轮问题"))
-    manager.add_message(msg(Role.ASSISTANT, "第二轮回答"))
+    # 【2026-11-14 收尾】这里原来只造了 2 轮（4 条正文）对话。配上默认的
+    #   KEEP_RECENT=10，全部消息都落在"保留窗口"里，边界之前一条都没有，
+    #   于是 _compress_by_boundary 返回 reason=nothing_to_compress，
+    #   摘要器一次都不被调，断言 calls==1 必然失败（屏幕上是"没有可压缩的较早对话"）。
+    #   这条用例要验的是**同一份用量不重复调摘要**，前提是确实有东西可压，
+    #   所以消息数必须超过保留窗口（默认 10 条）：6 轮 = 12 条正文 + 1 条 system，
+    #   边界之前稳定有可压内容。写成轮数循环，将来 KEEP_RECENT 调大只需改这个 7。
+    for round_no in range(1, 7):
+        manager.add_message(msg(Role.USER, f"第{round_no}轮问题"))
+        manager.add_message(msg(Role.ASSISTANT, f"第{round_no}轮回答"))
 
     # 【2026-11-09 五层压缩后调整】这里原来写的是 900（占用 0.90），
     #   那时候"过了 80% 就直接调摘要模型"，所以 900 必然触发一次摘要。
@@ -145,6 +151,15 @@ def test_compression_runs_only_once_per_usage():
     # 下一次真实请求带来新用量后，才允许再判断一次。
     # 980 仍是 L5 档（0.98），确保这次"允许再压"是因为标记被清掉，
     # 而不是因为档位换了别的不花钱的层。
+    # 【2026-11-14 收尾】两次压缩之间必须真的长出新对话，否则第二次一定压不动：
+    #   第一次压完只剩 system + 摘要 + 最近 10 条，"边界之前"又是空的，
+    #   _compress_by_boundary 会返回 reason=only_previous_summary（屏幕上那句
+    #   "能压的内容已经压完了"）。真实场景里也不存在"一条新消息都没来就又压一次"，
+    #   所以这里补 4 轮对话再触发，用例才和线上行为对得上。
+    for round_no in range(7, 11):
+        manager.add_message(msg(Role.USER, f"第{round_no}轮问题"))
+        manager.add_message(msg(Role.ASSISTANT, f"第{round_no}轮回答"))
+
     manager.update_token_usage(usage(980, 0))
     asyncio.run(manager.auto_messages_compression())
     assert len(calls) == 2, f"新用量到来后应允许再压 1 次，实际累计 {len(calls)} 次"
@@ -365,15 +380,30 @@ def run_all_tests():
         test_cropper_keeps_summary,
     ]
     passed = 0
-    try:
-        for test in tests:
+    failures = []  # 【2026-11-14 收尾】[用例名, 异常描述]，最后一起报
+    # 【2026-11-14 收尾】每条用例单独 try。
+    #   改前一个大 try 包住整个循环：第 1 条一挂，后面 7 条一条都不跑，
+    #   屏幕上却只写"已通过 0/8"，看起来像"8 条全挂了"——实际是"只测了 1 条"。
+    #   这 7 条覆盖的正是"会真花钱或真 400"的路径，被静默跳过等于没测。
+    for test in tests:
+        try:
             test()
             passed += 1
+        except Exception as error:
+            failures.append((test.__name__, f"{type(error).__name__}: {error}"))
+            print(f"❌ 用例失败：{test.__name__} → {type(error).__name__}: {error}")
+            traceback.print_exc()
+
+    if failures:
+        print(f"\n❌ 测试失败（通过 {passed}/{len(tests)}，失败 {len(failures)} 条）：")
+        for name, reason in failures:
+            print(f"   · {name} → {reason}")
+    else:
         print(f"\n🎉 所有测试通过（{passed}/{len(tests)}）")
-    except Exception as e:
-        print(f"\n❌ 测试失败（已通过 {passed}/{len(tests)}）：{e}")
-        traceback.print_exc()
+
+    # 退出码必须能反映失败，否则批量回归永远"全绿"（改前这个函数没有返回值）。
+    return 1 if failures else 0
 
 
 if __name__ == "__main__":
-    run_all_tests()
+    sys.exit(run_all_tests())

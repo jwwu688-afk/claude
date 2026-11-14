@@ -121,7 +121,7 @@ pip install -e .
 
 ```bash
 thinker --version
-# thinker v0.10.1
+# thinker v0.13.0
 ```
 
 ### 2. 配置
@@ -540,12 +540,18 @@ thinker mcp add duckduckgo -e HTTPS_PROXY=http://127.0.0.1:7890 -- C:/tools/duck
 
 ## 验证
 
-`test/` 下现在有 **34 个脚本**（都不是 pytest，直接 `python test/xxx.py`，靠打印的 ✓ 和退出码判定结果）。**全部可跑、全部离线**——不联网、不消耗模型额度，可以整个目录批量跑：
+`test/` 下现在有 **34 个脚本**（都不是 pytest，直接 `python test/xxx.py`，靠打印的 ✓ 和退出码判定结果）。**全部可跑、全部离线**——不联网、不消耗模型额度。
+
+一条命令跑完全部，末尾给汇总：
 
 ```bash
-for f in test/*.py; do /path/to/python "$f" > /dev/null || echo "失败：$f"; done
+python test/run_all.py            # 全部
+python test/run_all.py -k tool    # 只跑文件名含 tool 的
+python test/run_all.py --list     # 只看会跑哪些
 ```
 
+> **为什么要用 `run_all.py` 而不是 `for` 循环**：不少脚本的旧写法是"打印一句 ❌ 测试失败，然后正常结束"，退出码照样是 0。只看退出码的批量命令会把它们当成功——2026-11-14 收尾时就是这么翻出 3 个"假绿"脚本的。`run_all.py` 做双重判定（退出码 **+** 输出里的 ❌ / "测试失败"），并把这类脚本单独标成"假绿"。三个出过问题的脚本已修好（`test_conversation_loop` 补 hook 替身、`test_file_tools` 的工具数从 9 改 10、`test_p0_fixes` 把对话造到超过压缩保留窗口），现在失败都会返回非 0。
+>
 > 两个流式脚本（`test_streaming.py` / `test_streaming_with_tools.py`）默认走**假客户端**，只验 chunk 分流与 tool_calls 拼装；想真打一次接口确认线上流式没坏，加 `--live`（会花钱、需要联网）。
 >
 > 2026-11-13 重写过一遍：其中 8 个是跟随旧接口写的（`history_token_usage` 结构、`get_reminder` 加 `mode`、`register_skill_commands` 删除、`ThinkingChunk` 没有 `.content`、L5 改成按边界压之后"没有可压内容"、输入层整行自管后的按键注入点），已全部对齐当前实现——**顺带把两个流式脚本从"真请求、只打印、永远绿"改成了有断言的离线脚本**。
@@ -665,7 +671,7 @@ Windows 控制台的老坑，已在第 16.2 轮整行自管重做。若仍异常
 
 ## 文档索引
 
-`docs/优化记录/` 是这个项目最值得看的部分——每一次改动都记了「为什么要改、改前是什么样、踩了什么坑、怎么验证的」（共 49 份）。
+`docs/优化记录/` 是这个项目最值得看的部分——每一次改动都记了「为什么要改、改前是什么样、踩了什么坑、怎么验证的」（共 50 份）。
 
 - **[ROADMAP.md](docs/ROADMAP.md)** — 当前进度、优先级、依赖关系、遗留问题索引（先看这个）
 - **[THINKER.md](THINKER.md)** — 项目记忆：代码约定、不要做的事、已知的坑
@@ -687,6 +693,7 @@ Windows 控制台的老坑，已在第 16.2 轮整行自管重做。若仍异常
 | 技能 | [21 技能机制](docs/优化记录/21-第21轮-技能机制.md) |
 | 输入层 | [16 Tab 补全](docs/优化记录/16-第16轮-Tab补全.md)、[16.2 输入层重做](docs/优化记录/16.2-第16.2轮-输入层重做.md)、[18.6 跨行与留白](docs/优化记录/18.6-第18.6轮-输入层跨行与留白.md) |
 | 界面 | [07 对齐 Claude Code 视觉](docs/优化记录/07-第7轮-对齐ClaudeCode视觉.md)、[10 等待动画与界面还原](docs/优化记录/10-第10轮-等待动画与界面还原.md)、[18.5 等待动画重做](docs/优化记录/18.5-第18.5轮-等待动画重做.md) |
+| 测试与回归 | [36 测试收尾：统一入口与三个假绿脚本](docs/优化记录/36-第36轮-测试收尾.md) |
 
 ---
 
