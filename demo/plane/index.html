@@ -16,18 +16,17 @@
     <p class="footnote">不必一往无前。活下来，才是王牌。</p>
   </aside>
   <section class="console" aria-label="飞机大战">
-    <header class="hud"><div><small>得分</small><strong id="score">000000</strong></div><div><small>生命</small><strong id="lives">3 / 3</strong></div><div><small>波次</small><strong id="wave">01</strong></div></header>
+    <header class="hud"><div><small>得分</small><strong id="score">000000</strong></div><div><small>生命</small><strong id="lives">3 / 3</strong></div><div><small>火力</small><strong id="weapon">1 级</strong></div><div><small>护盾</small><strong id="shield">—</strong></div><div><small>波次</small><strong id="wave">01</strong></div></header>
     <div class="field" id="field">
       <canvas id="canvas" width="480" height="720" aria-label="游戏战场，使用方向键或拖动移动"></canvas>
       <div class="overlay" id="overlay">
         <div class="badge">飞行员，准备就绪</div><h2 id="title">逐云</h2><p id="message">自动开火，专注闪避。<br>35 秒后，迎战空中堡垒。</p>
         <button id="start" class="primary">开始出击</button><small id="hint">方向键移动 · 空格释放炸弹</small>
       </div>
-      <div class="power" id="power" aria-live="polite"></div>
     </div>
     <footer class="controls"><button id="bomb">炸弹 × <span id="bombs">2</span><small>SPACE</small></button><button id="pause" aria-label="暂停游戏">暂停<small>P</small></button><button id="sound" aria-pressed="false">音效：开</button></footer>
   </section>
-  <aside class="guide"><span class="guide-title">补给识别</span><div><b>↑</b><p>火力升级<small>双发 / 三发 · 12 秒</small></p></div><div><b>◇</b><p>能量护盾<small>抵挡一次伤害 · 12 秒</small></p></div><div><b>＋</b><p>维修补给<small>恢复一条生命</small></p></div><div><b>✦</b><p>清屏炸弹<small>清除敌弹，重创敌机</small></p></div><div><b>⏱</b><p>时停补给<small>冻结敌弹 · 4 秒</small></p></div><p class="guide-note">每次受伤后获得<br>2 秒无敌保护。</p></aside>
+  <aside class="guide"><span class="guide-title">补给识别</span><div><b>P</b><p>火力升级<small>双发 / 三发 · 12 秒</small></p></div><div><b>S</b><p>能量护盾<small>抵挡一次伤害 · 12 秒</small></p></div><div><b>L</b><p>维修补给<small>恢复一条生命</small></p></div><div><b>B</b><p>清屏炸弹<small>清除敌弹，重创敌机</small></p></div><div><b>T</b><p>时停补给<small>冻结敌弹 · 4 秒</small></p></div><p class="guide-note">每次受伤后获得<br>2 秒无敌保护。</p></aside>
 </main>
 <script src="js/entities.js"></script><script src="js/game.js"></script><script src="js/effects.js"></script><script src="js/main.js"></script>
 </body></html>

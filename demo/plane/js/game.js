@@ -18,6 +18,8 @@
       // nextBoss=40：开局首个 Boss 间隔；击杀后按等级递减，见 kill()。
       this.score = 0; this.time = 0; this.level = 1; this.spawn = 0.7; this.nextBoss = 40; this.boss = null; this.state = 'playing';
       this.combo = 0; this.comboTimer = 0; this.bossWarned = false;
+      // 【2026-11-14】Boss 击毁演出：慢动作计时与死亡序列状态，重置时清零。
+      this.slowmo = 0; this.bossDying = null;
       // 【2026-11-13】结算统计：击杀数与最高连击，供结算画面展示本局表现。
       this.kills = 0; this.bestCombo = 0;
     }
@@ -30,6 +32,32 @@
     }
     /** 只在游玩与暂停之间切换，结算不会被误恢复。 */
     pause() { if (this.state === 'playing') this.state = 'paused'; else if (this.state === 'paused') this.state = 'playing'; }
+    /** 【2026-11-14】按波次选择敌机类型，形成递进难度曲线。
+     * 波次 1-3：侦察机为主，少量织网机——让玩家熟悉基础走位。
+     * 波次 4-6：增加织网机和重装机——弹幕密度上升，考验走位。
+     * 波次 7-9：引入自爆机——压力增大，织网机比例提高。
+     * 波次 10+：混合所有类型，自爆机比例最高——节奏最快。 */
+    pickEnemyType(level) {
+      if (level <= 3) return this.rng() < 0.7 ? 'scout' : 'weaver';
+      if (level <= 6) {
+        const r = this.rng();
+        if (r < 0.35) return 'scout';
+        if (r < 0.7) return 'weaver';
+        return 'tank';
+      }
+      if (level <= 9) {
+        const r = this.rng();
+        if (r < 0.3) return 'scout';
+        if (r < 0.6) return 'weaver';
+        if (r < 0.8) return 'tank';
+        return 'suicide';
+      }
+      const r = this.rng();
+      if (r < 0.2) return 'scout';
+      if (r < 0.45) return 'weaver';
+      if (r < 0.7) return 'tank';
+      return 'suicide';
+    }
     /** 炸弹不伤玩家；复制目标列表，避免掉落/击杀修改迭代。 */
     bomb() {
       if (this.state !== 'playing' || !this.p.bombs) return false;
@@ -37,7 +65,9 @@
       for (const e of [...this.enemies]) { e.hp -= 45; e.flash = 0.2; if (e.hp <= 0) this.kill(e); }
       this.emit('bomb', this.p); return true;
     }
-    /** dead 是幂等锁；Boss 保证补给，其余按概率掉落。击杀计入连击。 */
+    /** dead 是幂等锁；Boss 保证补给，其余按概率掉落。击杀计入连击。
+     * 【2026-11-14】Boss 击毁演出：Boss 死亡时不立即清除，而是进入 bossDying
+     * 序列——慢动作 2 秒 + 多段爆炸，结束后才真正清除并刷新下一只。 */
     kill(e) {
       if (e.dead) return;
       e.dead = true;
@@ -47,7 +77,22 @@
       this.kills++; if (this.combo > this.bestCombo) this.bestCombo = this.combo;
       const gained = e.score * this.comboMul;
       this.score += gained;
-      this.emit(e.type === 'boss' ? 'bomb' : 'explosion', e);
+      if (e.type === 'boss') {
+        // Boss 死亡序列：进入慢动作，保留实体用于播放爆炸，发 bossdeath 事件。
+        // score 和 combo 事件仍然要发——玩家需要看到得分飘字和连击提示，
+        // 只是爆炸演出和 Boss 清除延迟到序列结束后。
+        this.emit('score', { x: e.x, y: e.y, value: gained });
+        if (this.combo > 0 && this.combo % 10 === 0) this.emit('combo', { combo: this.combo });
+        this.bossDying = { x: e.x, y: e.y, timer: 2.0, explosionTimer: 0 };
+        this.slowmo = 2.0;
+        this.emit('bossdeath', { x: e.x, y: e.y });
+        // Boss 死后立即从 enemies 中移除，但位置信息已存入 bossDying 供演出使用。
+        this.boss = null;
+        // Boss 必掉补给，保证玩家不会空手进入下一轮。
+        this.items.push(P.pickup(e.x, e.y, 'power'));
+        return;
+      }
+      this.emit('explosion', e);
       this.emit('score', { x: e.x, y: e.y, value: gained });
       if (this.combo > 0 && this.combo % 10 === 0) this.emit('combo', { combo: this.combo });
       // Boss 间隔随等级递减：前期 40 秒、后期最低 25 秒，难度递进。
@@ -68,11 +113,13 @@
     }
     /** 补给有上限，回血不会超过初始三条命，火力持续十二秒。
      * 先做 dead 幂等检查：同帧内补给可能被碰撞与遍历各收集一次，
-     * 不检查会导致火力/护盾/时停被重复叠加。 */
+     * 不检查会导致火力/护盾/时停被重复叠加。
+     * 【2026-11-14】武器系统：拾取 power 时循环切换武器类型（1散射→2激光→3导弹→1），
+     * 三种武器风格截然不同，给玩家选择与策略空间。 */
     collect(item) {
       if (item.dead) return;
       const p = this.p; item.dead = true;
-      if (item.type === 'power') { p.weapon = Math.min(3, p.weapon + 1); p.power = 12; }
+      if (item.type === 'power') { p.weapon = Math.min(3, p.weapon + 1); p.power = 12; p.weaponType = (p.weaponType % 3) + 1; }
       if (item.type === 'shield') p.shield = 12;
       if (item.type === 'heal') p.lives = Math.min(3, p.lives + 1);
       if (item.type === 'bomb') p.bombs = Math.min(5, p.bombs + 1);
@@ -86,6 +133,26 @@
     update(dt, input = {}) {
       if (this.state !== 'playing') return;
       dt = P.clamp(Number.isFinite(dt) ? dt : 0, 0, 0.05);
+      // 【2026-11-14】Boss 击毁慢动作：bossDying 激活时 dt 缩减到 25%，
+      // 让整个战场进入"慢镜头"，配合多段爆炸和全屏白光，强化击毁 Boss 的仪式感。
+      if (this.bossDying) {
+        const slowDt = dt * 0.25;
+        this.bossDying.timer -= dt;
+        // 多段爆炸：每 0.4 秒在 Boss 残骸附近随机位置炸一次，模拟解体过程。
+        this.bossDying.explosionTimer -= dt;
+        if (this.bossDying.explosionTimer <= 0) {
+          this.bossDying.explosionTimer = 0.4;
+          this.emit('explosion', { x: this.bossDying.x + (Math.random() - 0.5) * 80, y: this.bossDying.y + (Math.random() - 0.5) * 60 });
+        }
+        // 序列结束：清除慢动作状态，安排下一只 Boss。
+        if (this.bossDying.timer <= 0) {
+          this.bossDying = null;
+          this.slowmo = 0;
+          this.nextBoss = this.time + Math.max(25, 40 - this.level * 1.5);
+        }
+        // 慢动作期间仍然推进游戏逻辑，但用缩减后的 dt。
+        dt = slowDt;
+      }
       this.time += dt; this.level = 1 + Math.floor(this.time / 20);
       // 连击倒计时：暂停时由上方 state 检查拦截，不会偷偷清零。
       if (this.comboTimer > 0) { this.comboTimer -= dt; if (this.comboTimer <= 0) this._resetCombo(); }
@@ -124,22 +191,57 @@
       if (p.y <= 30 && p.vy < 0) p.vy = 0; if (p.y >= P.H - 26 && p.vy > 0) p.vy = 0;
       p.fire -= dt;
       if (p.fire <= 0) {
-        p.fire = 0.15;
-        for (let i = 0; i < p.weapon; i++) this.shots.push(P.bullet(p.x + (i - (p.weapon - 1) / 2) * 15, p.y - 26, (i - (p.weapon - 1) / 2) * 28, -590));
+        // 【2026-11-14】武器系统：三种武器发射逻辑，用 weaponType 区分。
+        // 1 散射：多发扇形子弹，覆盖面广，适合清小怪；
+        // 2 激光：单发高伤穿透弹，穿过多个敌机，适合打 Boss 和密集阵列；
+        // 3 导弹：追踪弹，自动锁定最近敌机，适合精准打击。
+        if (p.weaponType === 1) {
+          p.fire = 0.15;
+          for (let i = 0; i < p.weapon; i++) this.shots.push(P.bullet(p.x + (i - (p.weapon - 1) / 2) * 15, p.y - 26, (i - (p.weapon - 1) / 2) * 28, -590, false, false, 'spread'));
+        } else if (p.weaponType === 2) {
+          p.fire = 0.22;
+          // 激光：每发带 pierce，可穿透 3 个敌机；伤害在碰撞处理中按 pierce 扣减。
+          for (let i = 0; i < p.weapon; i++) this.shots.push(P.bullet(p.x + (i - (p.weapon - 1) / 2) * 12, p.y - 26, (i - (p.weapon - 1) / 2) * 15, -680, false, false, 'laser', 3));
+        } else {
+          p.fire = 0.35;
+          // 导弹：追踪最近敌机，发射时先朝正上方，之后每帧在 update 中转向。
+          for (let i = 0; i < Math.max(1, p.weapon - 1); i++) this.shots.push(P.bullet(p.x + (i - (p.weapon - 2) / 2) * 20, p.y - 26, (i - (p.weapon - 2) / 2) * 40, -480, false, true, 'missile'));
+        }
         this.emit('shot', p);
+      }
+      // 【2026-11-14】副机系统：两个副机贴身跟随主战机，独立计时开火。
+      // 副机位置由主战机位置 + 固定偏移计算，玩家移动时副机自动跟随，不需要独立输入。
+      // 副机开火频率比主炮快一倍（0.075s vs 0.15s），与主炮错开半拍，
+      // 形成"主炮三发 + 副机双发"的更密集火力网，是雷霆战机的核心体验。
+      // 副机受时停影响：freeze 期间敌弹冻结，但副机照常开火（与主炮一致）。
+      for (const w of p.wingmen) {
+        const ox = w === p.wingmen[0] ? -18 : 18;
+        w.x = P.clamp(p.x + ox, 20, P.W - 20);
+        w.y = p.y + 12;
+        w.fire -= dt;
+        if (w.fire <= 0) {
+          w.fire = 0.075;
+          this.shots.push(P.bullet(w.x, w.y - 18, 0, -590));
+        }
       }
       // 【2026-11-12】Boss 出场前 3 秒发 bosswarn 事件，渲染层据此画顶部红色警报条。
       // bossWarned 防止每次帧都触发，Boss 出现或重置时清零。
       if (!this.boss && !this.bossWarned && this.time >= this.nextBoss - 3) {
         this.bossWarned = true; this.emit('bosswarn', { time: this.nextBoss - this.time });
       }
-      if (!this.boss && this.time >= this.nextBoss) {
+      if (!this.boss && !this.bossDying && this.time >= this.nextBoss) {
         this.boss = P.enemy('boss', this.level, this.rng); this.enemies.push(this.boss); this.bossWarned = false;
       }
       this.spawn -= dt;
       if (!this.boss && this.spawn <= 0) {
+        // 【2026-11-14】难度曲线：按波次切换敌机组合，节奏递增。
+        // 波次 1-3：侦察机为主，少量织网机，让玩家熟悉基础走位。
+        // 波次 4-6：增加织网机和重装机，弹幕密度上升。
+        // 波次 7-9：引入自爆机，压力增大，织网机比例提高。
+        // 波次 10+：混合所有类型，自爆机比例最高，节奏最快。
+        // 这样比固定随机更有节奏感，玩家能感知难度递增。
         this.spawn = Math.max(0.22, 1 - this.level * 0.07);
-        const type = this.rng() < 0.2 ? 'suicide' : ['scout', 'weaver', 'tank'][Math.floor(this.rng() * 3)];
+        const type = this.pickEnemyType(this.level);
         this.enemies.push(P.enemy(type, this.level, this.rng));
       }
       for (const e of this.enemies) {
@@ -176,16 +278,15 @@
               // 阶段二：环形 8 发全方向，封走位逼擦弹。
               for (let i = 0; i < 8; i++) { const a = i * Math.PI / 4; this.bullets.push(P.bullet(e.x, e.y + e.r, Math.cos(a) * 175, Math.sin(a) * 175, true)); }
             } else {
-              // 阶段三：扇形 5 发与追踪 3 发交替发射，由 bossAlt 计数器切换。
-              // 交替而非齐射——齐射一次 8 发会瞬间封死走位，远超"狂暴"的设计意图；
-              // 交替则玩家有 0.5 秒窗口判断本轮是弹幕还是追踪弹，留出应对空间。
-              if (e.bossAlt === 0) {
-                for (let i = 0; i < 5; i++) { const a = angle + (i - 2) * 0.23; this.bullets.push(P.bullet(e.x, e.y + e.r, Math.cos(a) * 175, Math.sin(a) * 175, true)); }
-                e.bossAlt = 1;
-              } else {
-                for (let i = 0; i < 3; i++) { const a = angle + (i - 1) * 0.5; this.bullets.push(P.bullet(e.x, e.y + e.r, Math.cos(a) * 160, Math.sin(a) * 160, true, true)); }
-                e.bossAlt = 0;
+              // 【2026-11-14】阶段三：螺旋弹幕。bossSpiral 是持续累加的旋转角，
+              // 每轮发射时以当前角度为基准散开 4 发，下一轮整体旋转，
+              // 形成不断旋转的螺旋弹幕——比"扇形+追踪交替"更难预判走位。
+              // 旋转步长 0.42 弧度：约 7.5 轮转完一圈，节奏紧凑但留出穿插缝隙。
+              for (let i = 0; i < 4; i++) {
+                const a = e.bossSpiral + (i - 1.5) * 0.2;
+                this.bullets.push(P.bullet(e.x, e.y + e.r, Math.cos(a) * 170, Math.sin(a) * 170, true));
               }
+              e.bossSpiral += 0.42;
             }
             this.emit('shot', e);
           } else {
@@ -201,9 +302,9 @@
         // 【2026-11-13】时停补给只冻敌弹（hostile），不冻玩家自己的 shots——
         // 否则玩家趁机跑到安全位，时停就变成纯福利，失去"用 4 秒换走位窗口"的战术意义。
         if (!(b.hostile && p.freeze > 0)) { b.x += b.vx * dt; b.y += b.vy * dt; }
-        // 【2026-11-12】追踪弹（track）每帧朝玩家微调方向，保持速度大小不变。
-        // 只做角度转向，不做加速——避免追踪弹比常规弹快导致难度失控。
-        // 时停期间同样冻结转向：否则会看到追踪弹在静止弹幕里独自转向，视觉上很怪。
+        // 【2026-11-14】追踪逻辑分两路：
+        // Boss 阶段三的 track 弹朝玩家转向；玩家导弹（shotType=missile）朝最近敌机转向。
+        // 两者共享转向框架，但目标不同——导弹追敌、Boss 弹追玩家。
         if (b.track && !b.dead && p.freeze <= 0) {
           const ang = Math.atan2(p.y - b.y, p.x - b.x);
           const cur = Math.atan2(b.vy, b.vx);
@@ -213,7 +314,24 @@
           const speed = Math.hypot(b.vx, b.vy);
           b.vx = Math.cos(cur + turn) * speed; b.vy = Math.sin(cur + turn) * speed;
         }
+        // 导弹追踪最近敌机：每帧找距离最近的存活敌机，朝它转向。
+        if (b.shotType === 'missile' && !b.dead && p.freeze <= 0) {
+          let nearest = null, bestD = Infinity;
+          for (const e of this.enemies) { if (e.dead) continue; const d = Math.hypot(b.x - e.x, b.y - e.y); if (d < bestD) { bestD = d; nearest = e; } }
+          if (nearest) {
+            const ang = Math.atan2(nearest.y - b.y, nearest.x - b.x);
+            const cur = Math.atan2(b.vy, b.vx);
+            let diff = ang - cur;
+            if (diff > Math.PI) diff -= Math.PI * 2; else if (diff < -Math.PI) diff += Math.PI * 2;
+            const turn = P.clamp(diff, -4.0 * dt, 4.0 * dt);
+            const speed = Math.hypot(b.vx, b.vy);
+            b.vx = Math.cos(cur + turn) * speed; b.vy = Math.sin(cur + turn) * speed;
+          }
+        }
         if (b.y < -30 || b.y > P.H + 30 || b.x < -30 || b.x > P.W + 30) b.dead = true;
+        // 【2026-11-14】激光穿透：shotType=laser 且 pierce>0 时不立即销毁，
+        // 记录已击中的敌机防止重复伤害，每穿透一个消耗一次 pierce。
+        // 导弹（shotType=missile）命中后爆炸销毁；散射弹保持原逻辑一击即销毁。
         if (b.hostile) {
           // 擦弹：距离在 (hitR, hitR+GRAZE] 内且该弹未擦过，加 20 分并发 graze 事件。
           // 命中判定优先：先判 hit，再判擦弹，避免同帧既擦又命中。
@@ -226,7 +344,20 @@
             }
           }
         }
-        else for (const e of this.enemies) if (P.hit(b, e)) { b.dead = true; e.hp--; e.flash = 0.07; if (e.hp <= 0) this.kill(e); break; }
+        else {
+          for (const e of this.enemies) {
+            if (b.dead) break;
+            if (P.hit(b, e)) {
+              // 激光：检查是否已击中过该敌机，没击中过则造成伤害并消耗 pierce。
+              if (b.shotType === 'laser') {
+                if (!b.hits.includes(e)) { b.hits.push(e); e.hp--; e.flash = 0.07; if (e.hp <= 0) this.kill(e); b.pierce--; }
+                if (b.pierce <= 0) b.dead = true;
+              } else {
+                b.dead = true; e.hp--; e.flash = 0.07; if (e.hp <= 0) this.kill(e);
+              }
+            }
+          }
+        }
       }
       for (const item of this.items) { item.age += dt; item.y += 85 * dt; if (P.hit(item, p)) this.collect(item); if (item.y > P.H + 20) item.dead = true; }
       for (const key of ['enemies', 'shots', 'bullets', 'items']) this[key] = this[key].filter(e => !e.dead);

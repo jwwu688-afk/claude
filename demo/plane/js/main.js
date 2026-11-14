@@ -19,14 +19,18 @@
   }
   /** 结算时才写存储；每帧只刷新数字，状态变化才改遮罩。 */
   function sync() {
+    // 【2026-11-14】HUD 统一：顶部栏直接显示火力等级和护盾状态，
+    // 去掉底部 power 浮条（信息已上移到 HUD，避免重复展示），
+    // 保持雷霆战机式的简洁仪表盘风格。
     $('score').textContent = String(game.score).padStart(6, '0');
     $('lives').textContent = `${Math.max(0, game.p.lives)} / 3`;
+    $('weapon').textContent = `${game.p.weapon} 级 · ${['散射', '激光', '导弹'][game.p.weaponType - 1]}`;
+    $('shield').textContent = game.p.shield > 0 ? `${Math.ceil(game.p.shield)}s` : '—';
     $('wave').textContent = String(game.level).padStart(2, '0');
     $('bombs').textContent = game.p.bombs; $('best').textContent = String(best).padStart(6, '0');
     $('bomb').disabled = game.state !== 'playing' || !game.p.bombs;
     $('pause').disabled = !['playing', 'paused'].includes(game.state);
     $('pause').firstChild.textContent = game.state === 'paused' ? '继续' : '暂停';
-    $('power').textContent = [game.p.power > 0 ? `${game.p.weapon} 发火力 ${Math.ceil(game.p.power)}s` : '', game.p.shield > 0 ? `护盾 ${Math.ceil(game.p.shield)}s` : '', game.p.freeze > 0 ? `时停 ${Math.ceil(game.p.freeze)}s` : ''].filter(Boolean).join('　/　');
     if (shownState === game.state) return;
     shownState = game.state; $('overlay').hidden = game.state === 'playing';
     if (game.state === 'ready') return;

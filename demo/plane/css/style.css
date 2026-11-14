@@ -1,7 +1,219 @@
-/* ===== 驾驶舱布局：战场为主，仪表与说明为辅；窄屏收起侧栏。 ===== */
-:root{color-scheme:dark;--sky:#123b57;--deep:#071e32;--paper:#f3edda;--muted:#94b3c5;--gold:#f4c66a;--red:#ed7458}
-*{box-sizing:border-box}body{margin:0;background:var(--deep);color:var(--paper);font-family:Georgia,"Microsoft YaHei",sans-serif;background-image:radial-gradient(ellipse at 50% 40%,#1b435b 0,transparent 70%);min-height:100svh}button{font:inherit;cursor:pointer;color:inherit;border:1px solid #557080;background:#16384c;transition:background .15s}button:hover{background:#28566b}button:focus-visible{outline:3px solid var(--gold);outline-offset:4px}button:disabled{opacity:.4;cursor:default}.cockpit{display:flex;align-items:center;justify-content:center;gap:48px;min-height:100svh;padding:28px}.brief{width:260px}.brand{font-size:25px;font-weight:bold;letter-spacing:6px}.brand span{display:block;font:11px "Microsoft YaHei",sans-serif;letter-spacing:3px;color:var(--muted);margin-top:10px}h1{font-size:39px;line-height:1.5;font-weight:normal;margin:48px 0 18px;letter-spacing:2px}.intro{font-size:13px;color:var(--muted);line-height:2}.record{border-top:1px solid #355467;border-bottom:1px solid #355467;padding:23px 0;margin:35px 0}.record span,.record small{display:block;color:var(--muted);font-size:11px;letter-spacing:1px}.record strong{display:block;font:36px Georgia,serif;color:var(--gold);margin:10px 0;font-variant-numeric:tabular-nums}.instructions{font:11px/2 "Microsoft YaHei",sans-serif;color:var(--muted)}kbd{color:var(--paper);font-size:11px}.footnote{font-size:11px;margin-top:35px;color:#6f94a9}.console{width:min(480px,calc((100svh - 174px)*2/3));min-width:280px;box-shadow:0 20px 70px #0005;border:1px solid #557080;background:#102d42}.hud{height:66px;display:flex;justify-content:space-between;padding:12px 22px}.hud small{display:block;font-size:10px;color:var(--muted);letter-spacing:2px}.hud strong{font:22px Georgia,serif;font-variant-numeric:tabular-nums}.field{position:relative;aspect-ratio:2/3;overflow:hidden;background:var(--sky)}canvas{display:block;width:100%;height:100%;touch-action:none}.overlay{position:absolute;inset:0;background:#071e32c9;display:flex;align-items:center;justify-content:center;flex-direction:column;text-align:center;padding:20px;backdrop-filter:blur(3px)}.overlay[hidden]{display:none}.badge{color:var(--gold);font-size:11px;letter-spacing:3px}h2{font-size:74px;font-weight:normal;letter-spacing:12px;margin:18px 0}#message{font-size:13px;color:#c0d0d7;line-height:2.1;margin:0 0 30px}.primary{background:var(--gold);border:none;color:var(--deep);padding:14px 40px;font-size:16px;font-weight:bold}.primary:hover{background:#ffdb91}#hint{font-size:10px;color:var(--muted);margin-top:20px}.controls{height:52px;display:flex}.controls button{flex:1;border:0;border-top:1px solid #355467;background:transparent;font-size:12px}.controls button+button{border-left:1px solid #355467}.controls small{font-size:9px;margin-left:9px;color:var(--muted)}.power{position:absolute;left:0;bottom:12px;width:100%;text-align:center;font-size:11px;color:var(--gold);pointer-events:none;text-shadow:0 1px 4px #000}.guide{width:150px}.guide-title{font-size:11px;letter-spacing:3px;color:var(--muted)}.guide>div{display:flex;align-items:center;gap:14px;margin:26px 0}.guide b{color:var(--gold);font-size:24px;width:26px;text-align:center}.guide p{font-size:12px;margin:0}.guide small{display:block;font-size:10px;color:var(--muted);margin-top:7px}.guide .guide-note{font-size:11px;line-height:2;color:var(--muted);border-top:1px solid #355467;padding-top:22px}
-/* 手机优先保留战场完整高度；工具条依旧可触摸，不依赖 hover。 */
-@media(max-width:1100px){.guide{display:none}.cockpit{gap:30px}.brief{width:230px}}
-@media(max-width:700px){.brief{display:none}.cockpit{padding:10px;min-height:100svh}.console{width:min(calc((100svh - 140px)*2/3),100%);min-width:0}.hud{height:58px;padding:9px 16px}.controls{height:52px}.controls small{display:none}h2{font-size:60px}.badge{letter-spacing:1px}}
-@media(prefers-reduced-motion:reduce){*{transition:none!important}}
+/* ===== 雷霆战机风格驾驶舱：金属外框、发光仪表、霓虹按钮 =====
+ * 【2026-11-14 全面改造】整个界面改为街机风格的深色金属质感：
+ *   - 外框用金属渐变 + 青色辉光描边，模拟街机机台的金属边框
+ *   - HUD 仪表用等宽字体 + 发光色，像街机屏幕的读数面板
+ *   - 按钮加霓虹辉光效果，点击有能量感
+ *   - 战场区域有内阴影，像嵌在机台里的屏幕
+ */
+
+:root {
+  color-scheme: dark;
+  --sky: #0d2238;
+  --deep: #030a14;
+  --paper: #e8f0f8;
+  --muted: #6f94a9;
+  --gold: #f4c66a;
+  --red: #ed5040;
+  --cyan: #50d0ff;
+  --teal: #50dcec;
+  --metal-light: #2a4a60;
+  --metal-dark: #0a1a28;
+}
+
+* { box-sizing: border-box; }
+
+body {
+  margin: 0;
+  background: var(--deep);
+  color: var(--paper);
+  font-family: Georgia, "Microsoft YaHei", sans-serif;
+  background-image:
+    radial-gradient(ellipse at 50% 30%, #0d2238 0%, transparent 60%),
+    radial-gradient(ellipse at 50% 80%, #1a0a2a 0%, transparent 50%);
+  min-height: 100svh;
+}
+
+/* 按钮：金属底色 + 青色霓虹描边，悬停时辉光增强 */
+button {
+  font: inherit; cursor: pointer; color: inherit;
+  border: 1px solid rgba(80, 208, 255, 0.4);
+  background: linear-gradient(180deg, #1a3a50, #0a2030);
+  transition: border-color .15s, box-shadow .15s, background .15s;
+}
+button:hover {
+  border-color: var(--cyan);
+  background: linear-gradient(180deg, #204a65, #102840);
+  box-shadow: 0 0 12px rgba(80, 208, 255, 0.3);
+}
+button:focus-visible { outline: 3px solid var(--cyan); outline-offset: 4px; }
+button:disabled { opacity: .35; cursor: default; box-shadow: none; }
+
+.cockpit {
+  display: flex; align-items: center; justify-content: center;
+  gap: 48px; min-height: 100svh; padding: 28px;
+}
+
+/* 左侧说明栏 */
+.brief { width: 260px; }
+.brand {
+  font-size: 25px; font-weight: bold; letter-spacing: 6px;
+  color: var(--cyan);
+  text-shadow: 0 0 12px rgba(80, 208, 255, 0.4);
+}
+.brand span {
+  display: block; font: 11px "Microsoft YaHei", sans-serif;
+  letter-spacing: 3px; color: var(--muted); margin-top: 10px;
+}
+h1 {
+  font-size: 39px; line-height: 1.5; font-weight: normal;
+  margin: 48px 0 18px; letter-spacing: 2px;
+}
+.intro { font-size: 13px; color: var(--muted); line-height: 2; }
+.record {
+  border-top: 1px solid #1a3550; border-bottom: 1px solid #1a3550;
+  padding: 23px 0; margin: 35px 0;
+}
+.record span, .record small {
+  display: block; color: var(--muted); font-size: 11px; letter-spacing: 1px;
+}
+.record strong {
+  display: block; font: 36px Georgia, serif;
+  color: var(--gold); margin: 10px 0;
+  font-variant-numeric: tabular-nums;
+  text-shadow: 0 0 16px rgba(244, 198, 106, 0.4);
+}
+.instructions { font: 11px/2 "Microsoft YaHei", sans-serif; color: var(--muted); }
+kbd {
+  color: var(--cyan); font-size: 11px;
+  border: 1px solid rgba(80, 208, 255, 0.3);
+  border-radius: 3px; padding: 1px 5px;
+}
+.footnote { font-size: 11px; margin-top: 35px; color: #4a7089; }
+
+/* 控制台：金属外框 + 内阴影屏幕 */
+.console {
+  width: min(480px, calc((100svh - 174px) * 2 / 3));
+  min-width: 280px;
+  box-shadow:
+    0 20px 70px #0008,
+    0 0 0 1px rgba(80, 208, 255, 0.15),
+    0 0 40px rgba(80, 208, 255, 0.08),
+    inset 0 0 0 2px rgba(80, 208, 255, 0.08);
+  border: 1px solid #1a3550;
+  background: linear-gradient(180deg, #0a1a28, #051018);
+}
+
+/* HUD：仪表面板风格，顶部金属横条 */
+.hud {
+  height: 78px;
+  display: flex; justify-content: space-between;
+  align-items: flex-start; padding: 10px 14px; gap: 6px;
+  background: linear-gradient(180deg, rgba(10, 30, 50, 0.9), rgba(5, 20, 35, 0.6));
+  border-bottom: 1px solid rgba(80, 208, 255, 0.15);
+}
+.hud small {
+  display: block; font-size: 9px; color: var(--muted);
+  letter-spacing: 1px; text-transform: uppercase;
+}
+.hud strong {
+  font: 18px Georgia, serif;
+  font-variant-numeric: tabular-nums;
+  display: block; margin-top: 2px;
+}
+/* 各仪表项的发光色 */
+#score strong { color: var(--cyan); text-shadow: 0 0 8px rgba(80, 208, 255, 0.3); }
+#lives strong { color: var(--gold); text-shadow: 0 0 8px rgba(244, 198, 106, 0.3); }
+#weapon strong { color: var(--gold); text-shadow: 0 0 8px rgba(244, 198, 106, 0.3); }
+#shield strong { color: var(--teal); text-shadow: 0 0 8px rgba(80, 220, 240, 0.3); }
+#wave strong { color: var(--cyan); text-shadow: 0 0 8px rgba(80, 208, 255, 0.3); }
+#bombs strong { color: var(--red); text-shadow: 0 0 8px rgba(237, 80, 64, 0.3); }
+
+/* 战场区域：内凹屏幕效果 */
+.field {
+  position: relative; aspect-ratio: 2 / 3;
+  overflow: hidden; background: var(--sky);
+  box-shadow: inset 0 0 40px rgba(0, 0, 0, 0.6);
+}
+canvas { display: block; width: 100%; height: 100%; touch-action: none; }
+
+/* 覆盖层：半透明深蓝 + 模糊 */
+.overlay {
+  position: absolute; inset: 0;
+  background: #030a14e6;
+  display: flex; align-items: center; justify-content: center;
+  flex-direction: column; text-align: center;
+  padding: 20px; backdrop-filter: blur(3px);
+}
+.overlay[hidden] { display: none; }
+.badge {
+  color: var(--cyan); font-size: 11px; letter-spacing: 3px;
+  text-shadow: 0 0 10px rgba(80, 208, 255, 0.5);
+}
+h2 {
+  font-size: 74px; font-weight: normal; letter-spacing: 12px;
+  margin: 18px 0;
+  color: var(--paper);
+  text-shadow: 0 0 24px rgba(80, 208, 255, 0.4);
+}
+#message { font-size: 13px; color: #a0c0d0; line-height: 2.1; margin: 0 0 30px; }
+.primary {
+  background: linear-gradient(180deg, var(--gold), #c89840);
+  border: none; color: var(--deep);
+  padding: 14px 40px; font-size: 16px; font-weight: bold;
+  box-shadow: 0 0 20px rgba(244, 198, 106, 0.4);
+}
+.primary:hover {
+  box-shadow: 0 0 30px rgba(244, 198, 106, 0.6);
+  background: linear-gradient(180deg, #ffdb91, var(--gold));
+}
+#hint { font-size: 10px; color: var(--muted); margin-top: 20px; }
+
+/* 底部控制条 */
+.controls {
+  height: 52px; display: flex;
+  background: linear-gradient(180deg, rgba(5, 20, 35, 0.6), rgba(10, 30, 50, 0.8));
+  border-top: 1px solid rgba(80, 208, 255, 0.15);
+}
+.controls button {
+  flex: 1; border: 0;
+  border-top: 1px solid rgba(80, 208, 255, 0.1);
+  background: transparent; font-size: 12px;
+}
+.controls button + button { border-left: 1px solid rgba(80, 208, 255, 0.1); }
+.controls small {
+  font-size: 9px; margin-left: 9px; color: var(--muted);
+}
+
+/* 右侧操作指南 */
+.guide { width: 150px; }
+.guide-title { font-size: 11px; letter-spacing: 3px; color: var(--cyan); }
+.guide > div { display: flex; align-items: center; gap: 14px; margin: 26px 0; }
+.guide b {
+  color: var(--gold); font-size: 24px; width: 26px; text-align: center;
+}
+.guide p { font-size: 12px; margin: 0; }
+.guide small { display: block; font-size: 10px; color: var(--muted); margin-top: 7px; }
+.guide .guide-note {
+  font-size: 11px; line-height: 2; color: var(--muted);
+  border-top: 1px solid #1a3550; padding-top: 22px;
+}
+
+/* 手机优先：保留战场完整高度 */
+@media (max-width: 1100px) {
+  .guide { display: none; }
+  .cockpit { gap: 30px; }
+  .brief { width: 230px; }
+}
+@media (max-width: 700px) {
+  .brief { display: none; }
+  .cockpit { padding: 10px; min-height: 100svh; }
+  .console { width: min(calc((100svh - 140px) * 2 / 3), 100%); min-width: 0; }
+  .hud { height: 70px; padding: 8px 10px; }
+  .controls { height: 52px; }
+  .controls small { display: none; }
+  h2 { font-size: 60px; }
+  .badge { letter-spacing: 1px; }
+}
+@media (prefers-reduced-motion: reduce) {
+  * { transition: none !important; }
+}
